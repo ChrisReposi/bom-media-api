@@ -10,7 +10,6 @@ import {
 const USERNAME_PATTERN = /^[a-zA-Z0-9_]+$/;
 
 config({ path: ".env" });
-config({ path: "../../.env" });
 
 function requireEnv(name: string): string {
   const value = process.env[name];

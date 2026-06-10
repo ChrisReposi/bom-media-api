@@ -67,7 +67,7 @@ function serializeRequestForLogs(
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      envFilePath: [".env", "../../.env"],
+      envFilePath: [".env"],
       load: [apiConfig],
       validate: validateEnv,
     }),

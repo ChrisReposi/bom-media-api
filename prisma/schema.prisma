@@ -1,0 +1,349 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+enum AdminRole {
+  OWNER
+  ADMIN
+  STAFF
+}
+
+enum AccountStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum VideoProvider {
+  MANUAL
+  BUNNY
+  MUX
+  CLOUDINARY
+}
+
+enum VideoSourceType {
+  UPLOAD
+  DIRECT_URL
+  EMBED
+  DB_BLOB
+}
+
+enum EmbedProvider {
+  CLOUDINARY_PLAYER
+  YOUTUBE
+  YOUTUBE_NOCOOKIE
+  VIMEO
+  GENERIC_IFRAME
+}
+
+enum VideoStatus {
+  DRAFT
+  PROCESSING
+  READY
+  FAILED
+  DISABLED
+}
+
+enum WebsiteStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum WebsiteLanguage {
+  VI
+  EN
+}
+
+enum DomainStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum DomainGroupStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum ThemeStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum AssignmentStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum ShareLinkStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+  DISABLED
+}
+
+enum AccessLogStatus {
+  ALLOWED
+  DENIED
+}
+
+enum AuditStatus {
+  SUCCESS
+  FAIL
+}
+
+model AdminUser {
+  id           String        @id @default(cuid())
+  username     String        @unique @db.VarChar(32)
+  passwordHash String        @db.VarChar(255)
+  role         AdminRole     @default(STAFF)
+  status       AccountStatus @default(ACTIVE)
+  lastLoginAt  DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  refreshTokens AdminRefreshToken[]
+  auditLogs     AdminAuditLog[]
+
+  @@index([status])
+}
+
+model AdminRefreshToken {
+  id        String    @id @default(cuid())
+  adminId   String
+  tokenHash String    @unique @db.VarChar(128)
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  admin AdminUser @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  @@index([adminId])
+  @@index([expiresAt])
+}
+
+model VideoAsset {
+  id              String          @id @default(cuid())
+  title           String          @db.VarChar(255)
+  slug            String?         @unique @db.VarChar(160)
+  description     String?         @db.Text
+  provider        VideoProvider   @default(MANUAL)
+  sourceType      VideoSourceType @default(DIRECT_URL)
+  providerAssetId String?         @db.VarChar(255)
+  playbackId      String?         @db.VarChar(255)
+  playbackUrl     String?         @db.VarChar(2048)
+  embedProvider   EmbedProvider?
+  embedUrl        String?         @db.VarChar(2048)
+  embedCloudName  String?         @db.VarChar(120)
+  embedPublicId   String?         @db.VarChar(512)
+  embedAllow      String?         @db.VarChar(255)
+  thumbnailUrl    String?         @db.VarChar(2048)
+  durationSeconds Int?
+  viewCount       BigInt          @default(0)
+  publishedAt     DateTime?
+  status          VideoStatus     @default(DRAFT)
+  metadataJson    Json?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  websiteVideos   WebsiteVideo[]
+  shareLinkVideos ShareLinkVideo[]
+  binaryAsset     VideoBinaryAsset?
+
+  @@index([status])
+  @@index([provider, providerAssetId])
+  @@index([createdAt])
+  @@index([publishedAt])
+  @@index([slug])
+}
+
+model VideoBinaryAsset {
+  id        String   @id @default(cuid())
+  videoId   String   @unique
+  mimeType  String   @db.VarChar(120)
+  sizeBytes BigInt
+  data      Bytes    @db.LongBlob
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  video VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@index([videoId])
+}
+
+model Website {
+  id                 String          @id @default(cuid())
+  name               String          @db.VarChar(255)
+  slug               String          @unique @db.VarChar(120)
+  defaultTitle       String?         @db.VarChar(255)
+  defaultDescription String?         @db.Text
+  domainGroupId      String?
+  language           WebsiteLanguage @default(VI)
+  status             WebsiteStatus   @default(ACTIVE)
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  domainGroup   DomainGroup?    @relation(fields: [domainGroupId], references: [id], onDelete: SetNull)
+  domains       WebsiteDomain[]
+  themeConfig   ThemeConfig?
+  websiteVideos WebsiteVideo[]
+  shareLinks    ShareLink[]
+  accessLogs    AccessLog[]
+
+  @@index([status])
+  @@index([domainGroupId])
+}
+
+model DomainGroup {
+  id          String            @id @default(cuid())
+  key         String            @unique @db.VarChar(80)
+  name        String            @db.VarChar(160)
+  description String?           @db.Text
+  status      DomainGroupStatus @default(ACTIVE)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  websites Website[]
+
+  @@index([status])
+}
+
+model WebsiteDomain {
+  id        String       @id @default(cuid())
+  websiteId String
+  domain    String       @unique @db.VarChar(253)
+  isPrimary Boolean      @default(false)
+  status    DomainStatus @default(ACTIVE)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId])
+  @@index([status])
+}
+
+model ThemeConfig {
+  id          String      @id @default(cuid())
+  websiteId   String      @unique
+  themeKey    String      @db.VarChar(80)
+  layoutKey   String      @db.VarChar(80)
+  fontKey     String      @default("be-vietnam-pro") @db.VarChar(80)
+  colorsJson  Json?
+  fontsJson   Json?
+  contentJson Json?
+  customCss   String?     @db.Text
+  status      ThemeStatus @default(ACTIVE)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+}
+
+model WebsiteVideo {
+  id         String           @id @default(cuid())
+  websiteId  String
+  videoId    String
+  sortOrder  Int              @default(0)
+  isFeatured Boolean          @default(false)
+  status     AssignmentStatus @default(ACTIVE)
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  website Website    @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  video   VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@unique([websiteId, videoId])
+  @@index([websiteId])
+  @@index([videoId])
+  @@index([websiteId, sortOrder])
+  @@index([status])
+}
+
+model ShareLink {
+  id           String          @id @default(cuid())
+  websiteId    String
+  tokenHash    String          @unique @db.VarChar(128)
+  label        String?         @db.VarChar(255)
+  expiresAt    DateTime?
+  maxViews     Int?
+  currentViews Int             @default(0)
+  status       ShareLinkStatus @default(ACTIVE)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  lastViewedAt DateTime?
+
+  website         Website          @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  shareLinkVideos ShareLinkVideo[]
+  accessLogs      AccessLog[]
+
+  @@index([websiteId])
+  @@index([status])
+  @@index([websiteId, status])
+  @@index([expiresAt])
+}
+
+model ShareLinkVideo {
+  id          String   @id @default(cuid())
+  shareLinkId String
+  videoId     String
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  shareLink ShareLink  @relation(fields: [shareLinkId], references: [id], onDelete: Cascade)
+  video     VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@unique([shareLinkId, videoId])
+  @@index([shareLinkId])
+  @@index([videoId])
+  @@index([shareLinkId, sortOrder])
+}
+
+model AccessLog {
+  id          String          @id @default(cuid())
+  websiteId   String?
+  shareLinkId String?
+  domain      String?         @db.VarChar(253)
+  ipHash      String?         @db.VarChar(128)
+  userAgent   String?         @db.VarChar(1024)
+  referer     String?         @db.VarChar(2048)
+  status      AccessLogStatus
+  reasonCode  String?         @db.VarChar(80)
+  createdAt   DateTime        @default(now())
+
+  website   Website?   @relation(fields: [websiteId], references: [id], onDelete: SetNull)
+  shareLink ShareLink? @relation(fields: [shareLinkId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([websiteId])
+  @@index([shareLinkId])
+  @@index([status])
+}
+
+model AdminAuditLog {
+  id           String      @id @default(cuid())
+  adminId      String?
+  action       String      @db.VarChar(120)
+  module       String      @db.VarChar(120)
+  entityType   String?     @db.VarChar(120)
+  entityId     String?     @db.VarChar(191)
+  status       AuditStatus
+  ipHash       String?     @db.VarChar(128)
+  userAgent    String?     @db.VarChar(1024)
+  metadataJson Json?
+  createdAt    DateTime    @default(now())
+
+  admin AdminUser? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([adminId])
+  @@index([module])
+  @@index([entityType, entityId])
+}

@@ -1,0 +1,1709 @@
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
+import { readFile, unlink } from "node:fs/promises";
+import { CloudinaryService } from "../cloudinary/cloudinary.service";
+import { PrismaService } from "../database/prisma.service";
+import {
+  AuditStatus,
+  EmbedProvider,
+  Prisma,
+  VideoProvider,
+  VideoSourceType,
+  VideoStatus,
+  type VideoAsset,
+} from "../generated/prisma/client";
+import type { CreateEmbedVideoDto } from "./dto/create-embed-video.dto";
+import type { CreateVideoDto } from "./dto/create-video.dto";
+import type { ListVideosQueryDto } from "./dto/list-videos-query.dto";
+import { type VideoSortField } from "./dto/list-videos-query.dto";
+import type { PurgeVideoDto } from "./dto/purge-video.dto";
+import type { ReplaceDatabaseVideoBinaryDto } from "./dto/replace-database-video-binary.dto";
+import type { UploadDatabaseVideoDto } from "./dto/upload-database-video.dto";
+import type { UpdateVideoDto } from "./dto/update-video.dto";
+import type { UploadVideoDto } from "./dto/upload-video.dto";
+import type {
+  DisableVideoResponse,
+  PurgeVideoResponse,
+  VideoListResponse,
+  VideoResponse,
+} from "./types/video-response.type";
+import { buildCloudinaryVideoThumbnailUrl } from "./utils/cloudinary-video.util";
+import {
+  DEFAULT_VIDEO_EMBED_ALLOW,
+  DEFAULT_VIDEO_EMBED_ALLOWED_HOSTS,
+  parseVideoEmbedInput,
+  type ParsedVideoEmbed,
+} from "./utils/video-embed.util";
+import { createVideoSlug } from "./utils/video-slug.util";
+import { VideoMetadataService } from "./metadata/video-metadata.service";
+
+type VideoMutationAction =
+  | "VIDEO_CREATE"
+  | "VIDEO_EMBED_CREATE"
+  | "VIDEO_UPLOAD"
+  | "VIDEO_DB_UPLOAD"
+  | "VIDEO_DB_BINARY_REPLACE"
+  | "VIDEO_UPDATE"
+  | "VIDEO_DISABLE"
+  | "VIDEO_PURGE";
+
+const DEFAULT_DB_UPLOAD_MAX_MB = 50;
+const MAX_DB_UPLOAD_MAX_MB = 100;
+const DEFAULT_THUMBNAIL_UPLOAD_MAX_MB = 5;
+const MAX_THUMBNAIL_UPLOAD_MAX_MB = 10;
+const DATABASE_PACKET_OVERHEAD_RATIO = 0.15;
+const DATABASE_PACKET_MIN_OVERHEAD_BYTES = 5 * 1024 * 1024;
+const RECOMMENDED_DATABASE_PACKET_MB = 256;
+
+type VideoAssetWithBinaryMetadata = VideoAsset & {
+  binaryAsset?: {
+    mimeType: string;
+    sizeBytes: bigint;
+  } | null;
+};
+
+export type DatabaseVideoBinary = {
+  mimeType: string;
+  sizeBytes: bigint;
+  data: Buffer;
+};
+
+type ResolvedThumbnail = {
+  thumbnailUrl: string | null;
+  thumbnailMetadata: Record<string, unknown> | null;
+};
+
+@Injectable()
+export class VideosService {
+  private readonly logger = new Logger(VideosService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly cloudinaryService: CloudinaryService,
+    private readonly configService: ConfigService,
+    private readonly videoMetadataService: VideoMetadataService,
+  ) {}
+
+  async listVideos(query: ListVideosQueryDto): Promise<VideoListResponse> {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const skip = (page - 1) * limit;
+    const where = this.buildVideoWhere(query);
+    const orderBy = this.buildVideoOrderBy(
+      query.sortBy ?? "createdAt",
+      query.sortOrder ?? "desc",
+    );
+
+    const [items, total] = await this.prisma.$transaction([
+      this.prisma.videoAsset.findMany({
+        where,
+        orderBy,
+        skip,
+        take: limit,
+        include: {
+          binaryAsset: {
+            select: {
+              mimeType: true,
+              sizeBytes: true,
+            },
+          },
+        },
+      }),
+      this.prisma.videoAsset.count({ where }),
+    ]);
+
+    return {
+      items: items.map((video) => this.toVideoResponse(video)),
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  async getVideo(id: string): Promise<VideoResponse> {
+    const video = await this.prisma.videoAsset.findUnique({
+      where: { id },
+      include: {
+        binaryAsset: {
+          select: {
+            mimeType: true,
+            sizeBytes: true,
+          },
+        },
+      },
+    });
+
+    if (video === null) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    return this.toVideoResponse(video);
+  }
+
+  async createVideo(
+    dto: CreateVideoDto,
+    adminId: string,
+    thumbnailFile?: Express.Multer.File,
+  ): Promise<VideoResponse> {
+    const slug = await this.ensureUniqueSlug(dto.slug ?? dto.title);
+    const provider = this.resolveProvider(dto);
+    const parsedEmbed =
+      dto.embedUrl === undefined ? null : this.parseEmbedInput(dto.embedUrl);
+    const playbackUrl = this.trimNullable(dto.playbackUrl);
+    const thumbnail = await this.resolveThumbnailUrl({
+      thumbnailUrl: dto.thumbnailUrl,
+      thumbnailFile,
+      tags: ["manual"],
+    });
+    const durationSeconds =
+      dto.durationSeconds ??
+      (parsedEmbed === null && playbackUrl !== null
+        ? await this.probeRemoteDurationSeconds(playbackUrl)
+        : null);
+    const status =
+      dto.status ??
+      (playbackUrl || dto.embedUrl ? VideoStatus.READY : VideoStatus.DRAFT);
+
+    const video = await this.prisma.videoAsset.create({
+      data: {
+        title: dto.title.trim(),
+        slug,
+        description: this.trimNullable(dto.description),
+        provider,
+        sourceType:
+          parsedEmbed === null
+            ? VideoSourceType.DIRECT_URL
+            : VideoSourceType.EMBED,
+        providerAssetId: this.trimNullable(dto.providerAssetId),
+        playbackId: this.trimNullable(dto.playbackId),
+        playbackUrl,
+        embedProvider: parsedEmbed?.provider ?? null,
+        embedUrl: parsedEmbed?.embedUrl ?? null,
+        embedCloudName: parsedEmbed?.cloudName ?? null,
+        embedPublicId: parsedEmbed?.publicId ?? null,
+        embedAllow: parsedEmbed?.allow ?? null,
+        thumbnailUrl: thumbnail.thumbnailUrl,
+        durationSeconds,
+        viewCount: this.parseViewCount(dto.viewCount),
+        publishedAt: this.parseNullableDate(dto.publishedAt),
+        status,
+        metadataJson: this.buildMetadataJson(
+          dto.metadataJson,
+          thumbnail.thumbnailMetadata,
+        ),
+      },
+    });
+
+    await this.writeAudit(adminId, "VIDEO_CREATE", video.id, {
+      provider: video.provider,
+      status: video.status,
+    });
+
+    return this.toVideoResponse(video);
+  }
+
+  async createEmbedVideo(
+    dto: CreateEmbedVideoDto,
+    adminId: string,
+    thumbnailFile?: Express.Multer.File,
+  ): Promise<VideoResponse> {
+    const parsedEmbed = this.parseEmbedInput(dto.embedCodeOrUrl);
+    const slug = await this.ensureUniqueSlug(dto.slug ?? dto.title);
+    const thumbnail = await this.resolveThumbnailUrl({
+      thumbnailUrl: dto.thumbnailUrl,
+      thumbnailFile,
+      tags: ["embed"],
+    });
+    const thumbnailUrl =
+      thumbnail.thumbnailUrl ?? this.buildEmbedThumbnailUrl(parsedEmbed);
+
+    const video = await this.prisma.videoAsset.create({
+      data: {
+        title: dto.title.trim(),
+        slug,
+        description: this.trimNullable(dto.description),
+        provider:
+          parsedEmbed.provider === EmbedProvider.CLOUDINARY_PLAYER
+            ? VideoProvider.CLOUDINARY
+            : VideoProvider.MANUAL,
+        sourceType: VideoSourceType.EMBED,
+        providerAssetId: parsedEmbed.publicId ?? null,
+        playbackId: null,
+        playbackUrl: null,
+        embedProvider: parsedEmbed.provider,
+        embedUrl: parsedEmbed.embedUrl,
+        embedCloudName: parsedEmbed.cloudName ?? null,
+        embedPublicId: parsedEmbed.publicId ?? null,
+        embedAllow: parsedEmbed.allow,
+        thumbnailUrl,
+        durationSeconds: dto.durationSeconds ?? null,
+        viewCount: this.parseViewCount(dto.viewCount),
+        publishedAt: this.parseNullableDate(dto.publishedAt),
+        status: dto.status ?? VideoStatus.READY,
+        metadataJson: this.buildMetadataJson(
+          undefined,
+          thumbnail.thumbnailMetadata,
+        ),
+      },
+    });
+
+    await this.writeAudit(adminId, "VIDEO_EMBED_CREATE", video.id, {
+      embedProvider: video.embedProvider,
+      provider: video.provider,
+      status: video.status,
+    });
+
+    return this.toVideoResponse(video);
+  }
+
+  async uploadVideo(
+    dto: UploadVideoDto,
+    file: Express.Multer.File | undefined,
+    thumbnailFile: Express.Multer.File | undefined,
+    adminId: string,
+  ): Promise<VideoResponse> {
+    this.validateUploadFile(file);
+
+    const tags = this.parseTags(dto.tags);
+    const uploadResult = await this.cloudinaryService.uploadVideo({
+      fileBuffer: file.buffer,
+      originalFilename: file.originalname,
+      title: dto.title.trim(),
+      tags,
+      ...(this.trimOptional(dto.description) !== undefined
+        ? { description: this.trimOptional(dto.description) }
+        : {}),
+    });
+
+    const cloudName = this.cloudinaryService.getCloudName();
+    const thumbnail = await this.resolveThumbnailUrl({
+      thumbnailUrl: dto.thumbnailUrl,
+      thumbnailFile,
+      tags: [...tags, "video-upload"],
+    });
+    const thumbnailUrl =
+      thumbnail.thumbnailUrl ??
+      this.safeBuildCloudinaryThumbnailUrl(cloudName, uploadResult.publicId);
+    const slug = await this.ensureUniqueSlug(dto.slug ?? dto.title);
+    const uploadMetadata = this.removeUndefinedValues({
+      asset_id: uploadResult.assetId,
+      public_id: uploadResult.publicId,
+      version: uploadResult.version,
+      format: uploadResult.format,
+      resource_type: uploadResult.resourceType,
+      bytes: uploadResult.bytes,
+      width: uploadResult.width,
+      height: uploadResult.height,
+      duration: uploadResult.duration,
+      original_filename: uploadResult.originalFilename,
+    });
+
+    const video = await this.prisma.videoAsset.create({
+      data: {
+        title: dto.title.trim(),
+        slug,
+        description: this.trimNullable(dto.description),
+        provider: VideoProvider.CLOUDINARY,
+        sourceType: VideoSourceType.UPLOAD,
+        providerAssetId: uploadResult.publicId,
+        playbackId: uploadResult.publicId,
+        playbackUrl: uploadResult.secureUrl,
+        thumbnailUrl,
+        durationSeconds:
+          uploadResult.duration === undefined
+            ? (dto.durationSeconds ?? null)
+            : Math.round(uploadResult.duration),
+        viewCount: this.parseViewCount(dto.viewCount),
+        publishedAt: this.parseNullableDate(dto.publishedAt),
+        status: dto.status ?? VideoStatus.READY,
+        metadataJson: this.buildMetadataJson(
+          uploadMetadata,
+          thumbnail.thumbnailMetadata,
+        ),
+      },
+    });
+
+    await this.writeAudit(adminId, "VIDEO_UPLOAD", video.id, {
+      provider: video.provider,
+      status: video.status,
+    });
+
+    return this.toVideoResponse(video);
+  }
+
+  async uploadDatabaseVideo(
+    dto: UploadDatabaseVideoDto,
+    file: Express.Multer.File | undefined,
+    thumbnailFile: Express.Multer.File | undefined,
+    adminId: string,
+  ): Promise<VideoResponse> {
+    try {
+      this.ensureDatabaseVideoStorageEnabled();
+      this.validateDatabaseUploadFile(file);
+      await this.ensureDatabaseCanAcceptBlob(file.size);
+
+      const slug = await this.ensureUniqueSlug(dto.slug ?? dto.title);
+      const thumbnail = await this.resolveThumbnailUrl({
+        thumbnailUrl: dto.thumbnailUrl,
+        thumbnailFile,
+        tags: ["database-upload"],
+      });
+      const durationSeconds =
+        dto.durationSeconds ??
+        (await this.probeLocalDurationSeconds(file.path));
+      const data = await readFile(file.path);
+
+      let video: VideoAssetWithBinaryMetadata;
+
+      try {
+        video = await this.prisma.$transaction((transaction) =>
+          transaction.videoAsset.create({
+            data: {
+              title: dto.title.trim(),
+              slug,
+              description: this.trimNullable(dto.description),
+              provider: VideoProvider.MANUAL,
+              sourceType: VideoSourceType.DB_BLOB,
+              providerAssetId: null,
+              playbackId: null,
+              playbackUrl: null,
+              embedProvider: null,
+              embedUrl: null,
+              embedCloudName: null,
+              embedPublicId: null,
+              embedAllow: null,
+              thumbnailUrl: thumbnail.thumbnailUrl,
+              durationSeconds,
+              viewCount: this.parseViewCount(dto.viewCount),
+              publishedAt: this.parseNullableDate(dto.publishedAt),
+              status: dto.status ?? VideoStatus.READY,
+              metadataJson: this.buildMetadataJson(
+                undefined,
+                thumbnail.thumbnailMetadata,
+              ),
+              binaryAsset: {
+                create: {
+                  mimeType: file.mimetype,
+                  sizeBytes: BigInt(file.size),
+                  data,
+                },
+              },
+            },
+            include: {
+              binaryAsset: {
+                select: {
+                  mimeType: true,
+                  sizeBytes: true,
+                },
+              },
+            },
+          }),
+        );
+      } catch (error) {
+        if (this.isDatabasePacketTooLargeError(error)) {
+          throw this.createDatabasePacketLimitException();
+        }
+
+        throw error;
+      }
+
+      await this.writeAudit(adminId, "VIDEO_DB_UPLOAD", video.id, {
+        provider: video.provider,
+        sourceType: video.sourceType,
+        status: video.status,
+        mimeType: file.mimetype,
+        sizeBytes: String(file.size),
+      });
+
+      return this.toVideoResponse(video);
+    } finally {
+      await this.deleteTempUploadFile(file);
+      await this.deleteTempUploadFile(thumbnailFile);
+    }
+  }
+
+  async getDatabaseVideoBinary(id: string): Promise<DatabaseVideoBinary> {
+    const binaryAsset = await this.prisma.videoBinaryAsset.findUnique({
+      where: { videoId: id },
+      select: {
+        mimeType: true,
+        sizeBytes: true,
+        data: true,
+      },
+    });
+
+    if (binaryAsset === null) {
+      throw new NotFoundException("Database video binary asset not found.");
+    }
+
+    return {
+      mimeType: binaryAsset.mimeType,
+      sizeBytes: binaryAsset.sizeBytes,
+      data: Buffer.from(binaryAsset.data),
+    };
+  }
+
+  async replaceDatabaseVideoBinary(
+    id: string,
+    dto: ReplaceDatabaseVideoBinaryDto,
+    file: Express.Multer.File | undefined,
+    thumbnailFile: Express.Multer.File | undefined,
+    adminId: string,
+  ): Promise<VideoResponse> {
+    try {
+      this.ensureDatabaseVideoStorageEnabled();
+      this.validateDatabaseUploadFile(file);
+      await this.ensureDatabaseCanAcceptBlob(file.size);
+
+      const existingVideo = await this.prisma.videoAsset.findUnique({
+        where: { id },
+      });
+
+      if (existingVideo === null) {
+        throw new NotFoundException("Video not found.");
+      }
+
+      if (existingVideo.sourceType !== VideoSourceType.DB_BLOB) {
+        throw new BadRequestException(
+          "Only DB_BLOB videos can replace database binary data.",
+        );
+      }
+
+      const thumbnail = await this.resolveThumbnailUrl({
+        thumbnailUrl: dto.thumbnailUrl,
+        thumbnailFile,
+        tags: ["database-replace"],
+      });
+      const hasThumbnailInput =
+        thumbnailFile !== undefined || dto.thumbnailUrl !== undefined;
+      const nextThumbnailUrl = hasThumbnailInput
+        ? thumbnail.thumbnailUrl
+        : existingVideo.thumbnailUrl;
+      const durationSeconds =
+        dto.durationSeconds ??
+        (await this.probeLocalDurationSeconds(file.path)) ??
+        existingVideo.durationSeconds;
+      const data = await readFile(file.path);
+      const updateData: Prisma.VideoAssetUpdateInput = {
+        durationSeconds,
+        status: dto.status ?? existingVideo.status,
+        binaryAsset: {
+          upsert: {
+            create: {
+              mimeType: file.mimetype,
+              sizeBytes: BigInt(file.size),
+              data,
+            },
+            update: {
+              mimeType: file.mimetype,
+              sizeBytes: BigInt(file.size),
+              data,
+            },
+          },
+        },
+      };
+
+      if (hasThumbnailInput) {
+        updateData.thumbnailUrl = nextThumbnailUrl;
+        updateData.metadataJson = this.mergeThumbnailMetadataJson(
+          existingVideo.metadataJson,
+          thumbnail.thumbnailMetadata,
+        );
+      }
+
+      let video: VideoAssetWithBinaryMetadata;
+
+      try {
+        video = await this.prisma.$transaction((transaction) =>
+          transaction.videoAsset.update({
+            where: { id },
+            data: updateData,
+            include: {
+              binaryAsset: {
+                select: {
+                  mimeType: true,
+                  sizeBytes: true,
+                },
+              },
+            },
+          }),
+        );
+      } catch (error) {
+        if (this.isDatabasePacketTooLargeError(error)) {
+          throw this.createDatabasePacketLimitException();
+        }
+
+        throw error;
+      }
+
+      if (
+        hasThumbnailInput &&
+        nextThumbnailUrl !== existingVideo.thumbnailUrl
+      ) {
+        await this.deleteOwnedThumbnailBestEffort(
+          existingVideo.metadataJson,
+          existingVideo.thumbnailUrl,
+          existingVideo.id,
+        );
+      }
+
+      await this.writeAudit(adminId, "VIDEO_DB_BINARY_REPLACE", video.id, {
+        provider: video.provider,
+        sourceType: video.sourceType,
+        status: video.status,
+        mimeType: file.mimetype,
+        sizeBytes: String(file.size),
+        thumbnailReplaced:
+          hasThumbnailInput && nextThumbnailUrl !== existingVideo.thumbnailUrl,
+      });
+
+      return this.toVideoResponse(video);
+    } finally {
+      await this.deleteTempUploadFile(file);
+      await this.deleteTempUploadFile(thumbnailFile);
+    }
+  }
+
+  async updateVideo(
+    id: string,
+    dto: UpdateVideoDto,
+    adminId: string,
+  ): Promise<VideoResponse> {
+    const existingVideo = await this.prisma.videoAsset.findUnique({
+      where: { id },
+    });
+
+    if (existingVideo === null) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    const data: Prisma.VideoAssetUpdateInput = {};
+    let shouldCleanupOldThumbnail = false;
+
+    if (dto.title !== undefined) {
+      data.title = dto.title.trim();
+    }
+
+    if (dto.description !== undefined) {
+      data.description = this.trimNullable(dto.description);
+    }
+
+    if (dto.provider !== undefined) {
+      data.provider = dto.provider;
+    }
+
+    if (dto.providerAssetId !== undefined) {
+      data.providerAssetId = this.trimNullable(dto.providerAssetId);
+    }
+
+    if (dto.playbackId !== undefined) {
+      data.playbackId = this.trimNullable(dto.playbackId);
+    }
+
+    if (dto.playbackUrl !== undefined) {
+      data.playbackUrl = this.trimNullable(dto.playbackUrl);
+      data.sourceType = VideoSourceType.DIRECT_URL;
+
+      if (dto.embedUrl === undefined) {
+        data.embedProvider = null;
+        data.embedUrl = null;
+        data.embedCloudName = null;
+        data.embedPublicId = null;
+        data.embedAllow = null;
+      }
+    }
+
+    if (dto.embedUrl !== undefined) {
+      const parsedEmbed = this.parseEmbedInput(dto.embedUrl);
+      data.sourceType = VideoSourceType.EMBED;
+      data.embedProvider = parsedEmbed.provider;
+      data.embedUrl = parsedEmbed.embedUrl;
+      data.embedCloudName = parsedEmbed.cloudName ?? null;
+      data.embedPublicId = parsedEmbed.publicId ?? null;
+      data.embedAllow = parsedEmbed.allow;
+
+      if (
+        parsedEmbed.provider === EmbedProvider.CLOUDINARY_PLAYER &&
+        dto.provider === undefined
+      ) {
+        data.provider = VideoProvider.CLOUDINARY;
+      }
+
+      if (
+        parsedEmbed.publicId !== undefined &&
+        dto.providerAssetId === undefined
+      ) {
+        data.providerAssetId = parsedEmbed.publicId;
+      }
+    }
+
+    if (dto.thumbnailUrl !== undefined) {
+      const nextThumbnailUrl = this.trimNullable(dto.thumbnailUrl);
+      data.thumbnailUrl = nextThumbnailUrl;
+
+      if (nextThumbnailUrl !== existingVideo.thumbnailUrl) {
+        data.metadataJson = this.mergeThumbnailMetadataJson(
+          existingVideo.metadataJson,
+          null,
+        );
+        shouldCleanupOldThumbnail = true;
+      }
+    }
+
+    if (dto.durationSeconds !== undefined) {
+      data.durationSeconds = dto.durationSeconds;
+    }
+
+    if (dto.viewCount !== undefined) {
+      data.viewCount = this.parseViewCount(dto.viewCount);
+    }
+
+    if (dto.publishedAt !== undefined) {
+      data.publishedAt = this.parseNullableDate(dto.publishedAt);
+    }
+
+    if (dto.status !== undefined) {
+      data.status = dto.status;
+    }
+
+    if (dto.metadataJson !== undefined) {
+      data.metadataJson = this.toJsonInput(dto.metadataJson);
+    }
+
+    if (dto.slug !== undefined) {
+      data.slug = await this.ensureUniqueSlug(dto.slug, existingVideo.id);
+    } else if (
+      dto.title !== undefined &&
+      (existingVideo.slug === null || existingVideo.slug.trim() === "")
+    ) {
+      data.slug = await this.ensureUniqueSlug(dto.title, existingVideo.id);
+    }
+
+    const video = await this.prisma.videoAsset.update({
+      where: { id },
+      data,
+      include: {
+        binaryAsset: {
+          select: {
+            mimeType: true,
+            sizeBytes: true,
+          },
+        },
+      },
+    });
+
+    if (shouldCleanupOldThumbnail) {
+      await this.deleteOwnedThumbnailBestEffort(
+        existingVideo.metadataJson,
+        existingVideo.thumbnailUrl,
+        existingVideo.id,
+      );
+    }
+
+    await this.writeAudit(adminId, "VIDEO_UPDATE", video.id, {
+      status: video.status,
+    });
+
+    return this.toVideoResponse(video);
+  }
+
+  async disableVideo(
+    id: string,
+    adminId: string,
+  ): Promise<DisableVideoResponse> {
+    const existingVideo = await this.prisma.videoAsset.findUnique({
+      where: { id },
+      select: { id: true, status: true },
+    });
+
+    if (existingVideo === null) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    if (existingVideo.status !== VideoStatus.DISABLED) {
+      await this.prisma.videoAsset.update({
+        where: { id },
+        data: { status: VideoStatus.DISABLED },
+      });
+
+      await this.writeAudit(adminId, "VIDEO_DISABLE", id, {
+        previousStatus: existingVideo.status,
+      });
+    }
+
+    return {
+      message: "Video disabled successfully.",
+    };
+  }
+
+  async purgeVideo(
+    id: string,
+    dto: PurgeVideoDto,
+    adminId: string,
+  ): Promise<PurgeVideoResponse> {
+    if (dto.confirmVideoId !== id) {
+      throw new BadRequestException(
+        "Permanent delete confirmation does not match the video id.",
+      );
+    }
+
+    const deleteRemoteAsset = dto.deleteRemoteAsset ?? false;
+    const purgeResult = await this.prisma.$transaction(async (transaction) => {
+      const video = await transaction.videoAsset.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          provider: true,
+          sourceType: true,
+          providerAssetId: true,
+          thumbnailUrl: true,
+          metadataJson: true,
+        },
+      });
+
+      if (video === null) {
+        throw new NotFoundException("Video not found.");
+      }
+
+      const [websiteAssignmentCount, shareLinkVideoCount] = await Promise.all([
+        transaction.websiteVideo.count({ where: { videoId: id } }),
+        transaction.shareLinkVideo.count({ where: { videoId: id } }),
+      ]);
+      const hadWebsiteAssignments = websiteAssignmentCount > 0;
+      const hadShareLinks = shareLinkVideoCount > 0;
+
+      if (hadWebsiteAssignments || hadShareLinks) {
+        throw new BadRequestException(
+          "Video cannot be permanently deleted while it is assigned to websites or share links.",
+        );
+      }
+
+      await transaction.videoAsset.delete({ where: { id } });
+
+      return {
+        video,
+        hadWebsiteAssignments,
+        hadShareLinks,
+      };
+    });
+
+    const shouldDeleteRemoteAsset =
+      deleteRemoteAsset &&
+      purgeResult.video.provider === VideoProvider.CLOUDINARY &&
+      purgeResult.video.providerAssetId !== null;
+    let remoteAssetDeleted = false;
+
+    if (shouldDeleteRemoteAsset && purgeResult.video.providerAssetId !== null) {
+      remoteAssetDeleted = await this.deleteRemoteAssetBestEffort(
+        purgeResult.video.providerAssetId,
+        purgeResult.video.id,
+      );
+    }
+
+    const thumbnailDeleted = await this.deleteOwnedThumbnailBestEffort(
+      purgeResult.video.metadataJson,
+      purgeResult.video.thumbnailUrl,
+      purgeResult.video.id,
+    );
+
+    await this.writeAudit(adminId, "VIDEO_PURGE", id, {
+      provider: purgeResult.video.provider,
+      sourceType: purgeResult.video.sourceType,
+      hadWebsiteAssignments: purgeResult.hadWebsiteAssignments,
+      hadShareLinks: purgeResult.hadShareLinks,
+      deleteRemoteAsset,
+      remoteAssetDeleteAttempted: shouldDeleteRemoteAsset,
+      remoteAssetDeleted,
+      thumbnailDeleted,
+    });
+
+    return {
+      message: "Video permanently deleted successfully.",
+    };
+  }
+
+  private async probeRemoteDurationSeconds(
+    playbackUrl: string,
+  ): Promise<number | null> {
+    const metadata =
+      await this.videoMetadataService.probeRemoteVideoUrl(playbackUrl);
+
+    return metadata.durationSeconds;
+  }
+
+  private async probeLocalDurationSeconds(
+    path: string,
+  ): Promise<number | null> {
+    const metadata = await this.videoMetadataService.probeLocalVideoFile(path);
+
+    return metadata.durationSeconds;
+  }
+
+  private async deleteRemoteAssetBestEffort(
+    providerAssetId: string,
+    videoId: string,
+  ): Promise<boolean> {
+    try {
+      return await this.cloudinaryService.deleteVideoAsset(providerAssetId);
+    } catch (error) {
+      this.logger.warn(
+        {
+          videoId,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        },
+        "Cloudinary remote video asset deletion failed after video purge.",
+      );
+      return false;
+    }
+  }
+
+  private buildVideoWhere(
+    query: ListVideosQueryDto,
+  ): Prisma.VideoAssetWhereInput {
+    const where: Prisma.VideoAssetWhereInput = {};
+
+    if (query.status !== undefined) {
+      where.status = query.status;
+    }
+
+    if (query.provider !== undefined) {
+      where.provider = query.provider;
+    }
+
+    if (query.search !== undefined && query.search.trim() !== "") {
+      const search = query.search.trim();
+      where.OR = [
+        { title: { contains: search } },
+        { slug: { contains: search } },
+      ];
+    }
+
+    return where;
+  }
+
+  private buildVideoOrderBy(
+    sortBy: VideoSortField,
+    sortOrder: "asc" | "desc",
+  ): Prisma.VideoAssetOrderByWithRelationInput {
+    return { [sortBy]: sortOrder };
+  }
+
+  private resolveProvider(dto: CreateVideoDto): VideoProvider {
+    if (dto.provider !== undefined) {
+      return dto.provider;
+    }
+
+    if (
+      dto.playbackUrl !== undefined &&
+      this.isCloudinaryUrl(dto.playbackUrl)
+    ) {
+      return VideoProvider.CLOUDINARY;
+    }
+
+    return VideoProvider.MANUAL;
+  }
+
+  private isCloudinaryUrl(value: string): boolean {
+    try {
+      const url = new URL(value);
+      return url.hostname.endsWith("cloudinary.com");
+    } catch {
+      return false;
+    }
+  }
+
+  private async ensureUniqueSlug(
+    value: string,
+    currentVideoId?: string,
+  ): Promise<string> {
+    const baseSlug = createVideoSlug(value);
+    let candidate = baseSlug;
+    let suffix = 2;
+
+    while (true) {
+      const existing = await this.prisma.videoAsset.findUnique({
+        where: { slug: candidate },
+        select: { id: true },
+      });
+
+      if (existing === null || existing.id === currentVideoId) {
+        return candidate;
+      }
+
+      const suffixText = `-${suffix}`;
+      candidate = `${baseSlug.slice(0, 160 - suffixText.length)}${suffixText}`;
+      suffix += 1;
+
+      if (suffix > 1000) {
+        throw new ConflictException("Video slug is already in use.");
+      }
+    }
+  }
+
+  private validateUploadFile(
+    file: Express.Multer.File | undefined,
+  ): asserts file is Express.Multer.File {
+    if (file === undefined) {
+      throw new BadRequestException("Video file is required.");
+    }
+
+    if (!file.mimetype.startsWith("video/")) {
+      throw new BadRequestException("Uploaded file must be a video.");
+    }
+
+    const maxBytes = this.getUploadMaxBytes();
+    if (file.size > maxBytes) {
+      throw new BadRequestException(
+        `Video file must be ${this.getUploadMaxMegabytes()}MB or smaller.`,
+      );
+    }
+  }
+
+  private getUploadMaxMegabytes(): number {
+    const rawValue = this.configService.get<string>("VIDEO_UPLOAD_MAX_MB");
+    if (rawValue === undefined || rawValue.trim() === "") {
+      return 500;
+    }
+
+    const value = Number(rawValue);
+    if (!Number.isInteger(value) || value <= 0) {
+      return 500;
+    }
+
+    return value;
+  }
+
+  private getUploadMaxBytes(): number {
+    return this.getUploadMaxMegabytes() * 1024 * 1024;
+  }
+
+  private validateThumbnailFile(
+    file: Express.Multer.File | undefined,
+  ): Express.Multer.File | undefined {
+    if (file === undefined) {
+      return undefined;
+    }
+
+    if (!file.mimetype.startsWith("image/")) {
+      throw new BadRequestException("Thumbnail file must be an image.");
+    }
+
+    if (file.mimetype === "image/svg+xml") {
+      throw new BadRequestException("SVG thumbnails are not allowed.");
+    }
+
+    const maxBytes = this.getThumbnailUploadMaxBytes();
+    if (file.size > maxBytes) {
+      throw new BadRequestException(
+        `Thumbnail image file must be ${this.getThumbnailUploadMaxMegabytes()}MB or smaller.`,
+      );
+    }
+
+    return file;
+  }
+
+  private getThumbnailUploadMaxMegabytes(): number {
+    const rawValue = this.configService.get<string>(
+      "VIDEO_THUMBNAIL_UPLOAD_MAX_MB",
+    );
+    if (rawValue === undefined || rawValue.trim() === "") {
+      return DEFAULT_THUMBNAIL_UPLOAD_MAX_MB;
+    }
+
+    const value = Number(rawValue);
+    if (!Number.isInteger(value) || value <= 0) {
+      return DEFAULT_THUMBNAIL_UPLOAD_MAX_MB;
+    }
+
+    return Math.min(value, MAX_THUMBNAIL_UPLOAD_MAX_MB);
+  }
+
+  private getThumbnailUploadMaxBytes(): number {
+    return this.getThumbnailUploadMaxMegabytes() * 1024 * 1024;
+  }
+
+  private async resolveThumbnailUrl(params: {
+    thumbnailUrl?: string | undefined;
+    thumbnailFile?: Express.Multer.File | undefined;
+    tags?: string[] | undefined;
+  }): Promise<ResolvedThumbnail> {
+    const thumbnailFile = this.validateThumbnailFile(params.thumbnailFile);
+
+    if (thumbnailFile !== undefined) {
+      const fileBuffer = await this.readMulterFileBuffer(thumbnailFile);
+      const uploadResult = await this.cloudinaryService.uploadImage({
+        fileBuffer,
+        originalFilename: thumbnailFile.originalname,
+        tags: params.tags,
+      });
+
+      return {
+        thumbnailUrl: uploadResult.secureUrl,
+        thumbnailMetadata: this.removeUndefinedValues({
+          provider: "CLOUDINARY",
+          public_id: uploadResult.publicId,
+          secure_url: uploadResult.secureUrl,
+          asset_id: uploadResult.assetId,
+          version: uploadResult.version,
+          format: uploadResult.format,
+          resource_type: uploadResult.resourceType,
+          bytes: uploadResult.bytes,
+          width: uploadResult.width,
+          height: uploadResult.height,
+        }),
+      };
+    }
+
+    const thumbnailUrl = this.trimNullable(params.thumbnailUrl);
+
+    return {
+      thumbnailUrl:
+        thumbnailUrl === null
+          ? null
+          : this.validatePersistedThumbnailUrl(thumbnailUrl),
+      thumbnailMetadata: null,
+    };
+  }
+
+  private async readMulterFileBuffer(
+    file: Express.Multer.File,
+  ): Promise<Buffer> {
+    if (file.buffer !== undefined && file.buffer.length > 0) {
+      return file.buffer;
+    }
+
+    if (typeof file.path === "string" && file.path.trim() !== "") {
+      return readFile(file.path);
+    }
+
+    throw new BadRequestException(
+      "Thumbnail upload temporary file is unavailable.",
+    );
+  }
+
+  private validatePersistedThumbnailUrl(value: string): string {
+    try {
+      const url = new URL(value);
+
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        throw new Error("Unsupported thumbnail URL protocol.");
+      }
+
+      return value;
+    } catch {
+      throw new BadRequestException("Thumbnail URL must use http or https.");
+    }
+  }
+
+  private ensureDatabaseVideoStorageEnabled(): void {
+    if (!this.isDatabaseVideoStorageEnabled()) {
+      throw new BadRequestException("Database video storage is disabled.");
+    }
+  }
+
+  private isDatabaseVideoStorageEnabled(): boolean {
+    const rawValue = this.configService.get<boolean | string>(
+      "VIDEO_DB_STORAGE_ENABLED",
+    );
+    if (typeof rawValue === "boolean") {
+      return rawValue;
+    }
+
+    if (rawValue === undefined || rawValue.trim() === "") {
+      return false;
+    }
+
+    const value = rawValue.trim().toLowerCase();
+    return value === "true" || value === "1";
+  }
+
+  private validateDatabaseUploadFile(
+    file: Express.Multer.File | undefined,
+  ): asserts file is Express.Multer.File & { path: string } {
+    if (file === undefined) {
+      throw new BadRequestException("Video file is required.");
+    }
+
+    if (!file.mimetype.startsWith("video/")) {
+      throw new BadRequestException("Uploaded file must be a video.");
+    }
+
+    if (typeof file.path !== "string" || file.path.trim() === "") {
+      throw new BadRequestException(
+        "Database upload temporary file is unavailable.",
+      );
+    }
+
+    const maxBytes = this.getDatabaseUploadMaxBytes();
+    if (file.size > maxBytes) {
+      throw new BadRequestException(
+        `Database video file must be ${this.getDatabaseUploadMaxMegabytes()}MB or smaller.`,
+      );
+    }
+  }
+
+  private getDatabaseUploadMaxMegabytes(): number {
+    const rawValue = this.configService.get<string>("VIDEO_DB_UPLOAD_MAX_MB");
+    if (rawValue === undefined || rawValue.trim() === "") {
+      return DEFAULT_DB_UPLOAD_MAX_MB;
+    }
+
+    const value = Number(rawValue);
+    if (!Number.isInteger(value) || value <= 0) {
+      return DEFAULT_DB_UPLOAD_MAX_MB;
+    }
+
+    return Math.min(value, MAX_DB_UPLOAD_MAX_MB);
+  }
+
+  private getDatabaseUploadMaxBytes(): number {
+    return this.getDatabaseUploadMaxMegabytes() * 1024 * 1024;
+  }
+
+  private async ensureDatabaseCanAcceptBlob(
+    fileSizeBytes: number,
+  ): Promise<void> {
+    const maxAllowedPacketBytes = await this.getDatabaseMaxAllowedPacketBytes();
+
+    if (maxAllowedPacketBytes === null) {
+      this.logger.warn(
+        {
+          fileSizeBytes,
+        },
+        "Could not verify database max_allowed_packet before DB video upload.",
+      );
+      return;
+    }
+
+    const requiredPacketBytes = this.estimateDatabasePacketBytes(fileSizeBytes);
+
+    if (requiredPacketBytes > maxAllowedPacketBytes) {
+      throw this.createDatabasePacketLimitException({
+        maxAllowedPacketBytes,
+        requiredPacketBytes,
+      });
+    }
+  }
+
+  private async getDatabaseMaxAllowedPacketBytes(): Promise<number | null> {
+    try {
+      const rows = await this.prisma.$queryRaw<Array<Record<string, unknown>>>(
+        Prisma.sql`SHOW VARIABLES LIKE 'max_allowed_packet'`,
+      );
+      const firstRow = rows[0];
+
+      if (firstRow === undefined) {
+        return null;
+      }
+
+      const rawValue = this.readRawDatabaseVariableValue(firstRow);
+      const value =
+        typeof rawValue === "bigint"
+          ? Number(rawValue)
+          : Number(String(rawValue));
+
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        return null;
+      }
+
+      return value;
+    } catch (error) {
+      this.logger.warn(
+        {
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        },
+        "Failed to read database max_allowed_packet before DB video upload.",
+      );
+      return null;
+    }
+  }
+
+  private readRawDatabaseVariableValue(row: Record<string, unknown>): unknown {
+    for (const [key, value] of Object.entries(row)) {
+      if (key.toLowerCase() === "value") {
+        return value;
+      }
+    }
+
+    return undefined;
+  }
+
+  private estimateDatabasePacketBytes(fileSizeBytes: number): number {
+    const ratioOverhead = Math.ceil(
+      fileSizeBytes * DATABASE_PACKET_OVERHEAD_RATIO,
+    );
+    const overhead = Math.max(
+      DATABASE_PACKET_MIN_OVERHEAD_BYTES,
+      ratioOverhead,
+    );
+
+    return fileSizeBytes + overhead;
+  }
+
+  private createDatabasePacketLimitException(details?: {
+    maxAllowedPacketBytes?: number;
+    requiredPacketBytes?: number;
+  }): BadRequestException {
+    if (
+      details?.maxAllowedPacketBytes !== undefined &&
+      details.requiredPacketBytes !== undefined
+    ) {
+      return new BadRequestException(
+        `Database max_allowed_packet is too small for this video. Current limit is ${this.formatMegabytes(
+          details.maxAllowedPacketBytes,
+        )}, but this upload needs about ${this.formatMegabytes(
+          details.requiredPacketBytes,
+        )}. Increase Docker DB max_allowed_packet to ${RECOMMENDED_DATABASE_PACKET_MB}M and restart the database container.`,
+      );
+    }
+
+    return new BadRequestException(
+      `Database packet limit is too small for this video. Increase max_allowed_packet to ${RECOMMENDED_DATABASE_PACKET_MB}M and restart the database container.`,
+    );
+  }
+
+  private formatMegabytes(bytes: number): string {
+    return `${Math.ceil(bytes / (1024 * 1024))}MB`;
+  }
+
+  private isDatabasePacketTooLargeError(error: unknown): boolean {
+    const message = this.collectErrorMessages(error).join("\n").toLowerCase();
+
+    return (
+      message.includes("max_allowed_packet") ||
+      message.includes("packet bigger")
+    );
+  }
+
+  private collectErrorMessages(
+    error: unknown,
+    messages: string[] = [],
+    seen = new Set<object>(),
+  ): string[] {
+    if (typeof error === "string") {
+      messages.push(error);
+      return messages;
+    }
+
+    if (error instanceof Error) {
+      messages.push(error.message);
+
+      if (error.cause !== undefined) {
+        this.collectErrorMessages(error.cause, messages, seen);
+      }
+    }
+
+    if (typeof error !== "object" || error === null) {
+      return messages;
+    }
+
+    if (seen.has(error)) {
+      return messages;
+    }
+
+    seen.add(error);
+
+    const record = error as Record<string, unknown>;
+    for (const key of ["message", "cause", "error", "reason", "details"]) {
+      const value = record[key];
+
+      if (typeof value === "string") {
+        messages.push(value);
+      } else if (typeof value === "object" && value !== null) {
+        this.collectErrorMessages(value, messages, seen);
+      }
+    }
+
+    return messages;
+  }
+
+  private async deleteTempUploadFile(
+    file: Express.Multer.File | undefined,
+  ): Promise<void> {
+    if (
+      file === undefined ||
+      typeof file.path !== "string" ||
+      file.path.trim() === ""
+    ) {
+      return;
+    }
+
+    try {
+      await unlink(file.path);
+    } catch (error) {
+      this.logger.warn(
+        {
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        },
+        "Temporary database video upload cleanup failed.",
+      );
+    }
+  }
+
+  private parseEmbedInput(input: string): ParsedVideoEmbed {
+    return parseVideoEmbedInput({
+      input,
+      allowedHosts: this.getEmbedAllowedHosts(),
+      defaultAllow: this.getEmbedDefaultAllow(),
+    });
+  }
+
+  private getEmbedAllowedHosts(): string[] {
+    const rawValue = this.configService.get<string>(
+      "VIDEO_EMBED_ALLOWED_HOSTS",
+    );
+
+    if (rawValue === undefined || rawValue.trim() === "") {
+      return DEFAULT_VIDEO_EMBED_ALLOWED_HOSTS;
+    }
+
+    const hosts = rawValue
+      .split(",")
+      .map((host) => host.trim().toLowerCase())
+      .filter((host) => host.length > 0);
+
+    return hosts.length > 0 ? hosts : DEFAULT_VIDEO_EMBED_ALLOWED_HOSTS;
+  }
+
+  private getEmbedDefaultAllow(): string {
+    const rawValue = this.configService.get<string>(
+      "VIDEO_EMBED_DEFAULT_ALLOW",
+    );
+
+    if (rawValue === undefined || rawValue.trim() === "") {
+      return DEFAULT_VIDEO_EMBED_ALLOW;
+    }
+
+    return rawValue.trim();
+  }
+
+  private buildEmbedThumbnailUrl(embed: ParsedVideoEmbed): string | null {
+    if (
+      embed.provider !== EmbedProvider.CLOUDINARY_PLAYER ||
+      embed.cloudName === undefined ||
+      embed.publicId === undefined
+    ) {
+      return null;
+    }
+
+    return this.safeBuildCloudinaryThumbnailUrl(
+      embed.cloudName,
+      embed.publicId,
+    );
+  }
+
+  private parseViewCount(value: string | undefined): bigint {
+    if (value === undefined || value.trim() === "") {
+      return BigInt(0);
+    }
+
+    return BigInt(value);
+  }
+
+  private parseNullableDate(value: string | undefined): Date | null {
+    if (value === undefined || value.trim() === "") {
+      return null;
+    }
+
+    return new Date(value);
+  }
+
+  private toJsonInput(value: Record<string, unknown>): Prisma.InputJsonValue {
+    return value as Prisma.InputJsonValue;
+  }
+
+  private buildMetadataJson(
+    baseMetadata: Record<string, unknown> | undefined,
+    thumbnailMetadata: Record<string, unknown> | null,
+  ) {
+    const metadata = this.removeUndefinedValues({
+      ...(baseMetadata ?? {}),
+      ...(thumbnailMetadata === null
+        ? {}
+        : {
+            thumbnail: thumbnailMetadata,
+          }),
+    });
+
+    if (Object.keys(metadata).length === 0) {
+      return Prisma.JsonNull;
+    }
+
+    return this.toJsonInput(metadata);
+  }
+
+  private mergeThumbnailMetadataJson(
+    baseMetadataJson: Prisma.JsonValue | null,
+    thumbnailMetadata: Record<string, unknown> | null,
+  ) {
+    const metadata = this.metadataJsonToRecord(baseMetadataJson);
+
+    if (thumbnailMetadata === null) {
+      delete metadata.thumbnail;
+    } else {
+      metadata.thumbnail = thumbnailMetadata;
+    }
+
+    if (Object.keys(metadata).length === 0) {
+      return Prisma.JsonNull;
+    }
+
+    return this.toJsonInput(metadata);
+  }
+
+  private metadataJsonToRecord(
+    value: Prisma.JsonValue | null,
+  ): Record<string, unknown> {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      return {};
+    }
+
+    return { ...(value as Record<string, unknown>) };
+  }
+
+  private async deleteOwnedThumbnailBestEffort(
+    metadataJson: Prisma.JsonValue | null,
+    currentThumbnailUrl: string | null,
+    videoId: string,
+  ): Promise<boolean> {
+    const thumbnail = this.readOwnedCloudinaryThumbnailMetadata(
+      metadataJson,
+      currentThumbnailUrl,
+    );
+
+    if (thumbnail === null) {
+      return false;
+    }
+
+    try {
+      const deleted = await this.cloudinaryService.deleteImage(
+        thumbnail.publicId,
+      );
+
+      if (!deleted) {
+        this.logger.warn(
+          {
+            videoId,
+            publicId: thumbnail.publicId,
+          },
+          "Cloudinary thumbnail deletion did not confirm success.",
+        );
+      }
+
+      return deleted;
+    } catch (error) {
+      this.logger.warn(
+        {
+          videoId,
+          publicId: thumbnail.publicId,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        },
+        "Owned thumbnail cleanup failed.",
+      );
+      return false;
+    }
+  }
+
+  private readOwnedCloudinaryThumbnailMetadata(
+    metadataJson: Prisma.JsonValue | null,
+    currentThumbnailUrl: string | null,
+  ): { publicId: string } | null {
+    const metadata = this.metadataJsonToRecord(metadataJson);
+    const thumbnail = metadata.thumbnail;
+
+    if (
+      thumbnail === null ||
+      thumbnail === undefined ||
+      typeof thumbnail !== "object" ||
+      Array.isArray(thumbnail)
+    ) {
+      return null;
+    }
+
+    const thumbnailRecord = thumbnail as Record<string, unknown>;
+    const provider = String(thumbnailRecord.provider ?? "").toUpperCase();
+    const publicId =
+      typeof thumbnailRecord.public_id === "string"
+        ? thumbnailRecord.public_id.trim()
+        : "";
+    const secureUrl =
+      typeof thumbnailRecord.secure_url === "string"
+        ? thumbnailRecord.secure_url.trim()
+        : "";
+
+    if (
+      provider !== "CLOUDINARY" ||
+      publicId === "" ||
+      secureUrl === "" ||
+      currentThumbnailUrl === null ||
+      secureUrl !== currentThumbnailUrl.trim()
+    ) {
+      return null;
+    }
+
+    const folder = this.getConfiguredThumbnailUploadFolder();
+    if (!this.isCloudinaryPublicIdInsideFolder(publicId, folder)) {
+      return null;
+    }
+
+    return { publicId };
+  }
+
+  private getConfiguredThumbnailUploadFolder(): string {
+    const explicitFolder = this.configService
+      .get<string>("CLOUDINARY_THUMBNAIL_UPLOAD_FOLDER")
+      ?.trim();
+
+    if (explicitFolder) {
+      return explicitFolder.replace(/^\/+|\/+$/g, "");
+    }
+
+    const uploadFolder =
+      this.configService.get<string>("CLOUDINARY_UPLOAD_FOLDER") ??
+      "video-share-cms/videos";
+
+    return `${uploadFolder.replace(/^\/+|\/+$/g, "")}/thumbnails`;
+  }
+
+  private isCloudinaryPublicIdInsideFolder(
+    publicId: string,
+    folder: string,
+  ): boolean {
+    const normalizedFolder = folder.replace(/^\/+|\/+$/g, "");
+    const normalizedPublicId = publicId.replace(/^\/+/g, "");
+
+    return (
+      normalizedPublicId === normalizedFolder ||
+      normalizedPublicId.startsWith(`${normalizedFolder}/`)
+    );
+  }
+
+  private trimOptional(value: string | undefined): string | undefined {
+    if (value === undefined) {
+      return undefined;
+    }
+
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+
+  private trimNullable(value: string | undefined): string | null {
+    return this.trimOptional(value) ?? null;
+  }
+
+  private removeUndefinedValues(
+    value: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return Object.fromEntries(
+      Object.entries(value).filter(
+        ([, entryValue]) => entryValue !== undefined,
+      ),
+    );
+  }
+
+  private parseTags(value: string | undefined): string[] {
+    if (value === undefined || value.trim() === "") {
+      return [];
+    }
+
+    return value
+      .split(",")
+      .map((tag) => tag.trim())
+      .filter((tag) => tag.length > 0);
+  }
+
+  private safeBuildCloudinaryThumbnailUrl(
+    cloudName: string,
+    publicId: string,
+  ): string | null {
+    try {
+      return buildCloudinaryVideoThumbnailUrl(cloudName, publicId);
+    } catch {
+      return null;
+    }
+  }
+
+  private async writeAudit(
+    adminId: string,
+    action: VideoMutationAction,
+    videoId: string,
+    metadata: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      await this.prisma.adminAuditLog.create({
+        data: {
+          adminId,
+          action,
+          module: "videos",
+          entityType: "VideoAsset",
+          entityId: videoId,
+          status: AuditStatus.SUCCESS,
+          metadataJson: this.toJsonInput(metadata),
+        },
+      });
+    } catch (error) {
+      this.logger.warn(
+        {
+          action,
+          videoId,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        },
+        "Admin video audit log write failed.",
+      );
+    }
+  }
+
+  private buildBinaryPlaybackUrl(videoId: string): string {
+    const rawPrefix = this.configService.get<string>("API_PREFIX") ?? "api/v1";
+    const prefix = rawPrefix.replace(/^\/+|\/+$/g, "") || "api/v1";
+
+    return `/${prefix}/admin/videos/${videoId}/binary`;
+  }
+
+  private toVideoResponse(video: VideoAssetWithBinaryMetadata): VideoResponse {
+    const binaryAsset = video.binaryAsset ?? null;
+
+    return {
+      id: video.id,
+      title: video.title,
+      slug: video.slug,
+      description: video.description,
+      provider: video.provider,
+      sourceType: video.sourceType,
+      providerAssetId: video.providerAssetId,
+      playbackId: video.playbackId,
+      playbackUrl: video.playbackUrl,
+      embedProvider: video.embedProvider,
+      embedUrl: video.embedUrl,
+      embedCloudName: video.embedCloudName,
+      embedPublicId: video.embedPublicId,
+      embedAllow: video.embedAllow,
+      thumbnailUrl: video.thumbnailUrl,
+      durationSeconds: video.durationSeconds,
+      viewCount: video.viewCount.toString(),
+      publishedAt: video.publishedAt,
+      status: video.status,
+      metadataJson: video.metadataJson,
+      binaryAsset:
+        binaryAsset === null
+          ? null
+          : {
+              mimeType: binaryAsset.mimeType,
+              sizeBytes: binaryAsset.sizeBytes.toString(),
+            },
+      binaryPlaybackUrl:
+        binaryAsset === null ? null : this.buildBinaryPlaybackUrl(video.id),
+      createdAt: video.createdAt,
+      updatedAt: video.updatedAt,
+    };
+  }
+}

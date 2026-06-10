@@ -9,7 +9,7 @@ import {
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { JwtService } from "@nestjs/jwt";
-import { hash, verify } from "argon2";
+import { compare, hash } from "bcryptjs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { PrismaService } from "../database/prisma.service";
 import type { Prisma } from "../generated/prisma/client";
@@ -44,6 +44,8 @@ type AdminAuthRecord = {
   lastLoginAt: Date | null;
 };
 
+const PASSWORD_HASH_ROUNDS = 12;
+
 @Injectable()
 export class AdminAuthService {
   private readonly logger = new Logger(AdminAuthService.name);
@@ -69,7 +71,7 @@ export class AdminAuthService {
     }
 
     const username = this.normalizeUsername(dto.username);
-    const passwordHash = await hash(dto.password);
+    const passwordHash = await hash(dto.password, PASSWORD_HASH_ROUNDS);
 
     const admin = await this.prisma.adminUser.create({
       data: {
@@ -101,7 +103,7 @@ export class AdminAuthService {
       throw new UnauthorizedException("Invalid username or password.");
     }
 
-    const passwordMatches = await verify(admin.passwordHash, dto.password);
+    const passwordMatches = await compare(dto.password, admin.passwordHash);
     if (!passwordMatches) {
       throw new UnauthorizedException("Invalid username or password.");
     }
@@ -204,9 +206,9 @@ export class AdminAuthService {
       throw new UnauthorizedException("Unauthorized.");
     }
 
-    const oldPasswordMatches = await verify(
-      admin.passwordHash,
+    const oldPasswordMatches = await compare(
       dto.oldPassword,
+      admin.passwordHash,
     );
     const secretMatches = this.isChangePasswordSecretValid(dto.secretCode);
     if (!oldPasswordMatches || !secretMatches) {
@@ -219,7 +221,7 @@ export class AdminAuthService {
       );
     }
 
-    const passwordHash = await hash(dto.newPassword);
+    const passwordHash = await hash(dto.newPassword, PASSWORD_HASH_ROUNDS);
     const revokedAt = new Date();
 
     await this.prisma.$transaction(async (tx) => {

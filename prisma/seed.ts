@@ -1,5 +1,5 @@
 import { PrismaMariaDb } from "@prisma/adapter-mariadb";
-import { hash } from "argon2";
+import { hash } from "bcryptjs";
 import { config } from "dotenv";
 import {
   AccountStatus,
@@ -8,6 +8,7 @@ import {
 } from "../src/generated/prisma/client";
 
 const USERNAME_PATTERN = /^[a-zA-Z0-9_]+$/;
+const PASSWORD_HASH_ROUNDS = 12;
 
 config({ path: ".env" });
 
@@ -62,7 +63,7 @@ const prisma = new PrismaClient({
 async function main(): Promise<void> {
   const username = requireBootstrapUsername();
   const password = requireEnv("ADMIN_BOOTSTRAP_PASSWORD");
-  const passwordHash = await hash(password);
+  const passwordHash = await hash(password, PASSWORD_HASH_ROUNDS);
 
   await prisma.adminUser.upsert({
     where: { username },

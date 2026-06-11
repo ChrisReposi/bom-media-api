@@ -15,6 +15,9 @@ export interface ApiEnvironmentConfig {
   prefix: string;
   docsEnabled: boolean;
   corsAllowedOrigins: string[];
+  corsAllowDbDomains: boolean;
+  corsDbOriginCacheTtlMs: number;
+  corsAllowLocalhostDbDomains: boolean;
 }
 
 function parseBoolean(value: string | undefined, fallback: boolean): boolean {
@@ -36,6 +39,21 @@ function parseOrigins(value: string | undefined): string[] {
     .filter((origin) => origin.length > 0);
 }
 
+function parsePositiveInteger(
+  value: string | undefined,
+  fallback: number,
+): number {
+  if (value === undefined || value.trim() === "") {
+    return fallback;
+  }
+
+  const parsedValue = Number(value);
+
+  return Number.isInteger(parsedValue) && parsedValue > 0
+    ? parsedValue
+    : fallback;
+}
+
 export const apiConfig = registerAs("api", (): ApiEnvironmentConfig => {
   const nodeEnv = process.env.NODE_ENV ?? "development";
   const adminOrigin = process.env.ADMIN_WEB_ORIGIN ?? DEFAULT_ADMIN_WEB_ORIGIN;
@@ -52,6 +70,15 @@ export const apiConfig = registerAs("api", (): ApiEnvironmentConfig => {
     ),
     corsAllowedOrigins: Array.from(
       new Set([adminOrigin, ...parseOrigins(process.env.CORS_ALLOWED_ORIGINS)]),
+    ),
+    corsAllowDbDomains: parseBoolean(process.env.CORS_ALLOW_DB_DOMAINS, true),
+    corsDbOriginCacheTtlMs: parsePositiveInteger(
+      process.env.CORS_DB_ORIGIN_CACHE_TTL_MS,
+      60_000,
+    ),
+    corsAllowLocalhostDbDomains: parseBoolean(
+      process.env.CORS_ALLOW_LOCALHOST_DB_DOMAINS,
+      nodeEnv !== "production",
     ),
   };
 });

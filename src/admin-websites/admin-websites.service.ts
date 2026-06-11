@@ -29,16 +29,23 @@ import { hashShareToken } from "../public/utils/share-token.util";
 import type { ActivateWebsiteDomainDto } from "./dto/activate-website-domain.dto";
 import type { AssignWebsiteVideosDto } from "./dto/assign-website-videos.dto";
 import type { ClaimCurrentWebsiteDomainDto } from "./dto/claim-current-website-domain.dto";
+import type { AssignDomainToWebsiteDto } from "./dto/assign-domain-to-website.dto";
+import type { CreateDomainDto } from "./dto/create-domain.dto";
 import type { CreateDomainGroupDto } from "./dto/create-domain-group.dto";
 import type { CreateShareLinkDto } from "./dto/create-share-link.dto";
 import type { CreateWebsiteDomainDto } from "./dto/create-website-domain.dto";
 import type { CreateWebsiteDto } from "./dto/create-website.dto";
+import type { ListDomainsQueryDto } from "./dto/list-domains-query.dto";
 import type { ListDomainGroupsQueryDto } from "./dto/list-domain-groups-query.dto";
 import type { ListWebsitesQueryDto } from "./dto/list-websites-query.dto";
+import type { UpdateDomainDto } from "./dto/update-domain.dto";
 import type { UpdateDomainGroupDto } from "./dto/update-domain-group.dto";
 import type { UpdateWebsiteDomainDto } from "./dto/update-website-domain.dto";
 import type { UpdateWebsiteDto } from "./dto/update-website.dto";
-import type {
+import {
+  AdminDomainUsageStatus,
+  type AdminDomainListResponse,
+  type AdminDomainResponse,
   AdminDomainGroupListResponse,
   AdminDomainGroupResponse,
   AdminWebsiteAssignedVideoResponse,
@@ -60,6 +67,7 @@ import {
   normalizeDomain,
   normalizeWebsiteSlug,
 } from "./utils/normalize-domain.util";
+import { CorsOriginService } from "../security/cors-origin.service";
 import {
   buildPublicShareUrl,
   generateShareToken,
@@ -67,6 +75,11 @@ import {
 
 type WebsiteWithRelations = Website & {
   domains: WebsiteDomain[];
+  domainGroup: DomainGroup | null;
+};
+
+type DomainWithRelations = WebsiteDomain & {
+  website: Pick<Website, "id" | "name" | "slug" | "status"> | null;
   domainGroup: DomainGroup | null;
 };
 
@@ -79,6 +92,13 @@ type ShareLinkWithVideos = ShareLink & {
 };
 
 type AuditAction =
+  | "DOMAIN_CREATE"
+  | "DOMAIN_UPDATE"
+  | "DOMAIN_DISABLE"
+  | "DOMAIN_ACTIVATE"
+  | "DOMAIN_ASSIGN"
+  | "DOMAIN_UNASSIGN"
+  | "DOMAIN_TRANSFER_ATTEMPT_REJECTED"
   | "DOMAIN_GROUP_CREATE"
   | "DOMAIN_GROUP_UPDATE"
   | "DOMAIN_GROUP_DISABLE"
@@ -101,6 +121,7 @@ export class AdminWebsitesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly corsOriginService: CorsOriginService,
   ) {}
 
   async listDomainGroups(
@@ -260,6 +281,286 @@ export class AdminWebsitesService {
     }
 
     return { message: "Domain group disabled successfully." };
+  }
+
+  async listDomains(query: ListDomainsQueryDto): Promise<AdminDomainListResponse> {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 50;
+    const skip = (page - 1) * limit;
+    const where = this.buildDomainWhere(query);
+
+    const [items, total] = await this.prisma.$transaction([
+      this.prisma.websiteDomain.findMany({
+        where,
+        include: {
+          website: {
+            select: {
+              id: true,
+              name: true,
+              slug: true,
+              status: true,
+            },
+          },
+          domainGroup: true,
+        },
+        orderBy: [{ status: "asc" }, { domain: "asc" }],
+        skip,
+        take: limit,
+      }),
+      this.prisma.websiteDomain.count({ where }),
+    ]);
+
+    return {
+      items: items.map((domain) => this.toAdminDomainResponse(domain)),
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  async getDomain(domainId: string): Promise<AdminDomainResponse> {
+    return this.toAdminDomainResponse(await this.getDomainWithRelations(domainId));
+  }
+
+  async createStandaloneDomain(
+    dto: CreateDomainDto,
+    adminId: string,
+  ): Promise<AdminDomainResponse> {
+    const domain = this.parseDomain(dto.domain);
+    this.ensureLocalhostDomainAllowed(domain);
+    await this.ensureDomainAvailable(domain);
+    const domainGroupId = await this.resolveActiveDomainGroupId({
+      domainGroupKey: dto.domainGroupKey,
+      domainGroupId: dto.domainGroupId,
+    });
+
+    const domainRecord = await this.prisma.websiteDomain.create({
+      data: {
+        domain,
+        status: dto.status ?? DomainStatus.ACTIVE,
+        ...(domainGroupId ? { domainGroupId } : {}),
+      },
+      include: {
+        website: {
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            status: true,
+          },
+        },
+        domainGroup: true,
+      },
+    });
+
+    await this.writeAudit(adminId, "DOMAIN_CREATE", "WebsiteDomain", domainRecord.id, {
+      domain: domainRecord.domain,
+      domainGroupId: domainRecord.domainGroupId,
+      status: domainRecord.status,
+    });
+    this.clearCorsDomainCache();
+
+    return this.toAdminDomainResponse(domainRecord);
+  }
+
+  async updateStandaloneDomain(
+    domainId: string,
+    dto: UpdateDomainDto,
+    adminId: string,
+  ): Promise<AdminDomainResponse> {
+    const existingDomain = await this.getDomainWithRelations(domainId);
+    const data: Prisma.WebsiteDomainUpdateInput = {};
+
+    if (dto.domain !== undefined) {
+      const domain = this.parseDomain(dto.domain);
+      this.ensureLocalhostDomainAllowed(domain);
+      await this.ensureDomainAvailable(domain, existingDomain.id);
+      data.domain = domain;
+    }
+
+    if (dto.status === DomainStatus.DISABLED && existingDomain.websiteId !== null) {
+      throw new BadRequestException(
+        "Cannot disable a domain that is assigned to a website. Unassign it first.",
+      );
+    }
+
+    if (dto.status !== undefined) {
+      data.status = dto.status;
+      if (dto.status === DomainStatus.DISABLED) {
+        data.isPrimary = false;
+      }
+    }
+
+    if (dto.domainGroupKey !== undefined || dto.domainGroupId !== undefined) {
+      const domainGroupId = await this.resolveActiveDomainGroupId({
+        domainGroupKey: dto.domainGroupKey,
+        domainGroupId: dto.domainGroupId,
+      });
+      data.domainGroup =
+        domainGroupId === null
+          ? { disconnect: true }
+          : { connect: { id: domainGroupId } };
+    }
+
+    const domainRecord = await this.prisma.websiteDomain.update({
+      where: { id: domainId },
+      data,
+      include: {
+        website: {
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            status: true,
+          },
+        },
+        domainGroup: true,
+      },
+    });
+
+    await this.writeAudit(adminId, "DOMAIN_UPDATE", "WebsiteDomain", domainRecord.id, {
+      domain: domainRecord.domain,
+      domainGroupId: domainRecord.domainGroupId,
+      status: domainRecord.status,
+    });
+    this.clearCorsDomainCache();
+
+    return this.toAdminDomainResponse(domainRecord);
+  }
+
+  async disableStandaloneDomain(
+    domainId: string,
+    adminId: string,
+  ): Promise<AdminDomainResponse> {
+    const existingDomain = await this.getDomainWithRelations(domainId);
+
+    if (existingDomain.websiteId !== null) {
+      throw new BadRequestException(
+        "Cannot disable a domain that is assigned to a website. Unassign it first.",
+      );
+    }
+
+    const domainRecord = await this.prisma.websiteDomain.update({
+      where: { id: domainId },
+      data: {
+        status: DomainStatus.DISABLED,
+        isPrimary: false,
+      },
+      include: {
+        website: {
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            status: true,
+          },
+        },
+        domainGroup: true,
+      },
+    });
+
+    await this.writeAudit(
+      adminId,
+      "DOMAIN_DISABLE",
+      "WebsiteDomain",
+      domainRecord.id,
+      { domain: domainRecord.domain },
+    );
+    this.clearCorsDomainCache();
+
+    return this.toAdminDomainResponse(domainRecord);
+  }
+
+  async activateStandaloneDomain(
+    domainId: string,
+    adminId: string,
+  ): Promise<AdminDomainResponse> {
+    const domainRecord = await this.prisma.websiteDomain.update({
+      where: { id: domainId },
+      data: { status: DomainStatus.ACTIVE },
+      include: {
+        website: {
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            status: true,
+          },
+        },
+        domainGroup: true,
+      },
+    });
+
+    await this.writeAudit(
+      adminId,
+      "DOMAIN_ACTIVATE",
+      "WebsiteDomain",
+      domainRecord.id,
+      { domain: domainRecord.domain },
+    );
+    this.clearCorsDomainCache();
+
+    return this.toAdminDomainResponse(domainRecord);
+  }
+
+  async assignDomainToWebsite(
+    domainId: string,
+    dto: AssignDomainToWebsiteDto,
+    adminId: string,
+  ): Promise<AdminDomainResponse> {
+    const domainRecord = await this.assignDomainToWebsiteRecord({
+      domainId,
+      websiteId: dto.websiteId,
+      replaceExisting: dto.replaceExisting === true,
+      adminId,
+    });
+
+    return this.toAdminDomainResponse(domainRecord);
+  }
+
+  async unassignDomainFromWebsite(
+    domainId: string,
+    adminId: string,
+  ): Promise<AdminDomainResponse> {
+    const existingDomain = await this.getDomainWithRelations(domainId);
+
+    if (existingDomain.websiteId === null) {
+      return this.toAdminDomainResponse(existingDomain);
+    }
+
+    const previousWebsiteId = existingDomain.websiteId;
+    const domainRecord = await this.prisma.websiteDomain.update({
+      where: { id: domainId },
+      data: {
+        website: { disconnect: true },
+        isPrimary: false,
+      },
+      include: {
+        website: {
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            status: true,
+          },
+        },
+        domainGroup: true,
+      },
+    });
+
+    await this.writeAudit(
+      adminId,
+      "DOMAIN_UNASSIGN",
+      "WebsiteDomain",
+      domainRecord.id,
+      { domain: domainRecord.domain, previousWebsiteId },
+    );
+    this.clearCorsDomainCache();
+
+    return this.toAdminDomainResponse(domainRecord);
   }
 
   async listWebsites(
@@ -438,6 +739,9 @@ export class AdminWebsitesService {
     await this.writeAudit(adminId, "WEBSITE_UPDATE", "Website", website.id, {
       status: website.status,
     });
+    if (dto.status !== undefined) {
+      this.clearCorsDomainCache();
+    }
 
     return this.toWebsiteResponse(website);
   }
@@ -464,6 +768,7 @@ export class AdminWebsitesService {
       await this.writeAudit(adminId, "WEBSITE_DISABLE", "Website", id, {
         previousStatus: existingWebsite.status,
       });
+      this.clearCorsDomainCache();
     }
 
     return { message: "Website disabled successfully." };
@@ -474,37 +779,34 @@ export class AdminWebsitesService {
     dto: CreateWebsiteDomainDto,
     adminId: string,
   ): Promise<AdminWebsiteDomainResponse> {
-    await this.ensureWebsiteExists(websiteId);
-    const domain = this.parseDomain(dto.domain);
-    await this.ensureDomainAvailable(domain);
-    const status = dto.status ?? DomainStatus.ACTIVE;
-    if (dto.isPrimary === true && status !== DomainStatus.ACTIVE) {
-      throw new BadRequestException("Only ACTIVE domains can be primary.");
-    }
-
+    const website = await this.getActiveWebsiteForDomainAssignment(websiteId);
     const existingDomainCount = await this.prisma.websiteDomain.count({
       where: { websiteId },
     });
-    const shouldBePrimary =
-      status === DomainStatus.ACTIVE &&
-      (dto.isPrimary === true || existingDomainCount === 0);
 
-    const domainRecord = await this.prisma.$transaction(async (tx) => {
-      if (shouldBePrimary) {
-        await tx.websiteDomain.updateMany({
-          where: { websiteId },
-          data: { isPrimary: false },
-        });
-      }
+    if (existingDomainCount > 0) {
+      throw new BadRequestException(
+        "This website already has a domain. Assign an available domain with replaceExisting to replace it.",
+      );
+    }
 
-      return tx.websiteDomain.create({
-        data: {
-          websiteId,
-          domain,
-          isPrimary: shouldBePrimary,
-          status,
-        },
-      });
+    const domain = this.parseDomain(dto.domain);
+    this.ensureLocalhostDomainAllowed(domain);
+    await this.ensureDomainAvailable(domain);
+    const status = dto.status ?? DomainStatus.ACTIVE;
+
+    if (status !== DomainStatus.ACTIVE) {
+      throw new BadRequestException("Assigned domains must be ACTIVE.");
+    }
+
+    const domainRecord = await this.prisma.websiteDomain.create({
+      data: {
+        websiteId,
+        ...(website.domainGroupId ? { domainGroupId: website.domainGroupId } : {}),
+        domain,
+        isPrimary: true,
+        status,
+      },
     });
 
     await this.writeAudit(
@@ -514,6 +816,7 @@ export class AdminWebsitesService {
       domainRecord.id,
       { domain: domainRecord.domain, websiteId },
     );
+    this.clearCorsDomainCache();
 
     return this.toDomainResponse(domainRecord);
   }
@@ -529,11 +832,17 @@ export class AdminWebsitesService {
 
     if (dto.domain !== undefined) {
       const domain = this.parseDomain(dto.domain);
+      this.ensureLocalhostDomainAllowed(domain);
       await this.ensureDomainAvailable(domain, existingDomain.id);
       data.domain = domain;
     }
 
     if (dto.status !== undefined) {
+      if (dto.status === DomainStatus.DISABLED) {
+        throw new BadRequestException(
+          "Cannot disable a domain that is assigned to a website. Unassign it first.",
+        );
+      }
       data.status = dto.status;
     }
 
@@ -547,10 +856,6 @@ export class AdminWebsitesService {
       finalStatus === DomainStatus.DISABLED ? false : requestedIsPrimary;
     if (dto.isPrimary === true && finalStatus !== DomainStatus.ACTIVE) {
       throw new BadRequestException("Only ACTIVE domains can be primary.");
-    }
-
-    if (dto.status === DomainStatus.DISABLED) {
-      data.isPrimary = false;
     }
 
     const domainRecord = await this.prisma.$transaction(async (tx) => {
@@ -574,6 +879,7 @@ export class AdminWebsitesService {
       domainRecord.id,
       { domain: domainRecord.domain, websiteId },
     );
+    this.clearCorsDomainCache();
 
     return this.toDomainResponse(domainRecord);
   }
@@ -585,23 +891,17 @@ export class AdminWebsitesService {
   ): Promise<AdminWebsiteDomainResponse> {
     await this.getDomainForWebsite(websiteId, domainId);
 
-    const domainRecord = await this.prisma.websiteDomain.update({
-      where: { id: domainId },
-      data: {
-        status: DomainStatus.DISABLED,
-        isPrimary: false,
-      },
-    });
-
     await this.writeAudit(
       adminId,
-      "WEBSITE_DOMAIN_DISABLE",
+      "DOMAIN_TRANSFER_ATTEMPT_REJECTED",
       "WebsiteDomain",
-      domainRecord.id,
-      { domain: domainRecord.domain, websiteId },
+      domainId,
+      { reason: "DISABLE_ASSIGNED_DOMAIN_REJECTED", websiteId },
     );
 
-    return this.toDomainResponse(domainRecord);
+    throw new BadRequestException(
+      "Cannot disable a domain that is assigned to a website. Unassign it first.",
+    );
   }
 
   async activateDomain(
@@ -611,6 +911,20 @@ export class AdminWebsitesService {
     adminId: string,
   ): Promise<AdminWebsiteDomainResponse> {
     await this.getDomainForWebsite(websiteId, domainId);
+    const otherActiveDomainCount = await this.prisma.websiteDomain.count({
+      where: {
+        websiteId,
+        id: { not: domainId },
+        status: DomainStatus.ACTIVE,
+      },
+    });
+
+    if (otherActiveDomainCount > 0) {
+      throw new BadRequestException(
+        "This website already has an active domain. Unassign or replace it first.",
+      );
+    }
+
     const shouldBePrimary = dto.isPrimary === true;
 
     const domainRecord = await this.prisma.$transaction(async (tx) => {
@@ -641,6 +955,7 @@ export class AdminWebsitesService {
         isPrimary: domainRecord.isPrimary,
       },
     );
+    this.clearCorsDomainCache();
 
     return this.toDomainResponse(domainRecord);
   }
@@ -650,43 +965,99 @@ export class AdminWebsitesService {
     dto: ClaimCurrentWebsiteDomainDto,
     adminId: string,
   ): Promise<AdminWebsiteDomainResponse> {
-    await this.ensureActiveWebsiteExists(websiteId);
+    const website = await this.getActiveWebsiteForDomainAssignment(websiteId);
 
     const domain = this.parseClaimHost(dto.host);
-    this.ensureLocalhostClaimAllowed(domain);
-    await this.ensureDomainAvailable(domain);
+    this.ensureLocalhostDomainAllowed(domain);
 
-    const domainRecord = await this.prisma.$transaction(async (tx) => {
-      if (dto.isPrimary === true) {
-        await tx.websiteDomain.updateMany({
-          where: { websiteId },
-          data: { isPrimary: false },
-        });
-      }
-
-      return tx.websiteDomain.create({
-        data: {
-          websiteId,
-          domain,
-          isPrimary: dto.isPrimary === true,
-          status: DomainStatus.ACTIVE,
+    const existingDomain = await this.prisma.websiteDomain.findUnique({
+      where: { domain },
+      include: {
+        website: {
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            status: true,
+          },
         },
-      });
+        domainGroup: true,
+      },
+    });
+
+    if (existingDomain?.websiteId === websiteId) {
+      return this.toDomainResponse(existingDomain);
+    }
+
+    if (
+      existingDomain?.websiteId !== null &&
+      existingDomain?.websiteId !== undefined
+    ) {
+      throw new BadRequestException(
+        `Domain is already in use by website "${existingDomain.website?.name ?? existingDomain.websiteId}".`,
+      );
+    }
+
+    if (existingDomain?.status === DomainStatus.DISABLED) {
+      throw new BadRequestException(
+        "Domain is DISABLED. Activate it before assignment.",
+      );
+    }
+
+    const existingWebsiteDomainCount = await this.prisma.websiteDomain.count({
+      where: { websiteId },
+    });
+
+    if (existingWebsiteDomainCount > 0) {
+      throw new BadRequestException(
+        "This website already has a domain. Enable replaceExisting to replace it.",
+      );
+    }
+
+    const domainRecord =
+      existingDomain ??
+      (await this.prisma.websiteDomain.create({
+        data: {
+          domain,
+          status: DomainStatus.ACTIVE,
+          ...(website.domainGroupId
+            ? { domainGroupId: website.domainGroupId }
+            : {}),
+        },
+        include: {
+          website: {
+            select: {
+              id: true,
+              name: true,
+              slug: true,
+              status: true,
+            },
+          },
+          domainGroup: true,
+        },
+      }));
+
+    const assignedDomain = await this.assignDomainToWebsiteRecord({
+      domainId: domainRecord.id,
+      websiteId,
+      replaceExisting: false,
+      adminId,
     });
 
     await this.writeAudit(
       adminId,
       "WEBSITE_DOMAIN_CLAIM_CURRENT",
       "WebsiteDomain",
-      domainRecord.id,
+      assignedDomain.id,
       {
-        domain: domainRecord.domain,
+        domain: assignedDomain.domain,
         websiteId,
-        isPrimary: domainRecord.isPrimary,
+        isPrimary: assignedDomain.isPrimary,
       },
     );
+    this.clearCorsDomainCache();
 
-    return this.toDomainResponse(domainRecord);
+    return this.toDomainResponse(assignedDomain);
   }
 
   async listAssignedVideos(
@@ -970,6 +1341,252 @@ export class AdminWebsitesService {
     return where;
   }
 
+  private buildDomainWhere(
+    query: ListDomainsQueryDto,
+  ): Prisma.WebsiteDomainWhereInput {
+    const where: Prisma.WebsiteDomainWhereInput = {};
+
+    if (query.status !== undefined) {
+      where.status = query.status;
+    }
+
+    if (query.usageStatus === AdminDomainUsageStatus.AVAILABLE) {
+      where.status = DomainStatus.ACTIVE;
+      where.websiteId = null;
+    }
+
+    if (query.usageStatus === AdminDomainUsageStatus.IN_USE) {
+      where.status = DomainStatus.ACTIVE;
+      where.websiteId = { not: null };
+    }
+
+    if (query.usageStatus === AdminDomainUsageStatus.DISABLED) {
+      where.status = DomainStatus.DISABLED;
+    }
+
+    if (query.websiteId !== undefined && query.websiteId.trim() !== "") {
+      where.websiteId = query.websiteId.trim();
+    }
+
+    if (
+      query.domainGroupKey !== undefined &&
+      query.domainGroupKey.trim() !== ""
+    ) {
+      where.domainGroup = {
+        is: {
+          key: this.normalizeDomainGroupKey(query.domainGroupKey),
+        },
+      };
+    }
+
+    if (query.search !== undefined && query.search.trim() !== "") {
+      const search = query.search.trim();
+      const normalizedSearchHost = normalizeDomain(search);
+      where.OR = [
+        { domain: { contains: normalizedSearchHost ?? search.toLowerCase() } },
+        {
+          website: {
+            is: {
+              OR: [
+                { name: { contains: search } },
+                { slug: { contains: search.toLowerCase() } },
+              ],
+            },
+          },
+        },
+        {
+          domainGroup: {
+            is: {
+              OR: [
+                { key: { contains: search.toLowerCase() } },
+                { name: { contains: search } },
+              ],
+            },
+          },
+        },
+      ];
+    }
+
+    return where;
+  }
+
+  private async getDomainWithRelations(
+    domainId: string,
+  ): Promise<DomainWithRelations> {
+    const domain = await this.prisma.websiteDomain.findUnique({
+      where: { id: domainId },
+      include: {
+        website: {
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            status: true,
+          },
+        },
+        domainGroup: true,
+      },
+    });
+
+    if (domain === null) {
+      throw new NotFoundException("Domain not found.");
+    }
+
+    return domain;
+  }
+
+  private async getActiveWebsiteForDomainAssignment(
+    websiteId: string,
+  ): Promise<Pick<Website, "id" | "name" | "slug" | "status" | "domainGroupId">> {
+    const website = await this.prisma.website.findUnique({
+      where: { id: websiteId },
+      select: {
+        id: true,
+        name: true,
+        slug: true,
+        status: true,
+        domainGroupId: true,
+      },
+    });
+
+    if (website === null) {
+      throw new NotFoundException("Website not found.");
+    }
+
+    if (website.status !== WebsiteStatus.ACTIVE) {
+      throw new BadRequestException("Website must be ACTIVE.");
+    }
+
+    return website;
+  }
+
+  private async assignDomainToWebsiteRecord(params: {
+    domainId: string;
+    websiteId: string;
+    replaceExisting: boolean;
+    adminId: string;
+  }): Promise<DomainWithRelations> {
+    const domain = await this.getDomainWithRelations(params.domainId);
+    const website = await this.getActiveWebsiteForDomainAssignment(
+      params.websiteId,
+    );
+
+    if (domain.status !== DomainStatus.ACTIVE) {
+      throw new BadRequestException("Domain must be ACTIVE before assignment.");
+    }
+
+    if (domain.websiteId === params.websiteId) {
+      const assignedDomain = await this.prisma.$transaction(async (tx) => {
+        await tx.websiteDomain.updateMany({
+          where: { websiteId: params.websiteId, id: { not: params.domainId } },
+          data: {
+            websiteId: null,
+            isPrimary: false,
+          },
+        });
+
+        return tx.websiteDomain.update({
+          where: { id: params.domainId },
+          data: { isPrimary: true },
+          include: {
+            website: {
+              select: {
+                id: true,
+                name: true,
+                slug: true,
+                status: true,
+              },
+            },
+            domainGroup: true,
+          },
+        });
+      });
+
+      this.clearCorsDomainCache();
+
+      return assignedDomain;
+    }
+
+    if (domain.websiteId !== null) {
+      await this.writeAudit(
+        params.adminId,
+        "DOMAIN_TRANSFER_ATTEMPT_REJECTED",
+        "WebsiteDomain",
+        domain.id,
+        {
+          domain: domain.domain,
+          currentWebsiteId: domain.websiteId,
+          requestedWebsiteId: params.websiteId,
+        },
+      );
+
+      throw new BadRequestException(
+        `Domain is already in use by website "${domain.website?.name ?? domain.websiteId}".`,
+      );
+    }
+
+    const existingAssignedDomain = await this.prisma.websiteDomain.findFirst({
+      where: { websiteId: params.websiteId },
+      select: { id: true, domain: true },
+      orderBy: { createdAt: "asc" },
+    });
+
+    if (existingAssignedDomain !== null && !params.replaceExisting) {
+      throw new BadRequestException(
+        "This website already has a domain. Enable replaceExisting to replace it.",
+      );
+    }
+
+    const assignedDomain = await this.prisma.$transaction(async (tx) => {
+      if (existingAssignedDomain !== null) {
+        await tx.websiteDomain.updateMany({
+          where: { websiteId: params.websiteId },
+          data: {
+            websiteId: null,
+            isPrimary: false,
+          },
+        });
+      }
+
+      return tx.websiteDomain.update({
+        where: { id: params.domainId },
+        data: {
+          websiteId: params.websiteId,
+          isPrimary: true,
+          ...(domain.domainGroupId === null && website.domainGroupId
+            ? { domainGroupId: website.domainGroupId }
+            : {}),
+        },
+        include: {
+          website: {
+            select: {
+              id: true,
+              name: true,
+              slug: true,
+              status: true,
+            },
+          },
+          domainGroup: true,
+        },
+      });
+    });
+
+    await this.writeAudit(
+      params.adminId,
+      "DOMAIN_ASSIGN",
+      "WebsiteDomain",
+      assignedDomain.id,
+      {
+        domain: assignedDomain.domain,
+        websiteId: params.websiteId,
+        replacedDomainId: existingAssignedDomain?.id ?? null,
+      },
+    );
+    this.clearCorsDomainCache();
+
+    return assignedDomain;
+  }
+
   private async ensureWebsiteExists(websiteId: string): Promise<void> {
     const website = await this.prisma.website.findUnique({
       where: { id: websiteId },
@@ -1034,8 +1651,8 @@ export class AdminWebsitesService {
   }
 
   private async resolveActiveDomainGroupId(params: {
-    domainGroupKey?: string | undefined;
-    domainGroupId?: string | undefined;
+    domainGroupKey?: string | null | undefined;
+    domainGroupId?: string | null | undefined;
   }): Promise<string | null> {
     const domainGroupKey = params.domainGroupKey?.trim();
     const domainGroupId = params.domainGroupId?.trim();
@@ -1051,8 +1668,14 @@ export class AdminWebsitesService {
         select: { id: true, status: true },
       });
 
-      if (group === null || group.status !== DomainGroupStatus.ACTIVE) {
-        throw new BadRequestException("Active domain group not found.");
+      if (group === null) {
+        throw new BadRequestException(
+          `Domain group "${key}" does not exist. Create it first or leave domainGroupKey empty.`,
+        );
+      }
+
+      if (group.status !== DomainGroupStatus.ACTIVE) {
+        throw new BadRequestException(`Domain group "${key}" is not ACTIVE.`);
       }
 
       return group.id;
@@ -1067,8 +1690,16 @@ export class AdminWebsitesService {
       select: { id: true, status: true },
     });
 
-    if (group === null || group.status !== DomainGroupStatus.ACTIVE) {
-      throw new BadRequestException("Active domain group not found.");
+    if (group === null) {
+      throw new BadRequestException(
+        `Domain group id "${domainGroupId}" does not exist.`,
+      );
+    }
+
+    if (group.status !== DomainGroupStatus.ACTIVE) {
+      throw new BadRequestException(
+        `Domain group id "${domainGroupId}" is not ACTIVE.`,
+      );
     }
 
     return group.id;
@@ -1119,7 +1750,7 @@ export class AdminWebsitesService {
     return this.parseDomain(trimmed);
   }
 
-  private ensureLocalhostClaimAllowed(domain: string): void {
+  private ensureLocalhostDomainAllowed(domain: string): void {
     if (!this.isLocalhostDomain(domain)) {
       return;
     }
@@ -1130,7 +1761,7 @@ export class AdminWebsitesService {
 
     if (!allowLocalhostClaim || nodeEnv === "production") {
       throw new BadRequestException(
-        "Localhost domain claim is disabled for this environment.",
+        "Localhost domains are disabled for this environment.",
       );
     }
   }
@@ -1146,6 +1777,10 @@ export class AdminWebsitesService {
       domain === "[::1]" ||
       domain.startsWith("[::1]:")
     );
+  }
+
+  private clearCorsDomainCache(): void {
+    this.corsOriginService.clearDomainOriginCache();
   }
 
   private parseDomain(value: string): string {
@@ -1346,6 +1981,37 @@ export class AdminWebsitesService {
       createdAt: domain.createdAt,
       updatedAt: domain.updatedAt,
     };
+  }
+
+  private toAdminDomainResponse(domain: DomainWithRelations): AdminDomainResponse {
+    return {
+      ...this.toDomainResponse(domain),
+      websiteName: domain.website?.name ?? null,
+      websiteSlug: domain.website?.slug ?? null,
+      domainGroup:
+        domain.domainGroup === null
+          ? null
+          : {
+              id: domain.domainGroup.id,
+              key: domain.domainGroup.key,
+              name: domain.domainGroup.name,
+            },
+      usageStatus: this.getDomainUsageStatus(domain),
+    };
+  }
+
+  private getDomainUsageStatus(
+    domain: Pick<WebsiteDomain, "status" | "websiteId">,
+  ): AdminDomainUsageStatus {
+    if (domain.status === DomainStatus.DISABLED) {
+      return AdminDomainUsageStatus.DISABLED;
+    }
+
+    if (domain.websiteId !== null) {
+      return AdminDomainUsageStatus.IN_USE;
+    }
+
+    return AdminDomainUsageStatus.AVAILABLE;
   }
 
   private toAssignedVideoResponse(

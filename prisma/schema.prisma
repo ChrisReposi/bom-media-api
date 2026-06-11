@@ -209,22 +209,26 @@ model DomainGroup {
   updatedAt   DateTime          @updatedAt
 
   websites Website[]
+  domains  WebsiteDomain[]
 
   @@index([status])
 }
 
 model WebsiteDomain {
-  id        String       @id @default(cuid())
-  websiteId String
-  domain    String       @unique @db.VarChar(253)
-  isPrimary Boolean      @default(false)
-  status    DomainStatus @default(ACTIVE)
-  createdAt DateTime     @default(now())
-  updatedAt DateTime     @updatedAt
+  id            String       @id @default(cuid())
+  websiteId     String?
+  domainGroupId String?
+  domain        String       @unique @db.VarChar(253)
+  isPrimary     Boolean      @default(false)
+  status        DomainStatus @default(ACTIVE)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
 
-  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  website     Website?     @relation(fields: [websiteId], references: [id], onDelete: SetNull)
+  domainGroup DomainGroup? @relation(fields: [domainGroupId], references: [id], onDelete: SetNull)
 
   @@index([websiteId])
+  @@index([domainGroupId])
   @@index([status])
 }
 

@@ -545,10 +545,7 @@ export class VideosService {
         throw error;
       }
 
-      if (
-        hasThumbnailInput &&
-        nextThumbnailUrl !== existingVideo.thumbnailUrl
-      ) {
+      if (hasThumbnailInput && nextThumbnailUrl !== existingVideo.thumbnailUrl) {
         await this.deleteOwnedThumbnailBestEffort(
           existingVideo.metadataJson,
           existingVideo.thumbnailUrl,

@@ -32,6 +32,12 @@ export class AdminDomainGroupResponse extends AdminDomainGroupBasicResponse {
   updatedAt!: Date;
 }
 
+export enum AdminDomainUsageStatus {
+  AVAILABLE = "AVAILABLE",
+  IN_USE = "IN_USE",
+  DISABLED = "DISABLED",
+}
+
 export class AdminDomainGroupListResponse {
   @ApiProperty({ type: [AdminDomainGroupResponse] })
   items!: AdminDomainGroupResponse[];
@@ -54,8 +60,8 @@ export class AdminWebsiteDomainResponse {
   @ApiProperty()
   id!: string;
 
-  @ApiProperty()
-  websiteId!: string;
+  @ApiPropertyOptional({ nullable: true })
+  websiteId!: string | null;
 
   @ApiProperty()
   domain!: string;
@@ -71,6 +77,33 @@ export class AdminWebsiteDomainResponse {
 
   @ApiProperty()
   updatedAt!: Date;
+}
+
+export class AdminDomainResponse extends AdminWebsiteDomainResponse {
+  @ApiPropertyOptional({ nullable: true })
+  websiteName!: string | null;
+
+  @ApiPropertyOptional({ nullable: true })
+  websiteSlug!: string | null;
+
+  @ApiPropertyOptional({ type: AdminDomainGroupBasicResponse, nullable: true })
+  domainGroup!: AdminDomainGroupBasicResponse | null;
+
+  @ApiProperty({ enum: AdminDomainUsageStatus })
+  usageStatus!: AdminDomainUsageStatus;
+}
+
+export class AdminDomainListResponse {
+  @ApiProperty({ type: [AdminDomainResponse] })
+  items!: AdminDomainResponse[];
+
+  @ApiProperty()
+  meta!: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+  };
 }
 
 export class AdminWebsiteAssignedVideoResponse {

@@ -212,6 +212,28 @@ export function validateEnv(
     process.env.CORS_ALLOWED_ORIGINS = config.CORS_ALLOWED_ORIGINS;
     validated.CORS_ALLOWED_ORIGINS = config.CORS_ALLOWED_ORIGINS;
   }
+  validated.CORS_ALLOW_DB_DOMAINS = readBoolean(
+    config,
+    "CORS_ALLOW_DB_DOMAINS",
+    true,
+  );
+
+  const corsDbOriginCacheTtlMs = Number(
+    readString(config, "CORS_DB_ORIGIN_CACHE_TTL_MS", "60000"),
+  );
+  if (
+    !Number.isInteger(corsDbOriginCacheTtlMs) ||
+    corsDbOriginCacheTtlMs <= 0
+  ) {
+    throw new Error("CORS_DB_ORIGIN_CACHE_TTL_MS must be a positive integer");
+  }
+  validated.CORS_DB_ORIGIN_CACHE_TTL_MS = String(corsDbOriginCacheTtlMs);
+
+  validated.CORS_ALLOW_LOCALHOST_DB_DOMAINS = readBoolean(
+    config,
+    "CORS_ALLOW_LOCALHOST_DB_DOMAINS",
+    nodeEnv !== "production",
+  );
 
   if (typeof config.VIDEO_UPLOAD_MAX_MB === "string") {
     const uploadMaxMb = Number(config.VIDEO_UPLOAD_MAX_MB.trim());

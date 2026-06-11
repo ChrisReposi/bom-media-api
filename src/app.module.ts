@@ -10,6 +10,7 @@ import { validateEnv } from "./config/env.validation";
 import { DatabaseModule } from "./database/database.module";
 import { HealthModule } from "./health/health.module";
 import { PublicModule } from "./public/public.module";
+import { SecurityModule } from "./security/security.module";
 import { VideosModule } from "./videos/videos.module";
 
 function redactTokenFromUrl(value: string): string {
@@ -89,6 +90,7 @@ function serializeRequestForLogs(
       },
     }),
     DatabaseModule,
+    SecurityModule,
     HealthModule,
     AdminAuthModule,
     VideosModule,

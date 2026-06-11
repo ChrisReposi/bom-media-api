@@ -8,28 +8,7 @@ import { Logger } from "nestjs-pino";
 import { SWAGGER_PATH } from "./common/constants/api.constants";
 import type { ApiEnvironmentConfig } from "./config/env.config";
 import { AppModule } from "./app.module";
-
-function normalizeOrigin(origin: string): string {
-  return origin.trim().replace(/\/$/, "");
-}
-
-function buildCorsAllowedOrigins(
-  apiEnvironment: ApiEnvironmentConfig,
-): Set<string> {
-  const origins = new Set<string>();
-
-  for (const origin of apiEnvironment.corsAllowedOrigins) {
-    if (origin.trim() !== "") {
-      origins.add(normalizeOrigin(origin));
-    }
-  }
-
-  const selfOrigin = `http://localhost:${apiEnvironment.port}`;
-  origins.add(selfOrigin);
-  origins.add(`http://127.0.0.1:${apiEnvironment.port}`);
-
-  return origins;
-}
+import { CorsOriginService } from "./security/cors-origin.service";
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule, {
@@ -43,26 +22,17 @@ async function bootstrap(): Promise<void> {
 
   app.use(helmet());
 
-  const allowedOrigins = buildCorsAllowedOrigins(apiEnvironment);
+  const corsOriginService = app.get(CorsOriginService);
 
   app.enableCors({
     origin(
       origin: string | undefined,
       callback: (error: Error | null, allow?: boolean) => void,
     ): void {
-      if (!origin) {
-        callback(null, true);
-        return;
-      }
-
-      const normalizedOrigin = normalizeOrigin(origin);
-
-      if (allowedOrigins.has(normalizedOrigin)) {
-        callback(null, true);
-        return;
-      }
-
-      callback(null, false);
+      void corsOriginService
+        .isOriginAllowed(origin)
+        .then((allowed) => callback(null, allowed))
+        .catch(() => callback(null, false));
     },
     credentials: false,
     exposedHeaders: [

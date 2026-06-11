@@ -103,6 +103,7 @@ export class PublicService {
 
     if (
       domainRecord === null ||
+      domainRecord.website === null ||
       domainRecord.status !== DomainStatus.ACTIVE ||
       domainRecord.website.status !== WebsiteStatus.ACTIVE
     ) {
@@ -274,8 +275,9 @@ export class PublicService {
   async getPublicDatabaseVideoBinary(
     params: PublicDatabaseVideoBinaryParams,
   ): Promise<PublicDatabaseVideoBinary> {
-    const binaryAsset =
-      await this.getAuthorizedPublicDatabaseBinaryAsset(params);
+    const binaryAsset = await this.getAuthorizedPublicDatabaseBinaryAsset(
+      params,
+    );
     const totalSize = Number(binaryAsset.sizeBytes);
 
     if (!Number.isSafeInteger(totalSize) || totalSize <= 0) {
@@ -454,6 +456,7 @@ export class PublicService {
 
     if (
       domainRecord === null ||
+      domainRecord.website === null ||
       domainRecord.status !== DomainStatus.ACTIVE ||
       domainRecord.website.status !== WebsiteStatus.ACTIVE
     ) {
@@ -558,12 +561,14 @@ export class PublicService {
   private parseRangeHeader(
     rangeHeader: string | undefined,
     totalSize: number,
-  ): {
-    statusCode: 200 | 206;
-    start: number;
-    end: number;
-    length: number;
-  } | null {
+  ):
+    | {
+        statusCode: 200 | 206;
+        start: number;
+        end: number;
+        length: number;
+      }
+    | null {
     if (rangeHeader === undefined || rangeHeader.trim() === "") {
       return {
         statusCode: 200,

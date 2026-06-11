@@ -28,20 +28,26 @@ import { AdminAccessTokenGuard } from "../admin-auth/guards/admin-access-token.g
 import type { SafeAdminResponse } from "../admin-auth/types/admin-auth-response.type";
 import { AdminWebsitesService } from "./admin-websites.service";
 import { ActivateWebsiteDomainDto } from "./dto/activate-website-domain.dto";
+import { AssignDomainToWebsiteDto } from "./dto/assign-domain-to-website.dto";
 import { AssignWebsiteVideosDto } from "./dto/assign-website-videos.dto";
 import { ClaimCurrentWebsiteDomainDto } from "./dto/claim-current-website-domain.dto";
+import { CreateDomainDto } from "./dto/create-domain.dto";
 import { CreateDomainGroupDto } from "./dto/create-domain-group.dto";
 import { CreateShareLinkDto } from "./dto/create-share-link.dto";
 import { CreateWebsiteDomainDto } from "./dto/create-website-domain.dto";
 import { CreateWebsiteDto } from "./dto/create-website.dto";
+import { ListDomainsQueryDto } from "./dto/list-domains-query.dto";
 import { ListDomainGroupsQueryDto } from "./dto/list-domain-groups-query.dto";
 import { ListWebsitesQueryDto } from "./dto/list-websites-query.dto";
+import { UpdateDomainDto } from "./dto/update-domain.dto";
 import { UpdateDomainGroupDto } from "./dto/update-domain-group.dto";
 import { UpdateWebsiteDomainDto } from "./dto/update-website-domain.dto";
 import { UpdateWebsiteDto } from "./dto/update-website.dto";
 import {
   AdminDomainGroupListResponse,
   AdminDomainGroupResponse,
+  AdminDomainListResponse,
+  AdminDomainResponse,
   AdminWebsiteDetailResponse,
   AdminWebsiteDomainResponse,
   AdminWebsiteListResponse,
@@ -121,6 +127,109 @@ export class AdminWebsitesController {
     @CurrentAdmin() admin: SafeAdminResponse,
   ): Promise<DisableDomainGroupResponse> {
     return this.websitesService.disableDomainGroup(id, admin.id);
+  }
+
+  @Get("domains")
+  @ApiOperation({ summary: "List domains in the global domain pool" })
+  @ApiOkResponse({ type: AdminDomainListResponse })
+  @ApiUnauthorizedResponse()
+  listDomains(
+    @Query() query: ListDomainsQueryDto,
+  ): Promise<AdminDomainListResponse> {
+    return this.websitesService.listDomains(query);
+  }
+
+  @Post("domains")
+  @ApiOperation({ summary: "Create standalone domain in the domain pool" })
+  @ApiCreatedResponse({ type: AdminDomainResponse })
+  @ApiBadRequestResponse()
+  @ApiUnauthorizedResponse()
+  @ApiConflictResponse()
+  createStandaloneDomain(
+    @Body() dto: CreateDomainDto,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<AdminDomainResponse> {
+    return this.websitesService.createStandaloneDomain(dto, admin.id);
+  }
+
+  @Get("domains/:domainId")
+  @ApiOperation({ summary: "Get domain from the domain pool" })
+  @ApiOkResponse({ type: AdminDomainResponse })
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  getDomain(@Param("domainId") domainId: string): Promise<AdminDomainResponse> {
+    return this.websitesService.getDomain(domainId);
+  }
+
+  @Patch("domains/:domainId")
+  @ApiOperation({ summary: "Update domain in the domain pool" })
+  @ApiOkResponse({ type: AdminDomainResponse })
+  @ApiBadRequestResponse()
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  @ApiConflictResponse()
+  updateStandaloneDomain(
+    @Param("domainId") domainId: string,
+    @Body() dto: UpdateDomainDto,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<AdminDomainResponse> {
+    return this.websitesService.updateStandaloneDomain(
+      domainId,
+      dto,
+      admin.id,
+    );
+  }
+
+  @Delete("domains/:domainId")
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: "Disable available domain" })
+  @ApiOkResponse({ type: AdminDomainResponse })
+  @ApiBadRequestResponse()
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  disableStandaloneDomain(
+    @Param("domainId") domainId: string,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<AdminDomainResponse> {
+    return this.websitesService.disableStandaloneDomain(domainId, admin.id);
+  }
+
+  @Post("domains/:domainId/activate")
+  @ApiOperation({ summary: "Activate domain" })
+  @ApiOkResponse({ type: AdminDomainResponse })
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  activateStandaloneDomain(
+    @Param("domainId") domainId: string,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<AdminDomainResponse> {
+    return this.websitesService.activateStandaloneDomain(domainId, admin.id);
+  }
+
+  @Post("domains/:domainId/assign")
+  @ApiOperation({ summary: "Assign available domain to a website" })
+  @ApiOkResponse({ type: AdminDomainResponse })
+  @ApiBadRequestResponse()
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  assignDomainToWebsite(
+    @Param("domainId") domainId: string,
+    @Body() dto: AssignDomainToWebsiteDto,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<AdminDomainResponse> {
+    return this.websitesService.assignDomainToWebsite(domainId, dto, admin.id);
+  }
+
+  @Post("domains/:domainId/unassign")
+  @ApiOperation({ summary: "Unassign domain from its website" })
+  @ApiOkResponse({ type: AdminDomainResponse })
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  unassignDomainFromWebsite(
+    @Param("domainId") domainId: string,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<AdminDomainResponse> {
+    return this.websitesService.unassignDomainFromWebsite(domainId, admin.id);
   }
 
   @Get("websites")

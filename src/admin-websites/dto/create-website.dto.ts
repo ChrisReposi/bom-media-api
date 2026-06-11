@@ -1,4 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
+import { Transform } from "class-transformer";
 import {
   IsEnum,
   IsOptional,
@@ -7,6 +8,15 @@ import {
   MaxLength,
 } from "class-validator";
 import { WebsiteStatus } from "../../generated/prisma/client";
+
+function emptyStringToUndefined(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? undefined : trimmed;
+}
 
 export class CreateWebsiteDto {
   @ApiProperty({ maxLength: 255 })
@@ -45,6 +55,7 @@ export class CreateWebsiteDto {
   description?: string;
 
   @ApiPropertyOptional({ example: "sml", maxLength: 80 })
+  @Transform(({ value }) => emptyStringToUndefined(value))
   @IsOptional()
   @IsString()
   @MaxLength(80)
@@ -55,9 +66,10 @@ export class CreateWebsiteDto {
   domainGroupKey?: string;
 
   @ApiPropertyOptional()
+  @Transform(({ value }) => emptyStringToUndefined(value))
   @IsOptional()
   @IsString()
-  domainGroupId?: string;
+  domainGroupId?: string | null;
 
   @ApiPropertyOptional({ enum: WebsiteStatus })
   @IsOptional()

@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { BadRequestException } from "@nestjs/common";
 import { normalizeWebsiteDomain } from "../../common/utils/domain.util";
 
 export function generateShareToken(): string {
@@ -6,18 +7,20 @@ export function generateShareToken(): string {
 }
 
 export function buildPublicShareUrl(params: {
-  domain: string | null;
+  domain: string;
   token: string;
   protocol?: string | undefined;
-}): string | null {
-  if (params.domain === null) {
-    return null;
+}): string {
+  const domain = params.domain.trim();
+
+  if (!domain) {
+    throw new BadRequestException("Public share domain is required.");
   }
 
-  const normalizedDomain = normalizeWebsiteDomain(params.domain);
+  const normalizedDomain = normalizeWebsiteDomain(domain);
 
   if (normalizedDomain === null) {
-    return null;
+    throw new BadRequestException("Public share domain is invalid.");
   }
 
   const protocol = resolvePublicSiteProtocol(normalizedDomain, params.protocol);

@@ -173,11 +173,7 @@ export class AdminWebsitesController {
     @Body() dto: UpdateDomainDto,
     @CurrentAdmin() admin: SafeAdminResponse,
   ): Promise<AdminDomainResponse> {
-    return this.websitesService.updateStandaloneDomain(
-      domainId,
-      dto,
-      admin.id,
-    );
+    return this.websitesService.updateStandaloneDomain(domainId, dto, admin.id);
   }
 
   @Delete("domains/:domainId")

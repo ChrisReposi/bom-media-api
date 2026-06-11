@@ -1162,79 +1162,111 @@ export class AdminWebsitesService {
     const tokenPepper = this.configService
       .get<string>("SHARE_TOKEN_PEPPER")
       ?.trim();
+    const hasTokenPepper = Boolean(tokenPepper);
+    let selectedVideoIds: string[] = [];
+    let domain: string | null = null;
 
-    if (!tokenPepper) {
-      throw new BadRequestException("SHARE_TOKEN_PEPPER is required.");
-    }
+    try {
+      if (!tokenPepper) {
+        throw new BadRequestException("SHARE_TOKEN_PEPPER is required.");
+      }
 
-    await this.ensureActiveWebsiteExists(websiteId);
-    const selectedVideoIds = await this.resolveShareLinkVideoIds(
-      websiteId,
-      dto,
-    );
-    if (selectedVideoIds.length === 0) {
-      throw new BadRequestException("No playable videos selected.");
-    }
+      await this.ensureActiveWebsiteExists(websiteId);
+      selectedVideoIds = await this.resolveShareLinkVideoIds(websiteId, dto);
+      if (selectedVideoIds.length === 0) {
+        throw new BadRequestException("No playable videos selected.");
+      }
 
-    const videos = await this.getReadyPlayableVideosByIds(selectedVideoIds);
-    this.ensureAllRequestedVideosFound(selectedVideoIds, videos, (videoId) => {
-      return `Video ${videoId} is not READY, not playable, or does not exist. READY direct/upload, embed, and DB_BLOB videos with binary data can be attached to a share link.`;
-    });
+      const videos = await this.getReadyPlayableVideosByIds(selectedVideoIds);
+      this.ensureAllRequestedVideosFound(selectedVideoIds, videos, (videoId) => {
+        return `Video ${videoId} is not READY, not playable, or does not exist. READY direct/upload, embed, and DB_BLOB videos with binary data can be attached to a share link.`;
+      });
 
-    const domain = await this.getPreferredActiveDomain(websiteId);
-    const rawToken = generateShareToken();
-    const tokenHash = hashShareToken({ token: rawToken, pepper: tokenPepper });
-    const publicUrl = buildPublicShareUrl({
-      domain,
-      token: rawToken,
-      protocol: this.getConfiguredPublicSiteProtocol(domain),
-    });
-
-    const shareLink = await this.prisma.$transaction(async (tx) => {
-      const createdShareLink = await tx.shareLink.create({
-        data: {
+      domain = await this.getPreferredActiveDomain(websiteId);
+      this.logger.debug(
+        {
           websiteId,
-          tokenHash,
-          label: this.trimNullable(dto.label),
-          expiresAt: this.parseNullableDate(dto.expiresAt),
-          maxViews: dto.maxViews ?? null,
-          status: ShareLinkStatus.ACTIVE,
+          selectedVideoCount: selectedVideoIds.length,
+          domain,
+          hasTokenPepper,
         },
+        "Creating admin share link.",
+      );
+
+      if (!domain) {
+        throw new BadRequestException(
+          "Website must have one ACTIVE assigned domain before creating a share link.",
+        );
+      }
+
+      const rawToken = generateShareToken();
+      const tokenHash = hashShareToken({ token: rawToken, pepper: tokenPepper });
+      const publicUrl = buildPublicShareUrl({
+        domain,
+        token: rawToken,
+        protocol: this.getConfiguredPublicSiteProtocol(domain),
       });
 
-      await tx.shareLinkVideo.createMany({
-        data: selectedVideoIds.map((videoId, index) => ({
-          shareLinkId: createdShareLink.id,
-          videoId,
-          sortOrder: index,
-        })),
-      });
-
-      return tx.shareLink.findUniqueOrThrow({
-        where: { id: createdShareLink.id },
-        include: {
-          shareLinkVideos: {
-            include: { video: true },
-            orderBy: { sortOrder: "asc" },
+      const shareLink = await this.prisma.$transaction(async (tx) => {
+        const createdShareLink = await tx.shareLink.create({
+          data: {
+            websiteId,
+            tokenHash,
+            label: this.trimNullable(dto.label),
+            expiresAt: this.parseNullableDate(dto.expiresAt),
+            maxViews: dto.maxViews ?? null,
+            status: ShareLinkStatus.ACTIVE,
           },
-        },
+        });
+
+        await tx.shareLinkVideo.createMany({
+          data: selectedVideoIds.map((videoId, index) => ({
+            shareLinkId: createdShareLink.id,
+            videoId,
+            sortOrder: index,
+          })),
+        });
+
+        return tx.shareLink.findUniqueOrThrow({
+          where: { id: createdShareLink.id },
+          include: {
+            shareLinkVideos: {
+              include: { video: true },
+              orderBy: { sortOrder: "asc" },
+            },
+          },
+        });
       });
-    });
 
-    await this.writeAudit(
-      adminId,
-      "SHARE_LINK_CREATE",
-      "ShareLink",
-      shareLink.id,
-      { websiteId, videoCount: shareLink.shareLinkVideos.length },
-    );
+      await this.writeAudit(
+        adminId,
+        "SHARE_LINK_CREATE",
+        "ShareLink",
+        shareLink.id,
+        { websiteId, videoCount: shareLink.shareLinkVideos.length },
+      );
 
-    return {
-      message: "Share link created successfully.",
-      shareLink: this.toShareLinkResponse(shareLink, publicUrl),
-      rawToken,
-      publicUrl,
-    };
+      return {
+        message: "Share link created successfully.",
+        shareLink: this.toShareLinkResponse(shareLink, publicUrl),
+        rawToken,
+        publicUrl,
+      };
+    } catch (error) {
+      this.logger.error(
+        {
+          websiteId,
+          selectedVideoCount: selectedVideoIds.length,
+          domain,
+          hasTokenPepper,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+          errorMessage: error instanceof Error ? error.message : String(error),
+        },
+        "Create share link failed.",
+      );
+
+      throw error;
+    }
   }
 
   async revokeShareLink(
@@ -1294,7 +1326,9 @@ export class AdminWebsitesService {
       const domain = this.parseDomain(query.domain);
       where.domains = {
         some: {
-          domain: { contains: domain },
+          domain,
+          status: DomainStatus.ACTIVE,
+          websiteId: { not: null },
         },
       };
     }
@@ -1863,8 +1897,13 @@ export class AdminWebsitesService {
     websiteId: string,
     dto: CreateShareLinkDto,
   ): Promise<string[]> {
-    const providedVideoIds =
-      dto.videoIds?.filter((videoId) => videoId.trim() !== "") ?? [];
+    const providedVideoIds = [
+      ...new Set(
+        (dto.videoIds ?? [])
+          .map((videoId) => videoId.trim())
+          .filter((videoId) => videoId.length > 0),
+      ),
+    ];
 
     if (providedVideoIds.length > 0) {
       return providedVideoIds;
@@ -1889,6 +1928,11 @@ export class AdminWebsitesService {
       where: {
         websiteId,
         status: DomainStatus.ACTIVE,
+        website: {
+          is: {
+            status: WebsiteStatus.ACTIVE,
+          },
+        },
       },
       orderBy: [{ isPrimary: "desc" }, { createdAt: "asc" }],
       select: { domain: true },

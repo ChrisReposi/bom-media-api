@@ -20,6 +20,7 @@ import {
   type DomainGroup,
   type ShareLink,
   type ShareLinkVideo,
+  type VideoBinaryAsset,
   type VideoAsset,
   type Website,
   type WebsiteDomain,
@@ -89,6 +90,15 @@ type WebsiteVideoWithVideo = WebsiteVideo & {
 
 type ShareLinkWithVideos = ShareLink & {
   shareLinkVideos: Array<ShareLinkVideo & { video: VideoAsset }>;
+};
+
+type VideoBinaryAssetMetadata = Pick<
+  VideoBinaryAsset,
+  "mimeType" | "sizeBytes"
+>;
+
+type VideoWithBinaryAssetMetadata = VideoAsset & {
+  binaryAsset?: VideoBinaryAssetMetadata | null;
 };
 
 type AuditAction =
@@ -1159,73 +1169,88 @@ export class AdminWebsitesService {
     dto: CreateShareLinkDto,
     adminId: string,
   ): Promise<CreateShareLinkResponse> {
-    const tokenPepper = this.configService
-      .get<string>("SHARE_TOKEN_PEPPER")
-      ?.trim();
-    const hasTokenPepper = Boolean(tokenPepper);
-    let selectedVideoIds: string[] = [];
-    let domain: string | null = null;
+    let stage = "start";
 
     try {
+      stage = "read-token-pepper";
+      const tokenPepper = this.configService
+        .get<string>("SHARE_TOKEN_PEPPER")
+        ?.trim();
+
       if (!tokenPepper) {
         throw new BadRequestException("SHARE_TOKEN_PEPPER is required.");
       }
 
+      stage = "ensure-active-website";
       await this.ensureActiveWebsiteExists(websiteId);
-      selectedVideoIds = await this.resolveShareLinkVideoIds(websiteId, dto);
+
+      stage = "resolve-video-ids";
+      const selectedVideoIds = await this.resolveShareLinkVideoIds(
+        websiteId,
+        dto,
+      );
       if (selectedVideoIds.length === 0) {
         throw new BadRequestException("No playable videos selected.");
       }
 
+      stage = "load-playable-videos";
       const videos = await this.getReadyPlayableVideosByIds(selectedVideoIds);
+
+      stage = "validate-playable-videos";
       this.ensureAllRequestedVideosFound(selectedVideoIds, videos, (videoId) => {
         return `Video ${videoId} is not READY, not playable, or does not exist. READY direct/upload, embed, and DB_BLOB videos with binary data can be attached to a share link.`;
       });
 
-      domain = await this.getPreferredActiveDomain(websiteId);
-      this.logger.debug(
-        {
-          websiteId,
-          selectedVideoCount: selectedVideoIds.length,
-          domain,
-          hasTokenPepper,
-        },
-        "Creating admin share link.",
+      stage = "validate-share-link-options";
+      const label = this.trimNullable(dto.label);
+      const expiresAt = this.parseNullableDate(dto.expiresAt);
+      const maxViews = this.parseNullablePositiveInteger(
+        dto.maxViews,
+        "maxViews",
       );
 
+      stage = "get-domain";
+      const domain = await this.getPreferredActiveDomain(websiteId);
       if (!domain) {
         throw new BadRequestException(
           "Website must have one ACTIVE assigned domain before creating a share link.",
         );
       }
 
+      stage = "generate-token";
       const rawToken = generateShareToken();
       const tokenHash = hashShareToken({ token: rawToken, pepper: tokenPepper });
+
+      stage = "build-public-url";
       const publicUrl = buildPublicShareUrl({
         domain,
         token: rawToken,
         protocol: this.getConfiguredPublicSiteProtocol(domain),
       });
 
+      stage = "transaction-create-share-link";
       const shareLink = await this.prisma.$transaction(async (tx) => {
         const createdShareLink = await tx.shareLink.create({
           data: {
             websiteId,
             tokenHash,
-            label: this.trimNullable(dto.label),
-            expiresAt: this.parseNullableDate(dto.expiresAt),
-            maxViews: dto.maxViews ?? null,
+            label,
+            expiresAt,
+            maxViews,
+            currentViews: 0,
             status: ShareLinkStatus.ACTIVE,
           },
         });
 
-        await tx.shareLinkVideo.createMany({
-          data: selectedVideoIds.map((videoId, index) => ({
-            shareLinkId: createdShareLink.id,
-            videoId,
-            sortOrder: index,
-          })),
-        });
+        for (const [index, videoId] of selectedVideoIds.entries()) {
+          await tx.shareLinkVideo.create({
+            data: {
+              shareLinkId: createdShareLink.id,
+              videoId,
+              sortOrder: index,
+            },
+          });
+        }
 
         return tx.shareLink.findUniqueOrThrow({
           where: { id: createdShareLink.id },
@@ -1238,6 +1263,7 @@ export class AdminWebsitesService {
         });
       });
 
+      stage = "write-audit";
       await this.writeAudit(
         adminId,
         "SHARE_LINK_CREATE",
@@ -1246,6 +1272,7 @@ export class AdminWebsitesService {
         { websiteId, videoCount: shareLink.shareLinkVideos.length },
       );
 
+      stage = "build-response";
       return {
         message: "Share link created successfully.",
         shareLink: this.toShareLinkResponse(shareLink, publicUrl),
@@ -1255,12 +1282,12 @@ export class AdminWebsitesService {
     } catch (error) {
       this.logger.error(
         {
+          stage,
           websiteId,
-          selectedVideoCount: selectedVideoIds.length,
-          domain,
-          hasTokenPepper,
+          videoIds: dto.videoIds ?? null,
           errorName: error instanceof Error ? error.name : "UnknownError",
           errorMessage: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
         },
         "Create share link failed.",
       );
@@ -1841,38 +1868,60 @@ export class AdminWebsitesService {
 
   private async getReadyPlayableVideosByIds(
     videoIds: string[],
-  ): Promise<VideoAsset[]> {
+  ): Promise<VideoWithBinaryAssetMetadata[]> {
     if (videoIds.length === 0) {
       return [];
     }
 
-    return this.prisma.videoAsset.findMany({
+    const videos = await this.prisma.videoAsset.findMany({
       where: {
         id: { in: videoIds },
         status: VideoStatus.READY,
-        OR: [
-          {
-            sourceType: {
-              in: [VideoSourceType.UPLOAD, VideoSourceType.DIRECT_URL],
-            },
-            playbackUrl: { not: null },
+      },
+      include: {
+        binaryAsset: {
+          select: {
+            mimeType: true,
+            sizeBytes: true,
           },
-          {
-            sourceType: VideoSourceType.EMBED,
-            embedUrl: { not: null },
-          },
-          {
-            sourceType: VideoSourceType.DB_BLOB,
-            binaryAsset: {
-              is: {
-                mimeType: { startsWith: "video/" },
-                sizeBytes: { gt: BigInt(0) },
-              },
-            },
-          },
-        ],
+        },
       },
     });
+
+    return videos.filter((video) => this.isPublicPlayableVideo(video));
+  }
+
+  private isPublicPlayableVideo(video: VideoWithBinaryAssetMetadata): boolean {
+    if (video.status !== VideoStatus.READY) {
+      return false;
+    }
+
+    if (
+      video.sourceType === VideoSourceType.UPLOAD ||
+      video.sourceType === VideoSourceType.DIRECT_URL
+    ) {
+      return (
+        typeof video.playbackUrl === "string" &&
+        video.playbackUrl.trim() !== ""
+      );
+    }
+
+    if (video.sourceType === VideoSourceType.EMBED) {
+      return typeof video.embedUrl === "string" && video.embedUrl.trim() !== "";
+    }
+
+    if (video.sourceType === VideoSourceType.DB_BLOB) {
+      const mimeType = String(video.binaryAsset?.mimeType ?? "");
+      const sizeBytes = Number(video.binaryAsset?.sizeBytes ?? 0);
+
+      return (
+        mimeType.startsWith("video/") &&
+        Number.isFinite(sizeBytes) &&
+        sizeBytes > 0
+      );
+    }
+
+    return false;
   }
 
   private ensureAllRequestedVideosFound(
@@ -1897,13 +1946,7 @@ export class AdminWebsitesService {
     websiteId: string,
     dto: CreateShareLinkDto,
   ): Promise<string[]> {
-    const providedVideoIds = [
-      ...new Set(
-        (dto.videoIds ?? [])
-          .map((videoId) => videoId.trim())
-          .filter((videoId) => videoId.length > 0),
-      ),
-    ];
+    const providedVideoIds = this.normalizeShareLinkVideoIds(dto.videoIds);
 
     if (providedVideoIds.length > 0) {
       return providedVideoIds;
@@ -1918,7 +1961,21 @@ export class AdminWebsitesService {
       select: { videoId: true },
     });
 
-    return assignments.map((assignment) => assignment.videoId);
+    return this.normalizeShareLinkVideoIds(
+      assignments.map((assignment) => assignment.videoId),
+    );
+  }
+
+  private normalizeShareLinkVideoIds(
+    videoIds: string[] | undefined,
+  ): string[] {
+    return Array.from(
+      new Set(
+        (videoIds ?? [])
+          .map((videoId) => videoId.trim())
+          .filter((videoId) => videoId.length > 0),
+      ),
+    );
   }
 
   private async getPreferredActiveDomain(
@@ -1972,7 +2029,41 @@ export class AdminWebsitesService {
       return null;
     }
 
-    return new Date(value);
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      throw new BadRequestException("expiresAt must be a valid ISO 8601 date.");
+    }
+
+    return date;
+  }
+
+  private parseNullablePositiveInteger(
+    value: number | null | undefined,
+    fieldName: string,
+  ): number | null {
+    if (value === undefined || value === null) {
+      return null;
+    }
+
+    const numberValue = Number(value);
+    if (!Number.isInteger(numberValue) || numberValue < 1) {
+      throw new BadRequestException(`${fieldName} must be a positive integer.`);
+    }
+
+    return numberValue;
+  }
+
+  private toSafeNumber(value: unknown): number | null {
+    if (value === null || value === undefined) {
+      return null;
+    }
+
+    if (typeof value === "bigint") {
+      return Number(value);
+    }
+
+    const numberValue = Number(value);
+    return Number.isFinite(numberValue) ? numberValue : null;
   }
 
   private toJsonInput(value: Record<string, unknown>): Prisma.InputJsonValue {
@@ -2085,8 +2176,8 @@ export class AdminWebsitesService {
       label: shareLink.label,
       status: shareLink.status,
       expiresAt: shareLink.expiresAt,
-      maxViews: shareLink.maxViews,
-      currentViews: shareLink.currentViews,
+      maxViews: this.toSafeNumber(shareLink.maxViews),
+      currentViews: this.toSafeNumber(shareLink.currentViews) ?? 0,
       createdAt: shareLink.createdAt,
       updatedAt: shareLink.updatedAt,
       lastViewedAt: shareLink.lastViewedAt,

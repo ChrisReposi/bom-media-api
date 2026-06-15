@@ -1,6 +1,5 @@
 # Dependencies
 node_modules/
-.local-storage
 
 # Build output
 dist/
@@ -49,3 +48,6 @@ pnpm-lock.yaml
 *.sqlite-journal
 *.db
 *.bak
+
+# Local runtime uploaded files - never commit
+.local-storage/

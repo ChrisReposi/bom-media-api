@@ -1,5 +1,7 @@
 import { Module } from "@nestjs/common";
-import { ConfigModule } from "@nestjs/config";
+import { ConfigModule, ConfigService } from "@nestjs/config";
+import { APP_GUARD } from "@nestjs/core";
+import { ThrottlerGuard, ThrottlerModule } from "@nestjs/throttler";
 import { LoggerModule } from "nestjs-pino";
 import { AdminAuthModule } from "./admin-auth/admin-auth.module";
 import { AdminWebsitesModule } from "./admin-websites/admin-websites.module";
@@ -7,11 +9,15 @@ import { AppController } from "./app.controller";
 import { AppService } from "./app.service";
 import { apiConfig } from "./config/env.config";
 import { validateEnv } from "./config/env.validation";
+import { loadApiEnv } from "./config/load-env";
 import { DatabaseModule } from "./database/database.module";
 import { HealthModule } from "./health/health.module";
 import { PublicModule } from "./public/public.module";
 import { SecurityModule } from "./security/security.module";
+import { buildThrottlerOptions } from "./security/throttle.config";
 import { VideosModule } from "./videos/videos.module";
+
+loadApiEnv();
 
 function redactTokenFromUrl(value: string): string {
   const [rawPath, queryString] = value.split("?");
@@ -68,7 +74,7 @@ function serializeRequestForLogs(
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      envFilePath: [".env"],
+      ignoreEnvFile: true,
       load: [apiConfig],
       validate: validateEnv,
     }),
@@ -89,6 +95,11 @@ function serializeRequestForLogs(
         },
       },
     }),
+    ThrottlerModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: buildThrottlerOptions,
+    }),
     DatabaseModule,
     SecurityModule,
     HealthModule,
@@ -98,6 +109,12 @@ function serializeRequestForLogs(
     AdminWebsitesModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,
+    },
+  ],
 })
 export class AppModule {}

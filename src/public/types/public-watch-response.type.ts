@@ -33,6 +33,10 @@ export type PublicWatchVideoResponse = {
     mimeType: string;
     sizeBytes: string;
   } | null;
+  localFileAsset?: {
+    mimeType: string;
+    sizeBytes: string;
+  } | null;
   embedUrl: string | null;
   embedProvider: EmbedProvider | null;
   embedAllow: string | null;
@@ -54,4 +58,25 @@ export class PublicWatchResponse {
 
   @ApiProperty({ isArray: true })
   videos!: PublicWatchVideoResponse[];
+}
+
+export class PublicVideoViewResponse {
+  @ApiProperty({ example: true })
+  valid!: boolean;
+
+  @ApiProperty({ example: "cm_video_123", nullable: true })
+  videoId!: string | null;
+
+  @ApiProperty({
+    example: "1231132",
+    nullable: true,
+    description: "String because Prisma BigInt cannot be JSON serialized.",
+  })
+  viewCount!: string | null;
+
+  @ApiProperty({
+    example: "2026-06-14T00:00:00.000Z",
+    nullable: true,
+  })
+  publishedAt!: string | null;
 }

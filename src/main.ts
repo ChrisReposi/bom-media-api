@@ -5,6 +5,7 @@ import { NestFactory } from "@nestjs/core";
 import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
 import helmet from "helmet";
 import { Logger } from "nestjs-pino";
+import type { NextFunction, Request, Response } from "express";
 import { SWAGGER_PATH } from "./common/constants/api.constants";
 import type { ApiEnvironmentConfig } from "./config/env.config";
 import { AppModule } from "./app.module";
@@ -20,7 +21,16 @@ async function bootstrap(): Promise<void> {
   const configService = app.get(ConfigService);
   const apiEnvironment = configService.getOrThrow<ApiEnvironmentConfig>("api");
 
+  if (apiEnvironment.trustProxyEnabled) {
+    const expressInstance = app.getHttpAdapter().getInstance() as {
+      set(name: string, value: number): void;
+    };
+
+    expressInstance.set("trust proxy", apiEnvironment.trustProxyHops);
+  }
+
   app.use(helmet());
+  app.use(createPublicMediaHeaderMiddleware(apiEnvironment.prefix));
 
   const corsOriginService = app.get(CorsOriginService);
 
@@ -71,3 +81,19 @@ async function bootstrap(): Promise<void> {
 }
 
 void bootstrap();
+
+function createPublicMediaHeaderMiddleware(prefix: string) {
+  const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const mediaPathPattern = new RegExp(
+    `^/${escapedPrefix}/public/watch/[^/]+/videos/[^/]+/(?:binary|local-file|thumbnail)$`,
+  );
+
+  return (request: Request, response: Response, next: NextFunction): void => {
+    if (mediaPathPattern.test(request.path)) {
+      response.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+      response.vary("Origin");
+    }
+
+    next();
+  };
+}

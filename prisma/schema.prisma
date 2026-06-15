@@ -31,6 +31,16 @@ enum VideoSourceType {
   DIRECT_URL
   EMBED
   DB_BLOB
+  LOCAL_FILE
+}
+
+enum VideoUploadSessionStatus {
+  ACTIVE
+  COMPLETING
+  COMPLETED
+  ABORTED
+  EXPIRED
+  FAILED
 }
 
 enum EmbedProvider {
@@ -107,23 +117,49 @@ model AdminUser {
   updatedAt    DateTime      @updatedAt
 
   refreshTokens AdminRefreshToken[]
+  sessions      AdminSession[]
   auditLogs     AdminAuditLog[]
+  uploadSessions VideoUploadSession[]
 
   @@index([status])
+}
+
+model AdminSession {
+  id            String    @id @default(cuid())
+  adminId       String
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  revokedReason String?   @db.VarChar(80)
+  lastUsedAt    DateTime?
+  ipHash        String?   @db.VarChar(128)
+  userAgentHash String?   @db.VarChar(128)
+  userAgent     String?   @db.VarChar(512)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  admin         AdminUser           @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  refreshTokens AdminRefreshToken[]
+
+  @@index([adminId])
+  @@index([expiresAt])
+  @@index([revokedAt])
 }
 
 model AdminRefreshToken {
   id        String    @id @default(cuid())
   adminId   String
+  sessionId String?
   tokenHash String    @unique @db.VarChar(128)
   expiresAt DateTime
   revokedAt DateTime?
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
 
-  admin AdminUser @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  admin   AdminUser     @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  session AdminSession? @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   @@index([adminId])
+  @@index([sessionId])
   @@index([expiresAt])
 }
 
@@ -154,6 +190,11 @@ model VideoAsset {
   websiteVideos   WebsiteVideo[]
   shareLinkVideos ShareLinkVideo[]
   binaryAsset     VideoBinaryAsset?
+  localFileAsset  VideoLocalFileAsset?
+  localThumbnailAsset VideoLocalThumbnailAsset?
+  uploadSessions  VideoUploadSession[]
+  viewGrowthBuckets VideoViewGrowthBucket[]
+  viewGrowthEvents  VideoViewGrowthEvent[]
 
   @@index([status])
   @@index([provider, providerAssetId])
@@ -174,6 +215,123 @@ model VideoBinaryAsset {
   video VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
 
   @@index([videoId])
+}
+
+model VideoLocalFileAsset {
+  id               String   @id @default(cuid())
+  videoId          String   @unique
+  storageKey       String   @unique @db.VarChar(512)
+  originalFilename String   @db.VarChar(255)
+  mimeType         String   @db.VarChar(120)
+  sizeBytes        BigInt
+  checksumSha256   String?  @db.VarChar(64)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  video VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@index([videoId])
+  @@index([storageKey])
+}
+
+model VideoLocalThumbnailAsset {
+  id               String   @id @default(cuid())
+  videoId          String   @unique
+  storageKey       String   @unique @db.VarChar(512)
+  originalFilename String   @db.VarChar(255)
+  mimeType         String   @db.VarChar(120)
+  sizeBytes        BigInt
+  checksumSha256   String?  @db.VarChar(64)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  video VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@index([videoId])
+  @@index([storageKey])
+}
+
+model VideoUploadSession {
+  id               String                   @id @default(cuid())
+  adminId          String
+  videoId          String?
+  title            String                   @db.VarChar(255)
+  slug             String?                  @db.VarChar(160)
+  description      String?                  @db.Text
+  originalFilename String                   @db.VarChar(255)
+  mimeType         String                   @db.VarChar(120)
+  totalBytes       BigInt
+  totalChunks      Int
+  chunkSizeBytes   Int
+  receivedChunks   Int                      @default(0)
+  tempStorageKey   String                   @unique @db.VarChar(512)
+  finalStorageKey  String?                  @db.VarChar(512)
+  checksumSha256   String?                  @db.VarChar(64)
+  status           VideoUploadSessionStatus @default(ACTIVE)
+  expiresAt        DateTime
+  completedAt      DateTime?
+  abortedAt        DateTime?
+  metadataJson     Json?
+  createdAt        DateTime                 @default(now())
+  updatedAt        DateTime                 @updatedAt
+
+  admin  AdminUser   @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  video  VideoAsset? @relation(fields: [videoId], references: [id], onDelete: SetNull)
+  chunks VideoUploadSessionChunk[]
+
+  @@index([adminId])
+  @@index([videoId])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+model VideoUploadSessionChunk {
+  id              String   @id @default(cuid())
+  uploadSessionId String
+  chunkIndex      Int
+  storageKey      String   @unique @db.VarChar(512)
+  sizeBytes       BigInt
+  checksumSha256  String?  @db.VarChar(64)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  uploadSession VideoUploadSession @relation(fields: [uploadSessionId], references: [id], onDelete: Cascade)
+
+  @@unique([uploadSessionId, chunkIndex])
+  @@index([uploadSessionId])
+  @@index([chunkIndex])
+}
+
+model VideoViewGrowthBucket {
+  id             String   @id @default(cuid())
+  videoId        String
+  bucketStart    DateTime
+  incrementTotal Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  video VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@unique([videoId, bucketStart])
+  @@index([bucketStart])
+}
+
+model VideoViewGrowthEvent {
+  id          String   @id @default(cuid())
+  videoId     String
+  shareLinkId String?
+  websiteId   String?
+  viewerHash  String   @db.VarChar(128)
+  windowStart DateTime
+  increment   Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  video VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@unique([videoId, viewerHash, windowStart])
+  @@index([videoId, createdAt])
+  @@index([shareLinkId])
+  @@index([websiteId])
 }
 
 model Website {

@@ -43,24 +43,40 @@ import { diskStorage, memoryStorage, MulterError } from "multer";
 import { CurrentAdmin } from "../admin-auth/decorators/current-admin.decorator";
 import { AdminAccessTokenGuard } from "../admin-auth/guards/admin-access-token.guard";
 import type { SafeAdminResponse } from "../admin-auth/types/admin-auth-response.type";
+import {
+  THROTTLE_PROFILES,
+  ThrottleProfile,
+} from "../security/throttle-profile.decorator";
 import { CreateEmbedVideoWithThumbnailDto } from "./dto/create-embed-video-with-thumbnail.dto";
 import { CreateEmbedVideoDto } from "./dto/create-embed-video.dto";
 import { CreateManualVideoWithThumbnailDto } from "./dto/create-manual-video-with-thumbnail.dto";
 import { CreateVideoDto } from "./dto/create-video.dto";
+import { CompleteLocalVideoUploadDto } from "./dto/complete-local-video-upload.dto";
+import { InitLocalVideoUploadDto } from "./dto/init-local-video-upload.dto";
 import { ListVideosQueryDto } from "./dto/list-videos-query.dto";
 import { PurgeVideoDto } from "./dto/purge-video.dto";
 import { ReplaceDatabaseVideoBinaryDto } from "./dto/replace-database-video-binary.dto";
 import { UploadDatabaseVideoDto } from "./dto/upload-database-video.dto";
+import { UploadLocalVideoChunkDto } from "./dto/upload-local-video-chunk.dto";
+import { UpdateLocalVideoThumbnailDto } from "./dto/update-local-video-thumbnail.dto";
 import { UpdateVideoDto } from "./dto/update-video.dto";
 import { UploadVideoDto } from "./dto/upload-video.dto";
 import {
+  CancelLocalVideoUploadResponse,
   DisableVideoResponse,
+  InitLocalVideoUploadResponse,
+  LocalVideoChunkUploadResponse,
   PurgeVideoResponse,
+  VideoUploadSessionResponse,
   VideoListResponse,
   VideoResponse,
 } from "./types/video-response.type";
 import { VideosService } from "./videos.service";
-import type { DatabaseVideoBinary } from "./videos.service";
+import type {
+  DatabaseVideoBinary,
+  LocalThumbnailStream,
+  LocalVideoFileStream,
+} from "./videos.service";
 
 const DEFAULT_UPLOAD_LIMIT_BYTES = 500 * 1024 * 1024;
 const MAX_DATABASE_UPLOAD_LIMIT_MB = 100;
@@ -69,6 +85,9 @@ const MAX_DATABASE_UPLOAD_LIMIT_BYTES =
 const MAX_THUMBNAIL_UPLOAD_LIMIT_MB = 10;
 const MAX_THUMBNAIL_UPLOAD_LIMIT_BYTES =
   MAX_THUMBNAIL_UPLOAD_LIMIT_MB * 1024 * 1024;
+const MAX_LOCAL_CHUNK_UPLOAD_LIMIT_MB = 100;
+const MAX_LOCAL_CHUNK_UPLOAD_LIMIT_BYTES =
+  MAX_LOCAL_CHUNK_UPLOAD_LIMIT_MB * 1024 * 1024;
 
 type VideoUploadFiles = {
   file?: Express.Multer.File[];
@@ -88,6 +107,21 @@ function createDatabaseUploadFilename(
     : "";
 
   callback(null, `video-db-${Date.now()}-${randomUUID()}${extension}`);
+}
+
+function createLocalTempUploadFilename(
+  _request: Express.Request,
+  file: Express.Multer.File,
+  callback: (error: Error | null, filename: string) => void,
+): void {
+  const rawExtension = file.originalname.includes(".")
+    ? file.originalname.slice(file.originalname.lastIndexOf("."))
+    : "";
+  const extension = /^\.[a-z0-9]{1,12}$/i.test(rawExtension)
+    ? rawExtension.toLowerCase()
+    : "";
+
+  callback(null, `video-local-${Date.now()}-${randomUUID()}${extension}`);
 }
 
 function sendRangeNotSatisfiable(response: Response, size: number): void {
@@ -173,6 +207,58 @@ function streamDatabaseVideoBinary(
   response.send(chunk);
 }
 
+function setNoStoreMediaHeaders(response: Response, mimeType: string): void {
+  response.setHeader("Accept-Ranges", "bytes");
+  response.setHeader(
+    "Cache-Control",
+    "private, no-store, no-cache, must-revalidate",
+  );
+  response.setHeader("Pragma", "no-cache");
+  response.setHeader("Expires", "0");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+  response.setHeader("Content-Type", mimeType);
+}
+
+function streamLocalVideoFile(
+  result: LocalVideoFileStream,
+  response: Response,
+): void {
+  setNoStoreMediaHeaders(response, result.mimeType);
+
+  if (result.statusCode === HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE) {
+    response.status(HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE);
+    response.setHeader("Content-Range", result.contentRange ?? "");
+    response.end();
+    return;
+  }
+
+  response.status(result.statusCode);
+  response.setHeader("Content-Length", String(result.contentLength));
+
+  if (result.contentRange !== null) {
+    response.setHeader("Content-Range", result.contentRange);
+  }
+
+  result.stream?.pipe(response);
+}
+
+function streamLocalThumbnail(
+  result: LocalThumbnailStream,
+  response: Response,
+): void {
+  response.setHeader(
+    "Cache-Control",
+    "private, no-store, no-cache, must-revalidate",
+  );
+  response.setHeader("Pragma", "no-cache");
+  response.setHeader("Expires", "0");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+  response.setHeader("Content-Type", result.mimeType);
+  response.setHeader("Content-Length", String(result.contentLength));
+  response.status(HttpStatus.OK);
+  result.stream.pipe(response);
+}
+
 function getFirstUploadedFile(
   files: VideoUploadFiles | undefined,
   fieldName: keyof VideoUploadFiles,
@@ -214,9 +300,27 @@ class ThumbnailUploadMulterExceptionFilter implements ExceptionFilter {
   }
 }
 
+@Catch(MulterError)
+class LocalUploadMulterExceptionFilter implements ExceptionFilter {
+  catch(exception: MulterError, host: ArgumentsHost): void {
+    const response = host.switchToHttp().getResponse<Response>();
+    const message =
+      exception.code === "LIMIT_FILE_SIZE"
+        ? `Local upload chunk must be ${MAX_LOCAL_CHUNK_UPLOAD_LIMIT_MB}MB or smaller.`
+        : exception.message || "Invalid local video upload.";
+
+    response.status(HttpStatus.BAD_REQUEST).json({
+      statusCode: HttpStatus.BAD_REQUEST,
+      message,
+      error: "Bad Request",
+    });
+  }
+}
+
 @ApiTags("admin-videos")
 @ApiBearerAuth()
 @UseGuards(AdminAccessTokenGuard)
+@ThrottleProfile(THROTTLE_PROFILES.admin)
 @Controller("admin/videos")
 export class VideosController {
   constructor(private readonly videosService: VideosService) {}
@@ -233,6 +337,134 @@ export class VideosController {
   })
   listVideos(@Query() query: ListVideosQueryDto): Promise<VideoListResponse> {
     return this.videosService.listVideos(query);
+  }
+
+  @Post("upload-local/init")
+  @ApiOperation({
+    summary: "Initialize chunked local-file video upload",
+    description:
+      "Creates an upload session for Hostinger/private NVMe local storage. Video bytes are stored on disk, not in MySQL.",
+  })
+  @ApiCreatedResponse({ type: InitLocalVideoUploadResponse })
+  @ApiBadRequestResponse({
+    description:
+      "Invalid file metadata, disabled local storage, or size limit.",
+  })
+  @ApiUnauthorizedResponse({
+    description: "Missing, invalid, expired, or inactive access token.",
+  })
+  initLocalVideoUpload(
+    @Body() dto: InitLocalVideoUploadDto,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<InitLocalVideoUploadResponse> {
+    return this.videosService.initLocalVideoUpload(dto, admin.id);
+  }
+
+  @Post("upload-local/:uploadId/chunks")
+  @UseFilters(LocalUploadMulterExceptionFilter)
+  @UseInterceptors(
+    FileInterceptor("chunk", {
+      storage: diskStorage({
+        destination: tmpdir(),
+        filename: createLocalTempUploadFilename,
+      }),
+      limits: { fileSize: MAX_LOCAL_CHUNK_UPLOAD_LIMIT_BYTES },
+    }),
+  )
+  @ApiOperation({
+    summary: "Upload one local-file video chunk",
+    description:
+      "Stores one chunk in the private local temp upload area and records chunk progress in MySQL.",
+  })
+  @ApiConsumes("multipart/form-data")
+  @ApiBody({ type: UploadLocalVideoChunkDto })
+  @ApiOkResponse({ type: LocalVideoChunkUploadResponse })
+  @ApiBadRequestResponse({
+    description: "Invalid chunk, index, checksum, size, or upload session.",
+  })
+  @ApiUnauthorizedResponse({
+    description: "Missing, invalid, expired, or inactive access token.",
+  })
+  uploadLocalVideoChunk(
+    @Param("uploadId") uploadId: string,
+    @Body() dto: UploadLocalVideoChunkDto,
+    @UploadedFile() chunk: Express.Multer.File | undefined,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<LocalVideoChunkUploadResponse> {
+    return this.videosService.uploadLocalVideoChunk(
+      uploadId,
+      dto,
+      chunk,
+      admin.id,
+    );
+  }
+
+  @Get("upload-local/:uploadId")
+  @ApiOperation({ summary: "Get local-file upload session progress" })
+  @ApiOkResponse({ type: VideoUploadSessionResponse })
+  @ApiUnauthorizedResponse({
+    description: "Missing, invalid, expired, or inactive access token.",
+  })
+  @ApiNotFoundResponse({ description: "Upload session not found." })
+  getLocalVideoUploadStatus(
+    @Param("uploadId") uploadId: string,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<VideoUploadSessionResponse> {
+    return this.videosService.getLocalVideoUploadStatus(uploadId, admin.id);
+  }
+
+  @Post("upload-local/:uploadId/complete")
+  @UseFilters(ThumbnailUploadMulterExceptionFilter)
+  @UseInterceptors(
+    FileInterceptor("thumbnailFile", {
+      storage: diskStorage({
+        destination: tmpdir(),
+        filename: createLocalTempUploadFilename,
+      }),
+      limits: { fileSize: MAX_THUMBNAIL_UPLOAD_LIMIT_BYTES },
+    }),
+  )
+  @ApiOperation({
+    summary: "Complete chunked local-file video upload",
+    description:
+      "Verifies all chunks, streams them into the final local video file, creates VideoAsset metadata, and optionally stores a local thumbnail.",
+  })
+  @ApiConsumes("multipart/form-data")
+  @ApiBody({ type: CompleteLocalVideoUploadDto })
+  @ApiOkResponse({ type: VideoResponse })
+  @ApiBadRequestResponse({
+    description:
+      "Missing chunks, invalid checksum, invalid video, or thumbnail.",
+  })
+  @ApiUnauthorizedResponse({
+    description: "Missing, invalid, expired, or inactive access token.",
+  })
+  completeLocalVideoUpload(
+    @Param("uploadId") uploadId: string,
+    @Body() dto: CompleteLocalVideoUploadDto,
+    @UploadedFile() thumbnailFile: Express.Multer.File | undefined,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<VideoResponse> {
+    return this.videosService.completeLocalVideoUpload(
+      uploadId,
+      dto,
+      thumbnailFile,
+      admin.id,
+    );
+  }
+
+  @Post("upload-local/:uploadId/cancel")
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: "Cancel chunked local-file video upload" })
+  @ApiOkResponse({ type: CancelLocalVideoUploadResponse })
+  @ApiUnauthorizedResponse({
+    description: "Missing, invalid, expired, or inactive access token.",
+  })
+  cancelLocalVideoUpload(
+    @Param("uploadId") uploadId: string,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<CancelLocalVideoUploadResponse> {
+    return this.videosService.cancelLocalVideoUpload(uploadId, admin.id);
   }
 
   @Get(":id")
@@ -269,6 +501,58 @@ export class VideosController {
     const binary = await this.videosService.getDatabaseVideoBinary(id);
 
     streamDatabaseVideoBinary(binary, request.headers.range, response);
+  }
+
+  @Get(":id/local-file")
+  @ApiOperation({
+    summary: "Stream admin local-file video",
+    description:
+      "Admin-only playback endpoint for LOCAL_FILE videos stored on private local storage. Supports HTTP Range requests.",
+  })
+  @ApiOkResponse({
+    description: "Full local file response when no Range header is supplied.",
+  })
+  @ApiUnauthorizedResponse({
+    description: "Missing, invalid, expired, or inactive access token.",
+  })
+  @ApiNotFoundResponse({
+    description: "Local video file not found.",
+  })
+  async streamLocalVideo(
+    @Param("id") id: string,
+    @Req() request: Request,
+    @Res() response: Response,
+  ): Promise<void> {
+    const result = await this.videosService.getLocalVideoFileStream(
+      id,
+      request.headers.range,
+    );
+
+    streamLocalVideoFile(result, response);
+  }
+
+  @Get(":id/thumbnail")
+  @ApiOperation({
+    summary: "Stream admin local video thumbnail",
+    description:
+      "Admin-only endpoint for LOCAL_FILE thumbnail images stored on private local storage.",
+  })
+  @ApiOkResponse({
+    description: "Local thumbnail image response.",
+  })
+  @ApiUnauthorizedResponse({
+    description: "Missing, invalid, expired, or inactive access token.",
+  })
+  @ApiNotFoundResponse({
+    description: "Local thumbnail not found.",
+  })
+  async streamLocalThumbnail(
+    @Param("id") id: string,
+    @Res() response: Response,
+  ): Promise<void> {
+    const result = await this.videosService.getLocalThumbnailStream(id);
+
+    streamLocalThumbnail(result, response);
   }
 
   @Post()
@@ -522,6 +806,45 @@ export class VideosController {
     );
   }
 
+  @Patch(":id/thumbnail-local")
+  @UseFilters(ThumbnailUploadMulterExceptionFilter)
+  @UseInterceptors(
+    FileInterceptor("thumbnailFile", {
+      storage: diskStorage({
+        destination: tmpdir(),
+        filename: createLocalTempUploadFilename,
+      }),
+      limits: { fileSize: MAX_THUMBNAIL_UPLOAD_LIMIT_BYTES },
+    }),
+  )
+  @ApiOperation({
+    summary: "Replace local thumbnail for a LOCAL_FILE video",
+    description:
+      "Stores the thumbnail on private local storage and replaces any previous owned local thumbnail best-effort.",
+  })
+  @ApiConsumes("multipart/form-data")
+  @ApiBody({ type: UpdateLocalVideoThumbnailDto })
+  @ApiOkResponse({ type: VideoResponse })
+  @ApiBadRequestResponse({
+    description:
+      "Missing thumbnail file, unsupported image type, SVG thumbnail, or non-LOCAL_FILE video.",
+  })
+  @ApiUnauthorizedResponse({
+    description: "Missing, invalid, expired, or inactive access token.",
+  })
+  @ApiNotFoundResponse({ description: "Video not found." })
+  updateLocalVideoThumbnail(
+    @Param("id") id: string,
+    @UploadedFile() thumbnailFile: Express.Multer.File | undefined,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<VideoResponse> {
+    return this.videosService.updateLocalVideoThumbnail(
+      id,
+      thumbnailFile,
+      admin.id,
+    );
+  }
+
   @Patch(":id")
   @ApiOperation({ summary: "Update video metadata" })
   @ApiOkResponse({ type: VideoResponse })
@@ -543,7 +866,7 @@ export class VideosController {
   @ApiOperation({
     summary: "Disable video",
     description:
-      "Soft-disables a video by setting status to DISABLED. It does not delete the database row or remote Cloudinary asset.",
+      "Soft-disables a video by setting status to DISABLED. It does not delete the database row, local files, thumbnails, DB_BLOB bytes, or remote Cloudinary asset.",
   })
   @ApiOkResponse({ type: DisableVideoResponse })
   @ApiUnauthorizedResponse({
@@ -562,7 +885,7 @@ export class VideosController {
   @ApiOperation({
     summary: "Permanently delete video",
     description:
-      "Permanently deletes the video database row after explicit id confirmation and relation safety checks. Existing soft delete remains available through DELETE /admin/videos/:id.",
+      "Permanently deletes the video database row after explicit id confirmation and relation safety checks. LOCAL_FILE video and thumbnail storage is reclaimed best-effort. Existing soft delete remains available through DELETE /admin/videos/:id.",
   })
   @ApiBody({
     type: PurgeVideoDto,

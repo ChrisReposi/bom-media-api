@@ -11,7 +11,15 @@ const DEFAULT_VIDEO_DB_UPLOAD_MB = 50;
 const MAX_VIDEO_DB_UPLOAD_MB = 100;
 const DEFAULT_VIDEO_THUMBNAIL_UPLOAD_MB = 5;
 const MAX_VIDEO_THUMBNAIL_UPLOAD_MB = 10;
+const DEFAULT_LOCAL_VIDEO_UPLOAD_MB = 500;
+const MAX_LOCAL_VIDEO_UPLOAD_HARD_MB = 1024;
+const DEFAULT_LOCAL_VIDEO_CHUNK_MB = 50;
+const DEFAULT_LOCAL_VIDEO_UPLOAD_SESSION_TTL_MINUTES = 120;
+const DEFAULT_LOCAL_VIDEO_MIN_FREE_SPACE_MB = 1024;
+const DEFAULT_LOCAL_VIDEO_STALE_UPLOAD_MAX_AGE_HOURS = 24;
+const DEFAULT_LOCAL_THUMBNAIL_UPLOAD_MB = 10;
 const PROTOCOL_VALUES = new Set(["http", "https"]);
+const JWT_EXPIRES_IN_PATTERN = /^\d+[smhd]?$/;
 
 function readString(
   config: Record<string, unknown>,
@@ -86,13 +94,60 @@ function readOptionalProtocol(
   return protocol;
 }
 
+function readPositiveInteger(
+  config: Record<string, unknown>,
+  key: string,
+  fallback: number,
+): number {
+  const value = Number(readString(config, key, String(fallback)));
+
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${key} must be a positive integer`);
+  }
+
+  return value;
+}
+
+function readOptionalTrimmedString(
+  config: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = config[key];
+
+  if (typeof value !== "string" || value.trim() === "") {
+    delete process.env[key];
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  process.env[key] = trimmed;
+  return trimmed;
+}
+
+function isUnsafeLocalStorageRoot(value: string): boolean {
+  const normalized = value.replace(/\\/g, "/").toLowerCase();
+  const parts = normalized.split("/").filter((part) => part.length > 0);
+
+  return (
+    normalized === "/" ||
+    parts.includes("public_html") ||
+    parts.includes("htdocs") ||
+    parts.includes("www") ||
+    parts.includes("public") ||
+    normalized.endsWith("/dist")
+  );
+}
+
 export function validateEnv(
   config: Record<string, unknown>,
 ): Record<string, unknown> {
   const validated: Record<string, unknown> = { ...config };
   const nodeEnv = readString(config, "NODE_ENV", "development");
+  const appEnv = readString(config, "APP_ENV", nodeEnv);
+  const isProduction = nodeEnv === "production" || appEnv === "production";
 
   validated.NODE_ENV = nodeEnv;
+  validated.APP_ENV = appEnv;
   validated.API_HOST = readString(config, "API_HOST", DEFAULT_API_HOST);
 
   const portValue = readString(config, "API_PORT", String(DEFAULT_API_PORT));
@@ -114,7 +169,12 @@ export function validateEnv(
   validated.API_INTERNAL_DOCS_ENABLED = readBoolean(
     config,
     "API_INTERNAL_DOCS_ENABLED",
-    nodeEnv !== "production",
+    !isProduction,
+  );
+  validated.API_DOCS_ALLOW_IN_PRODUCTION = readBoolean(
+    config,
+    "API_DOCS_ALLOW_IN_PRODUCTION",
+    false,
   );
   validated.DATABASE_URL = readRequiredString(config, "DATABASE_URL");
   if (typeof config.SHADOW_DATABASE_URL === "string") {
@@ -130,9 +190,22 @@ export function validateEnv(
     "JWT_ACCESS_EXPIRES_IN",
     "15m",
   );
+  if (!JWT_EXPIRES_IN_PATTERN.test(String(validated.JWT_ACCESS_EXPIRES_IN))) {
+    throw new Error(
+      "JWT_ACCESS_EXPIRES_IN must be a duration such as 900, 15m, 1h, or 7d",
+    );
+  }
   validated.REFRESH_TOKEN_PEPPER = readRequiredString(
     config,
     "REFRESH_TOKEN_PEPPER",
+  );
+  validated.SHARE_TOKEN_PEPPER = readRequiredString(
+    config,
+    "SHARE_TOKEN_PEPPER",
+  );
+  validated.ACCESS_LOG_IP_PEPPER = readRequiredString(
+    config,
+    "ACCESS_LOG_IP_PEPPER",
   );
 
   const refreshTokenBytes = Number(
@@ -170,7 +243,7 @@ export function validateEnv(
     }
   }
 
-  if (nodeEnv === "production") {
+  if (isProduction) {
     validated.ADMIN_CHANGE_PASSWORD_SECRET = readRequiredString(
       config,
       "ADMIN_CHANGE_PASSWORD_SECRET",
@@ -232,7 +305,123 @@ export function validateEnv(
   validated.CORS_ALLOW_LOCALHOST_DB_DOMAINS = readBoolean(
     config,
     "CORS_ALLOW_LOCALHOST_DB_DOMAINS",
-    nodeEnv !== "production",
+    !isProduction,
+  );
+
+  validated.TRUST_PROXY_ENABLED = readBoolean(
+    config,
+    "TRUST_PROXY_ENABLED",
+    false,
+  );
+  validated.TRUST_PROXY_HOPS = String(
+    readPositiveInteger(config, "TRUST_PROXY_HOPS", 1),
+  );
+  validated.TRUST_PROXY_CLOUDFLARE_ONLY = readBoolean(
+    config,
+    "TRUST_PROXY_CLOUDFLARE_ONLY",
+    false,
+  );
+
+  validated.GLOBAL_THROTTLE_TTL_SECONDS = String(
+    readPositiveInteger(config, "GLOBAL_THROTTLE_TTL_SECONDS", 60),
+  );
+  validated.GLOBAL_THROTTLE_LIMIT = String(
+    readPositiveInteger(config, "GLOBAL_THROTTLE_LIMIT", 120),
+  );
+  validated.AUTH_LOGIN_THROTTLE_TTL_SECONDS = String(
+    readPositiveInteger(config, "AUTH_LOGIN_THROTTLE_TTL_SECONDS", 60),
+  );
+  validated.AUTH_LOGIN_THROTTLE_LIMIT = String(
+    readPositiveInteger(config, "AUTH_LOGIN_THROTTLE_LIMIT", 5),
+  );
+  validated.AUTH_REFRESH_THROTTLE_TTL_SECONDS = String(
+    readPositiveInteger(config, "AUTH_REFRESH_THROTTLE_TTL_SECONDS", 60),
+  );
+  validated.AUTH_REFRESH_THROTTLE_LIMIT = String(
+    readPositiveInteger(config, "AUTH_REFRESH_THROTTLE_LIMIT", 20),
+  );
+  validated.AUTH_LOGOUT_THROTTLE_TTL_SECONDS = String(
+    readPositiveInteger(config, "AUTH_LOGOUT_THROTTLE_TTL_SECONDS", 60),
+  );
+  validated.AUTH_LOGOUT_THROTTLE_LIMIT = String(
+    readPositiveInteger(config, "AUTH_LOGOUT_THROTTLE_LIMIT", 30),
+  );
+  validated.ADMIN_API_THROTTLE_TTL_SECONDS = String(
+    readPositiveInteger(config, "ADMIN_API_THROTTLE_TTL_SECONDS", 60),
+  );
+  validated.ADMIN_API_THROTTLE_LIMIT = String(
+    readPositiveInteger(config, "ADMIN_API_THROTTLE_LIMIT", 120),
+  );
+  validated.PUBLIC_WATCH_THROTTLE_TTL_SECONDS = String(
+    readPositiveInteger(config, "PUBLIC_WATCH_THROTTLE_TTL_SECONDS", 60),
+  );
+  validated.PUBLIC_WATCH_THROTTLE_LIMIT = String(
+    readPositiveInteger(config, "PUBLIC_WATCH_THROTTLE_LIMIT", 60),
+  );
+  validated.PUBLIC_MEDIA_THROTTLE_TTL_SECONDS = String(
+    readPositiveInteger(config, "PUBLIC_MEDIA_THROTTLE_TTL_SECONDS", 60),
+  );
+  validated.PUBLIC_MEDIA_THROTTLE_LIMIT = String(
+    readPositiveInteger(config, "PUBLIC_MEDIA_THROTTLE_LIMIT", 1200),
+  );
+
+  validated.VIDEO_VIEW_GROWTH_ENABLED = readBoolean(
+    config,
+    "VIDEO_VIEW_GROWTH_ENABLED",
+    !isProduction,
+  );
+  const videoViewMaxIncrementPerEvent = readPositiveInteger(
+    config,
+    "VIDEO_VIEW_MAX_INCREMENT_PER_EVENT",
+    99,
+  );
+  if (videoViewMaxIncrementPerEvent > 99) {
+    throw new Error(
+      "VIDEO_VIEW_MAX_INCREMENT_PER_EVENT must be less than or equal to 99",
+    );
+  }
+  validated.VIDEO_VIEW_MAX_INCREMENT_PER_EVENT = String(
+    videoViewMaxIncrementPerEvent,
+  );
+
+  validated.VIDEO_VIEW_MAX_INCREMENT_PER_VIDEO_HOUR = String(
+    readPositiveInteger(
+      config,
+      "VIDEO_VIEW_MAX_INCREMENT_PER_VIDEO_HOUR",
+      5000,
+    ),
+  );
+  validated.VIDEO_VIEW_DEDUPE_WINDOW_MINUTES = String(
+    readPositiveInteger(config, "VIDEO_VIEW_DEDUPE_WINDOW_MINUTES", 15),
+  );
+  validated.VIDEO_VIEW_MIN_WATCH_SECONDS = String(
+    readPositiveInteger(config, "VIDEO_VIEW_MIN_WATCH_SECONDS", 5),
+  );
+  const videoViewRandomMinIncrement = readPositiveInteger(
+    config,
+    "VIDEO_VIEW_RANDOM_MIN_INCREMENT",
+    1,
+  );
+  if (videoViewRandomMinIncrement > videoViewMaxIncrementPerEvent) {
+    throw new Error(
+      "VIDEO_VIEW_RANDOM_MIN_INCREMENT must be less than or equal to VIDEO_VIEW_MAX_INCREMENT_PER_EVENT",
+    );
+  }
+  validated.VIDEO_VIEW_RANDOM_MIN_INCREMENT = String(
+    videoViewRandomMinIncrement,
+  );
+
+  validated.DB_CONNECTION_LIMIT = String(
+    readPositiveInteger(config, "DB_CONNECTION_LIMIT", 5),
+  );
+  validated.DB_CONNECT_TIMEOUT_MS = String(
+    readPositiveInteger(config, "DB_CONNECT_TIMEOUT_MS", 10_000),
+  );
+  validated.DB_ACQUIRE_TIMEOUT_MS = String(
+    readPositiveInteger(config, "DB_ACQUIRE_TIMEOUT_MS", 10_000),
+  );
+  validated.DB_IDLE_TIMEOUT_SECONDS = String(
+    readPositiveInteger(config, "DB_IDLE_TIMEOUT_SECONDS", 60),
   );
 
   if (typeof config.VIDEO_UPLOAD_MAX_MB === "string") {
@@ -249,6 +438,21 @@ export function validateEnv(
     "VIDEO_DB_STORAGE_ENABLED",
     false,
   );
+  validated.VIDEO_DB_STORAGE_ALLOW_PRODUCTION_OVERRIDE = readBoolean(
+    config,
+    "VIDEO_DB_STORAGE_ALLOW_PRODUCTION_OVERRIDE",
+    false,
+  );
+
+  if (
+    isProduction &&
+    validated.VIDEO_DB_STORAGE_ENABLED === "true" &&
+    validated.VIDEO_DB_STORAGE_ALLOW_PRODUCTION_OVERRIDE !== "true"
+  ) {
+    throw new Error(
+      "VIDEO_DB_STORAGE_ENABLED must be false in production unless VIDEO_DB_STORAGE_ALLOW_PRODUCTION_OVERRIDE=true",
+    );
+  }
 
   const dbUploadMaxMb = Number(
     readString(
@@ -349,6 +553,103 @@ export function validateEnv(
   validated.VIDEO_METADATA_PROBE_MAX_REMOTE_MB = String(
     metadataProbeMaxRemoteMb,
   );
+
+  validated.LOCAL_FILE_STORAGE_ENABLED = readBoolean(
+    config,
+    "LOCAL_FILE_STORAGE_ENABLED",
+    false,
+  );
+
+  const localFileStorageRoot = readOptionalTrimmedString(
+    config,
+    "LOCAL_FILE_STORAGE_ROOT",
+  );
+  if (validated.LOCAL_FILE_STORAGE_ENABLED === "true") {
+    if (localFileStorageRoot === undefined) {
+      throw new Error(
+        "LOCAL_FILE_STORAGE_ROOT is required when LOCAL_FILE_STORAGE_ENABLED=true",
+      );
+    }
+
+    if (isUnsafeLocalStorageRoot(localFileStorageRoot)) {
+      throw new Error(
+        "LOCAL_FILE_STORAGE_ROOT must be outside public web roots such as public_html, htdocs, www, public, or dist",
+      );
+    }
+
+    validated.LOCAL_FILE_STORAGE_ROOT = localFileStorageRoot;
+  } else if (localFileStorageRoot !== undefined) {
+    validated.LOCAL_FILE_STORAGE_ROOT = localFileStorageRoot;
+  }
+
+  const localVideoHardMaxMb = readPositiveInteger(
+    config,
+    "LOCAL_VIDEO_UPLOAD_HARD_MAX_MB",
+    MAX_LOCAL_VIDEO_UPLOAD_HARD_MB,
+  );
+  if (localVideoHardMaxMb > MAX_LOCAL_VIDEO_UPLOAD_HARD_MB) {
+    throw new Error(
+      `LOCAL_VIDEO_UPLOAD_HARD_MAX_MB must be ${MAX_LOCAL_VIDEO_UPLOAD_HARD_MB} or smaller`,
+    );
+  }
+  validated.LOCAL_VIDEO_UPLOAD_HARD_MAX_MB = String(localVideoHardMaxMb);
+
+  const localVideoUploadMaxMb = readPositiveInteger(
+    config,
+    "LOCAL_VIDEO_UPLOAD_MAX_MB",
+    DEFAULT_LOCAL_VIDEO_UPLOAD_MB,
+  );
+  if (localVideoUploadMaxMb > localVideoHardMaxMb) {
+    throw new Error(
+      "LOCAL_VIDEO_UPLOAD_MAX_MB must be less than or equal to LOCAL_VIDEO_UPLOAD_HARD_MAX_MB",
+    );
+  }
+  validated.LOCAL_VIDEO_UPLOAD_MAX_MB = String(localVideoUploadMaxMb);
+
+  const localVideoChunkSizeMb = readPositiveInteger(
+    config,
+    "LOCAL_VIDEO_CHUNK_SIZE_MB",
+    DEFAULT_LOCAL_VIDEO_CHUNK_MB,
+  );
+  if (localVideoChunkSizeMb > localVideoUploadMaxMb) {
+    throw new Error(
+      "LOCAL_VIDEO_CHUNK_SIZE_MB must be less than or equal to LOCAL_VIDEO_UPLOAD_MAX_MB",
+    );
+  }
+  validated.LOCAL_VIDEO_CHUNK_SIZE_MB = String(localVideoChunkSizeMb);
+
+  validated.LOCAL_VIDEO_UPLOAD_SESSION_TTL_MINUTES = String(
+    readPositiveInteger(
+      config,
+      "LOCAL_VIDEO_UPLOAD_SESSION_TTL_MINUTES",
+      DEFAULT_LOCAL_VIDEO_UPLOAD_SESSION_TTL_MINUTES,
+    ),
+  );
+  validated.LOCAL_VIDEO_MIN_FREE_SPACE_MB = String(
+    readPositiveInteger(
+      config,
+      "LOCAL_VIDEO_MIN_FREE_SPACE_MB",
+      DEFAULT_LOCAL_VIDEO_MIN_FREE_SPACE_MB,
+    ),
+  );
+  validated.LOCAL_VIDEO_STALE_UPLOAD_MAX_AGE_HOURS = String(
+    readPositiveInteger(
+      config,
+      "LOCAL_VIDEO_STALE_UPLOAD_MAX_AGE_HOURS",
+      DEFAULT_LOCAL_VIDEO_STALE_UPLOAD_MAX_AGE_HOURS,
+    ),
+  );
+  const localThumbnailUploadMaxMb = readPositiveInteger(
+    config,
+    "LOCAL_THUMBNAIL_UPLOAD_MAX_MB",
+    DEFAULT_LOCAL_THUMBNAIL_UPLOAD_MB,
+  );
+  if (localThumbnailUploadMaxMb > MAX_VIDEO_THUMBNAIL_UPLOAD_MB) {
+    throw new Error(
+      `LOCAL_THUMBNAIL_UPLOAD_MAX_MB must be ${MAX_VIDEO_THUMBNAIL_UPLOAD_MB} or smaller`,
+    );
+  }
+  validated.LOCAL_THUMBNAIL_UPLOAD_MAX_MB = String(localThumbnailUploadMaxMb);
 
   return validated;
 }

@@ -1,11 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
 import { Transform } from "class-transformer";
-import {
-  IsEnum,
-  IsOptional,
-  IsString,
-  MaxLength,
-} from "class-validator";
+import { IsEnum, IsOptional, IsString, MaxLength } from "class-validator";
 import { DomainStatus } from "../../generated/prisma/client";
 
 function emptyStringToUndefined(value: unknown): unknown {

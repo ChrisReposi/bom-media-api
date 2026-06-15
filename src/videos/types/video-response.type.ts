@@ -17,6 +17,77 @@ export class VideoBinaryAssetResponse {
   sizeBytes!: string;
 }
 
+export class VideoLocalFileAssetResponse {
+  @ApiProperty({
+    example: "video/mp4",
+  })
+  mimeType!: string;
+
+  @ApiProperty({
+    example: "104857600",
+    description: "String because Prisma BigInt cannot be JSON serialized.",
+  })
+  sizeBytes!: string;
+
+  @ApiPropertyOptional({
+    example: "f2ca1bb6c7e907d06dafe4687e579fcecf6b48bda4a02d610f9dc98ea441f4ab",
+    nullable: true,
+  })
+  checksumSha256!: string | null;
+
+  @ApiProperty({
+    example: "training-video.mp4",
+  })
+  originalFilename!: string;
+}
+
+export class VideoUploadSessionResponse {
+  @ApiProperty({ example: "cm_upload_123" })
+  id!: string;
+
+  @ApiProperty({ example: "ACTIVE" })
+  status!: string;
+
+  @ApiProperty({ example: 104857600 })
+  totalBytes!: number;
+
+  @ApiProperty({ example: 4 })
+  totalChunks!: number;
+
+  @ApiProperty({ example: 52428800 })
+  chunkSizeBytes!: number;
+
+  @ApiProperty({ example: 2 })
+  uploadedChunks!: number;
+
+  @ApiProperty({ example: [0, 1] })
+  uploadedChunkIndexes!: number[];
+
+  @ApiProperty({ example: "2026-06-14T12:00:00.000Z" })
+  expiresAt!: Date;
+}
+
+export class InitLocalVideoUploadResponse {
+  @ApiProperty({ example: "Local video upload initialized." })
+  message!: string;
+
+  @ApiProperty({ type: VideoUploadSessionResponse })
+  upload!: VideoUploadSessionResponse;
+}
+
+export class LocalVideoChunkUploadResponse {
+  @ApiProperty({ example: "Chunk uploaded successfully." })
+  message!: string;
+
+  @ApiProperty({ type: VideoUploadSessionResponse })
+  upload!: VideoUploadSessionResponse;
+}
+
+export class CancelLocalVideoUploadResponse {
+  @ApiProperty({ example: "Upload canceled successfully." })
+  message!: string;
+}
+
 export class VideoResponse {
   @ApiProperty({ example: "cm_video_123" })
   id!: string;
@@ -115,12 +186,36 @@ export class VideoResponse {
   binaryAsset!: VideoBinaryAssetResponse | null;
 
   @ApiPropertyOptional({
+    type: VideoLocalFileAssetResponse,
+    nullable: true,
+    description:
+      "Private local-file metadata. The API never returns absolute filesystem paths.",
+  })
+  localFileAsset!: VideoLocalFileAssetResponse | null;
+
+  @ApiPropertyOptional({
+    type: VideoLocalFileAssetResponse,
+    nullable: true,
+    description:
+      "Private local-thumbnail metadata. The API never returns absolute filesystem paths.",
+  })
+  localThumbnailAsset!: VideoLocalFileAssetResponse | null;
+
+  @ApiPropertyOptional({
     example: "/api/v1/admin/videos/cm_video_123/binary",
     nullable: true,
     description:
       "Admin-authenticated DB blob endpoint for small MVP previews. Public playback is not exposed here.",
   })
   binaryPlaybackUrl!: string | null;
+
+  @ApiPropertyOptional({
+    example: "/api/v1/admin/videos/cm_video_123/local-file",
+    nullable: true,
+    description:
+      "Admin-authenticated local-file preview endpoint for LOCAL_FILE videos.",
+  })
+  localPlaybackUrl!: string | null;
 
   @ApiProperty({ example: "2026-05-30T00:00:00.000Z" })
   createdAt!: Date;
@@ -159,4 +254,54 @@ export class DisableVideoResponse {
 export class PurgeVideoResponse {
   @ApiProperty({ example: "Video permanently deleted successfully." })
   message!: string;
+
+  @ApiProperty({ example: "cm_video_123" })
+  videoId!: string;
+
+  @ApiProperty({ enum: VideoSourceType, example: VideoSourceType.LOCAL_FILE })
+  sourceType!: VideoSourceType;
+
+  @ApiProperty({ example: "PURGED" })
+  status!: "PURGED";
+
+  @ApiProperty({
+    example: {
+      hadWebsiteAssignments: false,
+      hadShareLinks: false,
+    },
+  })
+  safety!: {
+    hadWebsiteAssignments: boolean;
+    hadShareLinks: boolean;
+  };
+
+  @ApiProperty({
+    example: {
+      localVideoDeleteAttempted: true,
+      localVideoDeleted: true,
+      localThumbnailDeleteAttempted: true,
+      localThumbnailDeleted: true,
+      bytesReclaimed: "524298240",
+      orphanCleanupRequired: false,
+    },
+  })
+  storage!: {
+    localVideoDeleteAttempted: boolean;
+    localVideoDeleted: boolean;
+    localThumbnailDeleteAttempted: boolean;
+    localThumbnailDeleted: boolean;
+    bytesReclaimed: string;
+    orphanCleanupRequired: boolean;
+  };
+
+  @ApiProperty({
+    example: {
+      remoteAssetDeleteAttempted: false,
+      remoteAssetDeleted: false,
+    },
+  })
+  remote!: {
+    remoteAssetDeleteAttempted: boolean;
+    remoteAssetDeleted: boolean;
+  };
 }

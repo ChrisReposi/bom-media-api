@@ -10,12 +10,23 @@ import {
 import { ConfigService } from "@nestjs/config";
 import { JwtService } from "@nestjs/jwt";
 import { compare, hash } from "bcryptjs";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from "node:crypto";
+import {
+  hashSensitiveValue,
+  truncateRequestValue,
+  type RequestSecurityMeta,
+} from "../common/utils/request-security.util";
 import { PrismaService } from "../database/prisma.service";
 import type { Prisma } from "../generated/prisma/client";
 import {
   AccountStatus,
   AdminRole,
+  type AdminSession,
   AuditStatus,
 } from "../generated/prisma/client";
 import type { ChangeAdminPasswordDto } from "./dto/change-admin-password.dto";
@@ -42,6 +53,21 @@ type AdminAuthRecord = {
   status: AccountStatus;
   createdAt: Date;
   lastLoginAt: Date | null;
+};
+
+type AdminAuthAuditAction =
+  | "ADMIN_LOGIN_SUCCESS"
+  | "ADMIN_LOGIN_FAILURE"
+  | "ADMIN_REFRESH_SUCCESS"
+  | "ADMIN_REFRESH_FAILURE"
+  | "ADMIN_REFRESH_REPLAY"
+  | "ADMIN_LOGOUT_SUCCESS"
+  | "ADMIN_LOGOUT_FAILURE"
+  | "ADMIN_PASSWORD_CHANGE_SUCCESS"
+  | "ADMIN_PASSWORD_CHANGE_FAILURE";
+
+type InternalAdminTokenResponse = AdminTokenResponse & {
+  sessionId: string;
 };
 
 const PASSWORD_HASH_ROUNDS = 12;
@@ -89,7 +115,10 @@ export class AdminAuthService {
     };
   }
 
-  async login(dto: LoginAdminDto): Promise<LoginAdminResponse> {
+  async login(
+    dto: LoginAdminDto,
+    requestMeta?: RequestSecurityMeta,
+  ): Promise<LoginAdminResponse> {
     const username = this.normalizeUsername(dto.username);
     const admin = await this.prisma.adminUser.findUnique({
       where: { username },
@@ -100,11 +129,31 @@ export class AdminAuthService {
     });
 
     if (admin === null || admin.status !== AccountStatus.ACTIVE) {
+      await this.writeAuthAudit({
+        adminId: admin?.id ?? null,
+        action: "ADMIN_LOGIN_FAILURE",
+        status: AuditStatus.FAIL,
+        requestMeta,
+        metadata: {
+          reason: "INVALID_CREDENTIALS",
+          username,
+        },
+      });
       throw new UnauthorizedException("Invalid username or password.");
     }
 
     const passwordMatches = await compare(dto.password, admin.passwordHash);
     if (!passwordMatches) {
+      await this.writeAuthAudit({
+        adminId: admin.id,
+        action: "ADMIN_LOGIN_FAILURE",
+        status: AuditStatus.FAIL,
+        requestMeta,
+        metadata: {
+          reason: "INVALID_CREDENTIALS",
+          username,
+        },
+      });
       throw new UnauthorizedException("Invalid username or password.");
     }
 
@@ -114,76 +163,206 @@ export class AdminAuthService {
       select: this.safeAdminSelect(),
     });
 
+    const tokens = await this.buildTokenResponse(updatedAdmin, requestMeta);
+
+    await this.writeAuthAudit({
+      adminId: updatedAdmin.id,
+      action: "ADMIN_LOGIN_SUCCESS",
+      status: AuditStatus.SUCCESS,
+      requestMeta,
+      metadata: {
+        username: updatedAdmin.username,
+        sessionId: tokens.sessionId,
+      },
+    });
+
     return {
       message: "Admin logged in successfully.",
       admin: this.toSafeAdmin(updatedAdmin),
-      tokens: await this.buildTokenResponse(updatedAdmin),
+      tokens: this.toPublicTokenResponse(tokens),
     };
   }
 
-  async refresh(dto: RefreshAdminTokenDto): Promise<RefreshAdminTokenResponse> {
+  async refresh(
+    dto: RefreshAdminTokenDto,
+    requestMeta?: RequestSecurityMeta,
+  ): Promise<RefreshAdminTokenResponse> {
     const tokenHash = this.hashRefreshToken(dto.refreshToken);
     const existingToken = await this.prisma.adminRefreshToken.findUnique({
       where: { tokenHash },
       include: {
+        session: true,
         admin: {
           select: this.safeAdminSelect(),
         },
       },
     });
 
-    if (
-      existingToken === null ||
-      existingToken.revokedAt !== null ||
-      existingToken.expiresAt <= new Date() ||
-      existingToken.admin.status !== AccountStatus.ACTIVE
-    ) {
+    if (existingToken === null) {
+      await this.writeAuthAudit({
+        adminId: null,
+        action: "ADMIN_REFRESH_FAILURE",
+        status: AuditStatus.FAIL,
+        requestMeta,
+        metadata: { reason: "TOKEN_NOT_FOUND" },
+      });
       throw new UnauthorizedException("Invalid or expired refresh token.");
     }
 
+    if (existingToken.revokedAt !== null) {
+      await this.revokeSessionForRefreshReplay(existingToken.sessionId);
+      await this.writeAuthAudit({
+        adminId: existingToken.adminId,
+        action: "ADMIN_REFRESH_REPLAY",
+        status: AuditStatus.FAIL,
+        requestMeta,
+        metadata: {
+          reason: "REFRESH_TOKEN_REPLAY",
+          sessionId: existingToken.sessionId,
+        },
+      });
+      throw new UnauthorizedException("Invalid or expired refresh token.");
+    }
+
+    const now = new Date();
+    if (
+      existingToken.session === null ||
+      existingToken.session.revokedAt !== null ||
+      existingToken.session.expiresAt <= now ||
+      existingToken.expiresAt <= now ||
+      existingToken.admin.status !== AccountStatus.ACTIVE
+    ) {
+      await this.writeAuthAudit({
+        adminId: existingToken.adminId,
+        action: "ADMIN_REFRESH_FAILURE",
+        status: AuditStatus.FAIL,
+        requestMeta,
+        metadata: {
+          reason: "INVALID_REFRESH_SESSION",
+          sessionId: existingToken.sessionId,
+        },
+      });
+      throw new UnauthorizedException("Invalid or expired refresh token.");
+    }
+
+    const session = existingToken.session;
     const rawRefreshToken = this.generateRawRefreshToken();
     const newTokenHash = this.hashRefreshToken(rawRefreshToken);
-    const expiresAt = this.getRefreshTokenExpiresAt();
+    const expiresAt = this.getRefreshTokenExpiresAt(now);
 
     await this.prisma.$transaction(async (tx) => {
       await tx.adminRefreshToken.update({
         where: { id: existingToken.id },
-        data: { revokedAt: new Date() },
+        data: { revokedAt: now },
+      });
+
+      await tx.adminSession.update({
+        where: { id: session.id },
+        data: {
+          lastUsedAt: now,
+          expiresAt,
+        },
       });
 
       await tx.adminRefreshToken.create({
         data: {
           adminId: existingToken.admin.id,
+          sessionId: session.id,
           tokenHash: newTokenHash,
           expiresAt,
         },
       });
     });
 
+    const tokens: AdminTokenResponse = {
+      accessToken: await this.createAccessToken(
+        existingToken.admin,
+        session.id,
+      ),
+      refreshToken: rawRefreshToken,
+      tokenType: "Bearer",
+      expiresIn: this.getAccessTokenExpiresInSeconds(),
+    };
+
+    await this.writeAuthAudit({
+      adminId: existingToken.admin.id,
+      action: "ADMIN_REFRESH_SUCCESS",
+      status: AuditStatus.SUCCESS,
+      requestMeta,
+      metadata: {
+        sessionId: session.id,
+      },
+    });
+
     return {
       message: "Admin session refreshed successfully.",
       admin: this.toSafeAdmin(existingToken.admin),
-      tokens: {
-        accessToken: await this.createAccessToken(existingToken.admin),
-        refreshToken: rawRefreshToken,
-        tokenType: "Bearer",
-        expiresIn: this.getAccessTokenExpiresInSeconds(),
-      },
+      tokens,
     };
   }
 
-  async logout(dto: LogoutAdminDto): Promise<LogoutAdminResponse> {
+  async logout(
+    dto: LogoutAdminDto,
+    requestMeta?: RequestSecurityMeta,
+  ): Promise<LogoutAdminResponse> {
     const tokenHash = this.hashRefreshToken(dto.refreshToken);
-
-    await this.prisma.adminRefreshToken.updateMany({
-      where: {
-        tokenHash,
-        revokedAt: null,
-      },
-      data: {
-        revokedAt: new Date(),
+    const existingToken = await this.prisma.adminRefreshToken.findUnique({
+      where: { tokenHash },
+      select: {
+        adminId: true,
+        sessionId: true,
       },
     });
+
+    try {
+      const revokedAt = new Date();
+
+      await this.prisma.$transaction(async (tx) => {
+        await tx.adminRefreshToken.updateMany({
+          where: {
+            tokenHash,
+            revokedAt: null,
+          },
+          data: {
+            revokedAt,
+          },
+        });
+
+        if (existingToken?.sessionId !== null && existingToken?.sessionId) {
+          await tx.adminSession.updateMany({
+            where: {
+              id: existingToken.sessionId,
+              revokedAt: null,
+            },
+            data: {
+              revokedAt,
+              revokedReason: "LOGOUT",
+            },
+          });
+        }
+      });
+
+      await this.writeAuthAudit({
+        adminId: existingToken?.adminId ?? null,
+        action: "ADMIN_LOGOUT_SUCCESS",
+        status: AuditStatus.SUCCESS,
+        requestMeta,
+        metadata: {
+          sessionId: existingToken?.sessionId ?? null,
+        },
+      });
+    } catch (error) {
+      await this.writeAuthAudit({
+        adminId: existingToken?.adminId ?? null,
+        action: "ADMIN_LOGOUT_FAILURE",
+        status: AuditStatus.FAIL,
+        requestMeta,
+        metadata: {
+          sessionId: existingToken?.sessionId ?? null,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        },
+      });
+    }
 
     return {
       message: "Admin logged out successfully.",
@@ -193,6 +372,7 @@ export class AdminAuthService {
   async changePassword(
     adminId: string,
     dto: ChangeAdminPasswordDto,
+    requestMeta?: RequestSecurityMeta,
   ): Promise<ChangeAdminPasswordResponse> {
     const admin = await this.prisma.adminUser.findUnique({
       where: { id: adminId },
@@ -203,6 +383,13 @@ export class AdminAuthService {
     });
 
     if (admin === null || admin.status !== AccountStatus.ACTIVE) {
+      await this.writeAuthAudit({
+        adminId,
+        action: "ADMIN_PASSWORD_CHANGE_FAILURE",
+        status: AuditStatus.FAIL,
+        requestMeta,
+        metadata: { reason: "ADMIN_NOT_ACTIVE" },
+      });
       throw new UnauthorizedException("Unauthorized.");
     }
 
@@ -212,10 +399,24 @@ export class AdminAuthService {
     );
     const secretMatches = this.isChangePasswordSecretValid(dto.secretCode);
     if (!oldPasswordMatches || !secretMatches) {
+      await this.writeAuthAudit({
+        adminId: admin.id,
+        action: "ADMIN_PASSWORD_CHANGE_FAILURE",
+        status: AuditStatus.FAIL,
+        requestMeta,
+        metadata: { reason: "VERIFICATION_FAILED" },
+      });
       throw new UnauthorizedException("Password change is not allowed.");
     }
 
     if (dto.newPassword === dto.oldPassword) {
+      await this.writeAuthAudit({
+        adminId: admin.id,
+        action: "ADMIN_PASSWORD_CHANGE_FAILURE",
+        status: AuditStatus.FAIL,
+        requestMeta,
+        metadata: { reason: "PASSWORD_REUSED" },
+      });
       throw new BadRequestException(
         "New password must differ from old password.",
       );
@@ -237,10 +438,27 @@ export class AdminAuthService {
         },
         data: { revokedAt },
       });
+
+      await tx.adminSession.updateMany({
+        where: {
+          adminId: admin.id,
+          revokedAt: null,
+        },
+        data: {
+          revokedAt,
+          revokedReason: "PASSWORD_CHANGE",
+        },
+      });
     });
 
-    await this.writeAudit(admin.id, "ADMIN_PASSWORD_CHANGE", {
-      refreshTokensRevokedAt: revokedAt.toISOString(),
+    await this.writeAuthAudit({
+      adminId: admin.id,
+      action: "ADMIN_PASSWORD_CHANGE_SUCCESS",
+      status: AuditStatus.SUCCESS,
+      requestMeta,
+      metadata: {
+        sessionsRevokedAt: revokedAt.toISOString(),
+      },
     });
 
     return {
@@ -313,18 +531,37 @@ export class AdminAuthService {
 
   private async buildTokenResponse(
     admin: AdminAuthRecord,
-  ): Promise<AdminTokenResponse> {
+    requestMeta?: RequestSecurityMeta,
+  ): Promise<InternalAdminTokenResponse> {
+    const now = new Date();
+    const expiresAt = this.getRefreshTokenExpiresAt(now);
+    const session = await this.createAdminSession({
+      adminId: admin.id,
+      expiresAt,
+      requestMeta,
+    });
+
     return {
-      accessToken: await this.createAccessToken(admin),
-      refreshToken: await this.createRefreshToken(admin.id),
+      accessToken: await this.createAccessToken(admin, session.id),
+      refreshToken: await this.createRefreshToken(
+        admin.id,
+        session.id,
+        expiresAt,
+      ),
       tokenType: "Bearer",
       expiresIn: this.getAccessTokenExpiresInSeconds(),
+      sessionId: session.id,
     };
   }
 
-  private async createAccessToken(admin: AdminAuthRecord): Promise<string> {
+  private async createAccessToken(
+    admin: AdminAuthRecord,
+    sessionId: string,
+  ): Promise<string> {
     const payload: AdminAccessTokenPayload = {
       sub: admin.id,
+      sid: sessionId,
+      jti: randomUUID(),
       username: admin.username,
       role: admin.role,
       type: "admin_access",
@@ -336,18 +573,40 @@ export class AdminAuthService {
     });
   }
 
-  private async createRefreshToken(adminId: string): Promise<string> {
+  private async createRefreshToken(
+    adminId: string,
+    sessionId: string,
+    expiresAt: Date,
+  ): Promise<string> {
     const rawRefreshToken = this.generateRawRefreshToken();
 
     await this.prisma.adminRefreshToken.create({
       data: {
         adminId,
+        sessionId,
         tokenHash: this.hashRefreshToken(rawRefreshToken),
-        expiresAt: this.getRefreshTokenExpiresAt(),
+        expiresAt,
       },
     });
 
     return rawRefreshToken;
+  }
+
+  private async createAdminSession(params: {
+    adminId: string;
+    expiresAt: Date;
+    requestMeta?: RequestSecurityMeta | undefined;
+  }): Promise<AdminSession> {
+    return this.prisma.adminSession.create({
+      data: {
+        adminId: params.adminId,
+        expiresAt: params.expiresAt,
+        lastUsedAt: new Date(),
+        ipHash: this.getIpHash(params.requestMeta),
+        userAgentHash: this.getUserAgentHash(params.requestMeta),
+        userAgent: truncateRequestValue(params.requestMeta?.userAgent, 512),
+      },
+    });
   }
 
   private generateRawRefreshToken(): string {
@@ -399,15 +658,26 @@ export class AdminAuthService {
     return value;
   }
 
-  private getRefreshTokenExpiresAt(): Date {
+  private getRefreshTokenExpiresAt(from: Date = new Date()): Date {
     const value = Number(
       this.configService.get<string>("REFRESH_TOKEN_EXPIRES_DAYS") ?? "30",
     );
     const days = Number.isInteger(value) && value > 0 ? value : 30;
-    const expiresAt = new Date();
+    const expiresAt = new Date(from.getTime());
     expiresAt.setDate(expiresAt.getDate() + days);
 
     return expiresAt;
+  }
+
+  private toPublicTokenResponse(
+    tokens: InternalAdminTokenResponse,
+  ): AdminTokenResponse {
+    return {
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      tokenType: tokens.tokenType,
+      expiresIn: tokens.expiresIn,
+    };
   }
 
   private normalizeUsername(username: string): string {
@@ -436,33 +706,74 @@ export class AdminAuthService {
     };
   }
 
-  private async writeAudit(
-    adminId: string,
-    action: "ADMIN_PASSWORD_CHANGE",
-    metadata: Record<string, unknown>,
+  private async revokeSessionForRefreshReplay(
+    sessionId: string | null,
   ): Promise<void> {
+    if (sessionId === null) {
+      return;
+    }
+
+    await this.prisma.adminSession.updateMany({
+      where: {
+        id: sessionId,
+        revokedAt: null,
+      },
+      data: {
+        revokedAt: new Date(),
+        revokedReason: "REFRESH_REPLAY",
+      },
+    });
+  }
+
+  private async writeAuthAudit(params: {
+    adminId: string | null;
+    action: AdminAuthAuditAction;
+    status: AuditStatus;
+    metadata: Record<string, unknown>;
+    requestMeta?: RequestSecurityMeta | undefined;
+  }): Promise<void> {
+    const userAgent = truncateRequestValue(params.requestMeta?.userAgent, 1024);
+
     try {
       await this.prisma.adminAuditLog.create({
         data: {
-          adminId,
-          action,
+          adminId: params.adminId,
+          action: params.action,
           module: "admin-auth",
-          entityType: "AdminUser",
-          entityId: adminId,
-          status: AuditStatus.SUCCESS,
-          metadataJson: this.toJsonInput(metadata),
+          entityType: params.adminId === null ? null : "AdminUser",
+          entityId: params.adminId,
+          status: params.status,
+          ipHash: this.getIpHash(params.requestMeta),
+          userAgent,
+          metadataJson: this.toJsonInput(params.metadata),
         },
       });
     } catch (error) {
       this.logger.warn(
         {
-          action,
-          adminId,
+          action: params.action,
+          adminId: params.adminId,
           errorName: error instanceof Error ? error.name : "UnknownError",
         },
         "Admin auth audit log write failed.",
       );
     }
+  }
+
+  private getIpHash(meta: RequestSecurityMeta | undefined): string | null {
+    return hashSensitiveValue({
+      value: meta?.ip,
+      pepper: this.configService.get<string>("ACCESS_LOG_IP_PEPPER"),
+    });
+  }
+
+  private getUserAgentHash(
+    meta: RequestSecurityMeta | undefined,
+  ): string | null {
+    return hashSensitiveValue({
+      value: meta?.userAgent,
+      pepper: this.configService.get<string>("ACCESS_LOG_IP_PEPPER"),
+    });
   }
 
   private toJsonInput(value: Record<string, unknown>): Prisma.InputJsonValue {

@@ -1,7 +1,7 @@
-import { config } from "dotenv";
 import { defineConfig, env } from "prisma/config";
+import { loadApiEnv } from "./src/config/load-env";
 
-config({ path: ".env" });
+loadApiEnv();
 
 const shadowDatabaseUrl = process.env.SHADOW_DATABASE_URL;
 

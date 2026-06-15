@@ -1,16 +1,16 @@
 import { PrismaMariaDb } from "@prisma/adapter-mariadb";
 import { hash } from "bcryptjs";
-import { config } from "dotenv";
 import {
   AccountStatus,
   AdminRole,
   PrismaClient,
 } from "../src/generated/prisma/client";
+import { loadApiEnv } from "../src/config/load-env";
 
 const USERNAME_PATTERN = /^[a-zA-Z0-9_]+$/;
 const PASSWORD_HASH_ROUNDS = 12;
 
-config({ path: ".env" });
+loadApiEnv();
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -42,6 +42,18 @@ function requireBootstrapUsername(): string {
   return username;
 }
 
+function readPositiveIntegerEnv(name: string, fallback: number): number {
+  const rawValue = process.env[name]?.trim();
+
+  if (!rawValue) {
+    return fallback;
+  }
+
+  const value = Number(rawValue);
+
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
 function createMariaDbAdapter(databaseUrl: string): PrismaMariaDb {
   const url = new URL(databaseUrl);
 
@@ -51,7 +63,10 @@ function createMariaDbAdapter(databaseUrl: string): PrismaMariaDb {
     user: decodeURIComponent(url.username),
     password: decodeURIComponent(url.password),
     database: url.pathname.replace(/^\//, ""),
-    connectionLimit: 5,
+    connectionLimit: readPositiveIntegerEnv("DB_CONNECTION_LIMIT", 5),
+    connectTimeout: readPositiveIntegerEnv("DB_CONNECT_TIMEOUT_MS", 10_000),
+    acquireTimeout: readPositiveIntegerEnv("DB_ACQUIRE_TIMEOUT_MS", 10_000),
+    idleTimeout: readPositiveIntegerEnv("DB_IDLE_TIMEOUT_SECONDS", 60),
     allowPublicKeyRetrieval: true,
   });
 }

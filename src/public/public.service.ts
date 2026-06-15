@@ -14,6 +14,11 @@ import {
   type Website,
 } from "../generated/prisma/client";
 import {
+  LocalVideoStorageService,
+  type LocalStorageRangeResult,
+} from "../videos/storage/local-video-storage.service";
+import { VideoViewGrowthService } from "../videos/video-view-growth.service";
+import {
   hashIpAddress,
   truncateAccessLogValue,
   truncateDomain,
@@ -21,7 +26,10 @@ import {
 } from "./utils/access-log.util";
 import { normalizePublicHost } from "./utils/normalize-host.util";
 import { hashShareToken } from "./utils/share-token.util";
-import type { PublicWatchResponse } from "./types/public-watch-response.type";
+import type {
+  PublicVideoViewResponse,
+  PublicWatchResponse,
+} from "./types/public-watch-response.type";
 import {
   type PublicWatchReasonCode,
   type PublicWatchVideoResponse,
@@ -47,6 +55,21 @@ type PublicDatabaseVideoBinaryParams = {
   rangeHeader?: string | undefined;
 };
 
+type PublicLocalVideoFileParams = PublicDatabaseVideoBinaryParams;
+
+type PublicLocalThumbnailParams = {
+  host: string;
+  token: string;
+  videoId: string;
+};
+
+type RecordPublicVideoViewParams = {
+  host: string;
+  token: string;
+  videoId: string;
+  requestMeta?: Pick<PublicWatchRequestMeta, "ip" | "userAgent"> | undefined;
+};
+
 export type PublicDatabaseVideoBinary = {
   statusCode: 200 | 206 | 416;
   mimeType: string;
@@ -56,13 +79,31 @@ export type PublicDatabaseVideoBinary = {
   data: Buffer | null;
 };
 
+export type PublicLocalVideoFile = LocalStorageRangeResult & {
+  mimeType: string;
+};
+
+export type PublicLocalThumbnail = {
+  mimeType: string;
+  contentLength: number;
+  stream: NodeJS.ReadableStream;
+};
+
 type PublicBinaryAssetMetadata = {
+  mimeType: string;
+  sizeBytes: bigint;
+};
+
+type PublicLocalAssetMetadata = {
+  storageKey?: string;
   mimeType: string;
   sizeBytes: bigint;
 };
 
 type PublicWatchVideoWithBinary = VideoAsset & {
   binaryAsset?: PublicBinaryAssetMetadata | null;
+  localFileAsset?: PublicLocalAssetMetadata | null;
+  localThumbnailAsset?: PublicLocalAssetMetadata | null;
 };
 
 type ShareLinkWithVideos = ShareLink & {
@@ -72,6 +113,11 @@ type ShareLinkWithVideos = ShareLink & {
   }>;
 };
 
+type ShareLinkWhereInput = Prisma.Args<
+  PrismaService["shareLink"],
+  "updateMany"
+>["where"];
+
 @Injectable()
 export class PublicService {
   private readonly logger = new Logger(PublicService.name);
@@ -79,6 +125,8 @@ export class PublicService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly localVideoStorageService: LocalVideoStorageService,
+    private readonly videoViewGrowthService: VideoViewGrowthService,
   ) {}
 
   async resolvePublicWatch(
@@ -183,6 +231,18 @@ export class PublicService {
                     sizeBytes: true,
                   },
                 },
+                localFileAsset: {
+                  select: {
+                    mimeType: true,
+                    sizeBytes: true,
+                  },
+                },
+                localThumbnailAsset: {
+                  select: {
+                    mimeType: true,
+                    sizeBytes: true,
+                  },
+                },
               },
             },
           },
@@ -272,12 +332,65 @@ export class PublicService {
     };
   }
 
+  async getPublicLocalVideoFile(
+    params: PublicLocalVideoFileParams,
+  ): Promise<PublicLocalVideoFile> {
+    const localFileAsset = await this.getAuthorizedPublicLocalFileAsset(params);
+
+    return {
+      mimeType: localFileAsset.mimeType,
+      ...this.localVideoStorageService.createRangeReadStream({
+        storageKey: localFileAsset.storageKey,
+        rangeHeader: params.rangeHeader,
+      }),
+    };
+  }
+
+  async recordPublicVideoView(
+    params: RecordPublicVideoViewParams,
+  ): Promise<PublicVideoViewResponse> {
+    const authorized = await this.getAuthorizedPublicVideoForView(params);
+
+    if (authorized === null) {
+      return this.invalidVideoViewResponse();
+    }
+
+    const result = await this.videoViewGrowthService.recordPublicVideoView({
+      videoId: authorized.video.id,
+      shareLinkId: authorized.shareLink.id,
+      websiteId: authorized.website.id,
+      requestMeta: params.requestMeta,
+    });
+
+    return {
+      valid: true,
+      videoId: result.videoId,
+      viewCount: result.viewCount,
+      publishedAt: result.publishedAt,
+    };
+  }
+
+  async getPublicLocalThumbnail(
+    params: PublicLocalThumbnailParams,
+  ): Promise<PublicLocalThumbnail> {
+    const localThumbnailAsset =
+      await this.getAuthorizedPublicLocalThumbnailAsset(params);
+    const result = this.localVideoStorageService.createFullReadStream(
+      localThumbnailAsset.storageKey,
+    );
+
+    return {
+      mimeType: localThumbnailAsset.mimeType,
+      contentLength: result.contentLength,
+      stream: result.stream,
+    };
+  }
+
   async getPublicDatabaseVideoBinary(
     params: PublicDatabaseVideoBinaryParams,
   ): Promise<PublicDatabaseVideoBinary> {
-    const binaryAsset = await this.getAuthorizedPublicDatabaseBinaryAsset(
-      params,
-    );
+    const binaryAsset =
+      await this.getAuthorizedPublicDatabaseBinaryAsset(params);
     const totalSize = Number(binaryAsset.sizeBytes);
 
     if (!Number.isSafeInteger(totalSize) || totalSize <= 0) {
@@ -342,7 +455,7 @@ export class PublicService {
     shareLink: ShareLink,
     now: Date,
   ): Promise<boolean> {
-    const where: Prisma.ShareLinkWhereInput = {
+    const where: ShareLinkWhereInput = {
       id: shareLink.id,
       status: ShareLinkStatus.ACTIVE,
       OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
@@ -395,15 +508,33 @@ export class PublicService {
                 videoId: video.id,
                 host: playbackContext.host,
               })
-            : null,
+            : video.sourceType === VideoSourceType.LOCAL_FILE
+              ? this.buildPublicLocalPlaybackUrl({
+                  token: playbackContext.token,
+                  videoId: video.id,
+                  host: playbackContext.host,
+                })
+              : null,
         binaryAsset:
           video.sourceType === VideoSourceType.DB_BLOB
             ? this.toPublicBinaryAssetResponse(video.binaryAsset ?? null)
             : null,
+        localFileAsset:
+          video.sourceType === VideoSourceType.LOCAL_FILE
+            ? this.toPublicLocalAssetResponse(video.localFileAsset ?? null)
+            : null,
         embedUrl: video.embedUrl,
         embedProvider: video.embedProvider,
         embedAllow: video.embedAllow,
-        thumbnailUrl: video.thumbnailUrl,
+        thumbnailUrl:
+          video.sourceType === VideoSourceType.LOCAL_FILE &&
+          this.isPlayableLocalAsset(video.localThumbnailAsset ?? null)
+            ? this.buildPublicLocalThumbnailUrl({
+                token: playbackContext.token,
+                videoId: video.id,
+                host: playbackContext.host,
+              })
+            : video.thumbnailUrl,
         durationSeconds: video.durationSeconds,
         viewCount: video.viewCount.toString(),
         publishedAt: video.publishedAt?.toISOString() ?? null,
@@ -423,6 +554,10 @@ export class PublicService {
       return this.isPlayableBinaryAsset(video.binaryAsset ?? null);
     }
 
+    if (video.sourceType === VideoSourceType.LOCAL_FILE) {
+      return this.isPlayableLocalAsset(video.localFileAsset ?? null);
+    }
+
     return video.playbackUrl !== null && video.playbackUrl.trim() !== "";
   }
 
@@ -436,6 +571,19 @@ export class PublicService {
     return {
       mimeType: binaryAsset.mimeType,
       sizeBytes: binaryAsset.sizeBytes.toString(),
+    };
+  }
+
+  private toPublicLocalAssetResponse(
+    localAsset: PublicLocalAssetMetadata | null,
+  ): { mimeType: string; sizeBytes: string } | null {
+    if (!this.isPlayableLocalAsset(localAsset)) {
+      return null;
+    }
+
+    return {
+      mimeType: localAsset.mimeType,
+      sizeBytes: localAsset.sizeBytes.toString(),
     };
   }
 
@@ -548,6 +696,240 @@ export class PublicService {
     return null;
   }
 
+  private async getAuthorizedPublicLocalFileAsset(
+    params: PublicLocalVideoFileParams,
+  ): Promise<Required<PublicLocalAssetMetadata>> {
+    const video = await this.getAuthorizedPublicLocalVideo(params);
+    const localFileAsset = video?.localFileAsset ?? null;
+
+    if (
+      !this.isPlayableLocalAsset(localFileAsset) ||
+      !localFileAsset.storageKey
+    ) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    return localFileAsset as Required<PublicLocalAssetMetadata>;
+  }
+
+  private async getAuthorizedPublicLocalThumbnailAsset(
+    params: PublicLocalThumbnailParams,
+  ): Promise<Required<PublicLocalAssetMetadata>> {
+    const video = await this.getAuthorizedPublicLocalVideo(params);
+    const localThumbnailAsset = video?.localThumbnailAsset ?? null;
+
+    if (
+      !this.isPlayableImageAsset(localThumbnailAsset) ||
+      !localThumbnailAsset.storageKey
+    ) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    return localThumbnailAsset as Required<PublicLocalAssetMetadata>;
+  }
+
+  private async getAuthorizedPublicLocalVideo(params: {
+    host: string;
+    token: string;
+    videoId: string;
+  }): Promise<PublicWatchVideoWithBinary> {
+    const normalizedHost = normalizePublicHost(params.host);
+    const trimmedToken = params.token.trim();
+
+    if (normalizedHost === null || trimmedToken === "") {
+      throw new NotFoundException("Video not found.");
+    }
+
+    const domainRecord = await this.prisma.websiteDomain.findUnique({
+      where: { domain: normalizedHost },
+      include: { website: true },
+    });
+
+    if (
+      domainRecord === null ||
+      domainRecord.website === null ||
+      domainRecord.status !== DomainStatus.ACTIVE ||
+      domainRecord.website.status !== WebsiteStatus.ACTIVE
+    ) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    const tokenPepper = this.configService
+      .get<string>("SHARE_TOKEN_PEPPER")
+      ?.trim();
+
+    if (!tokenPepper) {
+      this.logger.error(
+        "SHARE_TOKEN_PEPPER is missing for public local video.",
+      );
+      throw new NotFoundException("Video not found.");
+    }
+
+    const tokenHash = hashShareToken({
+      pepper: tokenPepper,
+      token: trimmedToken,
+    });
+
+    const shareLink = await this.prisma.shareLink.findFirst({
+      where: {
+        tokenHash,
+        websiteId: domainRecord.website.id,
+      },
+      include: {
+        shareLinkVideos: {
+          where: {
+            videoId: params.videoId,
+          },
+          take: 1,
+          include: {
+            video: {
+              include: {
+                localFileAsset: {
+                  select: {
+                    storageKey: true,
+                    mimeType: true,
+                    sizeBytes: true,
+                  },
+                },
+                localThumbnailAsset: {
+                  select: {
+                    storageKey: true,
+                    mimeType: true,
+                    sizeBytes: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (
+      shareLink === null ||
+      this.getDeniedReasonForBinaryPlayback(shareLink, new Date()) !== null
+    ) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    const video = shareLink.shareLinkVideos[0]?.video;
+
+    if (
+      video === undefined ||
+      video.status !== VideoStatus.READY ||
+      video.sourceType !== VideoSourceType.LOCAL_FILE ||
+      !this.isPlayableLocalAsset(video.localFileAsset ?? null)
+    ) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    return video;
+  }
+
+  private async getAuthorizedPublicVideoForView(params: {
+    host: string;
+    token: string;
+    videoId: string;
+  }): Promise<{
+    website: Website;
+    shareLink: ShareLink;
+    video: PublicWatchVideoWithBinary;
+  } | null> {
+    const normalizedHost = normalizePublicHost(params.host);
+    const trimmedToken = params.token.trim();
+
+    if (normalizedHost === null || trimmedToken === "") {
+      return null;
+    }
+
+    const domainRecord = await this.prisma.websiteDomain.findUnique({
+      where: { domain: normalizedHost },
+      include: { website: true },
+    });
+
+    if (
+      domainRecord === null ||
+      domainRecord.website === null ||
+      domainRecord.status !== DomainStatus.ACTIVE ||
+      domainRecord.website.status !== WebsiteStatus.ACTIVE
+    ) {
+      return null;
+    }
+
+    const tokenPepper = this.configService
+      .get<string>("SHARE_TOKEN_PEPPER")
+      ?.trim();
+
+    if (!tokenPepper) {
+      this.logger.error(
+        "SHARE_TOKEN_PEPPER is missing for public video view tracking.",
+      );
+      return null;
+    }
+
+    const tokenHash = hashShareToken({
+      pepper: tokenPepper,
+      token: trimmedToken,
+    });
+
+    const shareLink = await this.prisma.shareLink.findFirst({
+      where: {
+        tokenHash,
+        websiteId: domainRecord.website.id,
+      },
+      include: {
+        shareLinkVideos: {
+          where: {
+            videoId: params.videoId,
+          },
+          take: 1,
+          include: {
+            video: {
+              include: {
+                binaryAsset: {
+                  select: {
+                    mimeType: true,
+                    sizeBytes: true,
+                  },
+                },
+                localFileAsset: {
+                  select: {
+                    storageKey: true,
+                    mimeType: true,
+                    sizeBytes: true,
+                  },
+                },
+                localThumbnailAsset: {
+                  select: {
+                    storageKey: true,
+                    mimeType: true,
+                    sizeBytes: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (shareLink === null || this.getDeniedReason(shareLink, new Date())) {
+      return null;
+    }
+
+    const video = shareLink.shareLinkVideos[0]?.video;
+
+    if (video === undefined || !this.isPublicPlayableVideo(video)) {
+      return null;
+    }
+
+    return {
+      website: domainRecord.website,
+      shareLink,
+      video,
+    };
+  }
+
   private isPlayableBinaryAsset(
     binaryAsset: PublicBinaryAssetMetadata | null,
   ): binaryAsset is PublicBinaryAssetMetadata {
@@ -558,17 +940,35 @@ export class PublicService {
     );
   }
 
+  private isPlayableLocalAsset(
+    localAsset: PublicLocalAssetMetadata | null,
+  ): localAsset is PublicLocalAssetMetadata {
+    return (
+      localAsset !== null &&
+      localAsset.mimeType.startsWith("video/") &&
+      localAsset.sizeBytes > BigInt(0)
+    );
+  }
+
+  private isPlayableImageAsset(
+    localAsset: PublicLocalAssetMetadata | null,
+  ): localAsset is PublicLocalAssetMetadata {
+    return (
+      localAsset !== null &&
+      localAsset.mimeType.startsWith("image/") &&
+      localAsset.sizeBytes > BigInt(0)
+    );
+  }
+
   private parseRangeHeader(
     rangeHeader: string | undefined,
     totalSize: number,
-  ):
-    | {
-        statusCode: 200 | 206;
-        start: number;
-        end: number;
-        length: number;
-      }
-    | null {
+  ): {
+    statusCode: 200 | 206;
+    start: number;
+    end: number;
+    length: number;
+  } | null {
     if (rangeHeader === undefined || rangeHeader.trim() === "") {
       return {
         statusCode: 200,
@@ -658,6 +1058,34 @@ export class PublicService {
     )}/videos/${encodeURIComponent(params.videoId)}/binary?${query.toString()}`;
   }
 
+  private buildPublicLocalPlaybackUrl(params: {
+    token: string;
+    videoId: string;
+    host: string;
+  }): string {
+    const rawPrefix = this.configService.get<string>("API_PREFIX") ?? "api/v1";
+    const prefix = rawPrefix.replace(/^\/+|\/+$/g, "") || "api/v1";
+    const query = new URLSearchParams({ host: params.host });
+
+    return `/${prefix}/public/watch/${encodeURIComponent(
+      params.token,
+    )}/videos/${encodeURIComponent(params.videoId)}/local-file?${query.toString()}`;
+  }
+
+  private buildPublicLocalThumbnailUrl(params: {
+    token: string;
+    videoId: string;
+    host: string;
+  }): string {
+    const rawPrefix = this.configService.get<string>("API_PREFIX") ?? "api/v1";
+    const prefix = rawPrefix.replace(/^\/+|\/+$/g, "") || "api/v1";
+    const query = new URLSearchParams({ host: params.host });
+
+    return `/${prefix}/public/watch/${encodeURIComponent(
+      params.token,
+    )}/videos/${encodeURIComponent(params.videoId)}/thumbnail?${query.toString()}`;
+  }
+
   private toPublicWebsiteResponse(
     website: Website,
     domain: string | null,
@@ -680,6 +1108,15 @@ export class PublicService {
       reasonCode,
       website: website ? this.toPublicWebsiteResponse(website, domain) : null,
       videos: [],
+    };
+  }
+
+  private invalidVideoViewResponse(): PublicVideoViewResponse {
+    return {
+      valid: false,
+      videoId: null,
+      viewCount: null,
+      publishedAt: null,
     };
   }
 

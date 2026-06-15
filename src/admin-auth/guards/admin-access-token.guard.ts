@@ -25,31 +25,39 @@ export class AdminAccessTokenGuard implements CanActivate {
     }
 
     const payload = await this.verifyToken(token);
+    if (!this.isValidAccessTokenPayload(payload)) {
+      throw new UnauthorizedException("Unauthorized.");
+    }
+
+    const session = await this.prisma.adminSession.findUnique({
+      where: { id: payload.sid },
+      include: {
+        admin: {
+          select: {
+            id: true,
+            username: true,
+            role: true,
+            status: true,
+            createdAt: true,
+            lastLoginAt: true,
+          },
+        },
+      },
+    });
+
     if (
-      payload.type !== "admin_access" ||
-      typeof payload.sub !== "string" ||
-      payload.sub.trim() === ""
+      session === null ||
+      session.adminId !== payload.sub ||
+      session.revokedAt !== null ||
+      session.expiresAt <= new Date() ||
+      session.admin.status !== AccountStatus.ACTIVE
     ) {
       throw new UnauthorizedException("Unauthorized.");
     }
 
-    const admin = await this.prisma.adminUser.findUnique({
-      where: { id: payload.sub },
-      select: {
-        id: true,
-        username: true,
-        role: true,
-        status: true,
-        createdAt: true,
-        lastLoginAt: true,
-      },
-    });
+    await this.touchSession(session.id, session.lastUsedAt);
 
-    if (admin === null || admin.status !== AccountStatus.ACTIVE) {
-      throw new UnauthorizedException("Unauthorized.");
-    }
-
-    request.admin = this.toSafeAdmin(admin);
+    request.admin = this.toSafeAdmin(session.admin);
     request.adminAccessTokenPayload = payload;
 
     return true;
@@ -78,6 +86,40 @@ export class AdminAccessTokenGuard implements CanActivate {
     } catch {
       throw new UnauthorizedException("Unauthorized.");
     }
+  }
+
+  private isValidAccessTokenPayload(payload: AdminAccessTokenPayload): boolean {
+    return (
+      payload.type === "admin_access" &&
+      typeof payload.sub === "string" &&
+      payload.sub.trim() !== "" &&
+      typeof payload.sid === "string" &&
+      payload.sid.trim() !== "" &&
+      typeof payload.jti === "string" &&
+      payload.jti.trim() !== ""
+    );
+  }
+
+  private async touchSession(
+    sessionId: string,
+    lastUsedAt: Date | null,
+  ): Promise<void> {
+    const now = new Date();
+    const lastUsedAtMs = lastUsedAt?.getTime() ?? 0;
+
+    if (now.getTime() - lastUsedAtMs < 60_000) {
+      return;
+    }
+
+    await this.prisma.adminSession.updateMany({
+      where: {
+        id: sessionId,
+        revokedAt: null,
+      },
+      data: {
+        lastUsedAt: now,
+      },
+    });
   }
 
   private toSafeAdmin(admin: SafeAdminResponse): SafeAdminResponse {

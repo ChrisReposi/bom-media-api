@@ -21,6 +21,7 @@ import {
   type ShareLink,
   type ShareLinkVideo,
   type VideoBinaryAsset,
+  type VideoLocalFileAsset,
   type VideoAsset,
   type Website,
   type WebsiteDomain,
@@ -96,9 +97,14 @@ type VideoBinaryAssetMetadata = Pick<
   VideoBinaryAsset,
   "mimeType" | "sizeBytes"
 >;
+type VideoLocalFileAssetMetadata = Pick<
+  VideoLocalFileAsset,
+  "mimeType" | "sizeBytes"
+>;
 
 type VideoWithBinaryAssetMetadata = VideoAsset & {
   binaryAsset?: VideoBinaryAssetMetadata | null;
+  localFileAsset?: VideoLocalFileAssetMetadata | null;
 };
 
 type AuditAction =
@@ -124,6 +130,28 @@ type AuditAction =
   | "SHARE_LINK_CREATE"
   | "SHARE_LINK_REVOKE";
 
+type DomainGroupWhereInput = NonNullable<
+  Prisma.Args<PrismaService["domainGroup"], "findMany">["where"]
+>;
+type DomainGroupUpdateInput = Prisma.Args<
+  PrismaService["domainGroup"],
+  "update"
+>["data"];
+type WebsiteDomainUpdateInput = Prisma.Args<
+  PrismaService["websiteDomain"],
+  "update"
+>["data"];
+type WebsiteUpdateInput = Prisma.Args<
+  PrismaService["website"],
+  "update"
+>["data"];
+type WebsiteWhereInput = NonNullable<
+  Prisma.Args<PrismaService["website"], "findMany">["where"]
+>;
+type WebsiteDomainWhereInput = NonNullable<
+  Prisma.Args<PrismaService["websiteDomain"], "findMany">["where"]
+>;
+
 @Injectable()
 export class AdminWebsitesService {
   private readonly logger = new Logger(AdminWebsitesService.name);
@@ -140,7 +168,7 @@ export class AdminWebsitesService {
     const page = query.page ?? 1;
     const limit = query.limit ?? 100;
     const skip = (page - 1) * limit;
-    const where: Prisma.DomainGroupWhereInput = {};
+    const where: DomainGroupWhereInput = {};
 
     if (query.status !== undefined) {
       where.status = query.status;
@@ -226,7 +254,7 @@ export class AdminWebsitesService {
       throw new NotFoundException("Domain group not found.");
     }
 
-    const data: Prisma.DomainGroupUpdateInput = {};
+    const data: DomainGroupUpdateInput = {};
 
     if (dto.key !== undefined) {
       const key = this.normalizeDomainGroupKey(dto.key);
@@ -293,7 +321,9 @@ export class AdminWebsitesService {
     return { message: "Domain group disabled successfully." };
   }
 
-  async listDomains(query: ListDomainsQueryDto): Promise<AdminDomainListResponse> {
+  async listDomains(
+    query: ListDomainsQueryDto,
+  ): Promise<AdminDomainListResponse> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 50;
     const skip = (page - 1) * limit;
@@ -332,7 +362,9 @@ export class AdminWebsitesService {
   }
 
   async getDomain(domainId: string): Promise<AdminDomainResponse> {
-    return this.toAdminDomainResponse(await this.getDomainWithRelations(domainId));
+    return this.toAdminDomainResponse(
+      await this.getDomainWithRelations(domainId),
+    );
   }
 
   async createStandaloneDomain(
@@ -366,11 +398,17 @@ export class AdminWebsitesService {
       },
     });
 
-    await this.writeAudit(adminId, "DOMAIN_CREATE", "WebsiteDomain", domainRecord.id, {
-      domain: domainRecord.domain,
-      domainGroupId: domainRecord.domainGroupId,
-      status: domainRecord.status,
-    });
+    await this.writeAudit(
+      adminId,
+      "DOMAIN_CREATE",
+      "WebsiteDomain",
+      domainRecord.id,
+      {
+        domain: domainRecord.domain,
+        domainGroupId: domainRecord.domainGroupId,
+        status: domainRecord.status,
+      },
+    );
     this.clearCorsDomainCache();
 
     return this.toAdminDomainResponse(domainRecord);
@@ -382,7 +420,7 @@ export class AdminWebsitesService {
     adminId: string,
   ): Promise<AdminDomainResponse> {
     const existingDomain = await this.getDomainWithRelations(domainId);
-    const data: Prisma.WebsiteDomainUpdateInput = {};
+    const data: WebsiteDomainUpdateInput = {};
 
     if (dto.domain !== undefined) {
       const domain = this.parseDomain(dto.domain);
@@ -391,7 +429,10 @@ export class AdminWebsitesService {
       data.domain = domain;
     }
 
-    if (dto.status === DomainStatus.DISABLED && existingDomain.websiteId !== null) {
+    if (
+      dto.status === DomainStatus.DISABLED &&
+      existingDomain.websiteId !== null
+    ) {
       throw new BadRequestException(
         "Cannot disable a domain that is assigned to a website. Unassign it first.",
       );
@@ -431,11 +472,17 @@ export class AdminWebsitesService {
       },
     });
 
-    await this.writeAudit(adminId, "DOMAIN_UPDATE", "WebsiteDomain", domainRecord.id, {
-      domain: domainRecord.domain,
-      domainGroupId: domainRecord.domainGroupId,
-      status: domainRecord.status,
-    });
+    await this.writeAudit(
+      adminId,
+      "DOMAIN_UPDATE",
+      "WebsiteDomain",
+      domainRecord.id,
+      {
+        domain: domainRecord.domain,
+        domainGroupId: domainRecord.domainGroupId,
+        status: domainRecord.status,
+      },
+    );
     this.clearCorsDomainCache();
 
     return this.toAdminDomainResponse(domainRecord);
@@ -700,7 +747,7 @@ export class AdminWebsitesService {
       throw new NotFoundException("Website not found.");
     }
 
-    const data: Prisma.WebsiteUpdateInput = {};
+    const data: WebsiteUpdateInput = {};
 
     if (dto.name !== undefined) {
       data.name = dto.name.trim();
@@ -812,7 +859,9 @@ export class AdminWebsitesService {
     const domainRecord = await this.prisma.websiteDomain.create({
       data: {
         websiteId,
-        ...(website.domainGroupId ? { domainGroupId: website.domainGroupId } : {}),
+        ...(website.domainGroupId
+          ? { domainGroupId: website.domainGroupId }
+          : {}),
         domain,
         isPrimary: true,
         status,
@@ -838,7 +887,7 @@ export class AdminWebsitesService {
     adminId: string,
   ): Promise<AdminWebsiteDomainResponse> {
     const existingDomain = await this.getDomainForWebsite(websiteId, domainId);
-    const data: Prisma.WebsiteDomainUpdateInput = {};
+    const data: WebsiteDomainUpdateInput = {};
 
     if (dto.domain !== undefined) {
       const domain = this.parseDomain(dto.domain);
@@ -1197,9 +1246,13 @@ export class AdminWebsitesService {
       const videos = await this.getReadyPlayableVideosByIds(selectedVideoIds);
 
       stage = "validate-playable-videos";
-      this.ensureAllRequestedVideosFound(selectedVideoIds, videos, (videoId) => {
-        return `Video ${videoId} is not READY, not playable, or does not exist. READY direct/upload, embed, and DB_BLOB videos with binary data can be attached to a share link.`;
-      });
+      this.ensureAllRequestedVideosFound(
+        selectedVideoIds,
+        videos,
+        (videoId) => {
+          return `Video ${videoId} is not READY, not playable, or does not exist. READY direct/upload, embed, DB_BLOB videos with binary data, and LOCAL_FILE videos with local file data can be attached to a share link.`;
+        },
+      );
 
       stage = "validate-share-link-options";
       const label = this.trimNullable(dto.label);
@@ -1219,7 +1272,10 @@ export class AdminWebsitesService {
 
       stage = "generate-token";
       const rawToken = generateShareToken();
-      const tokenHash = hashShareToken({ token: rawToken, pepper: tokenPepper });
+      const tokenHash = hashShareToken({
+        token: rawToken,
+        pepper: tokenPepper,
+      });
 
       stage = "build-public-url";
       const publicUrl = buildPublicShareUrl({
@@ -1340,10 +1396,8 @@ export class AdminWebsitesService {
     };
   }
 
-  private buildWebsiteWhere(
-    query: ListWebsitesQueryDto,
-  ): Prisma.WebsiteWhereInput {
-    const where: Prisma.WebsiteWhereInput = {};
+  private buildWebsiteWhere(query: ListWebsitesQueryDto): WebsiteWhereInput {
+    const where: WebsiteWhereInput = {};
 
     if (query.status !== undefined) {
       where.status = query.status;
@@ -1404,8 +1458,8 @@ export class AdminWebsitesService {
 
   private buildDomainWhere(
     query: ListDomainsQueryDto,
-  ): Prisma.WebsiteDomainWhereInput {
-    const where: Prisma.WebsiteDomainWhereInput = {};
+  ): WebsiteDomainWhereInput {
+    const where: WebsiteDomainWhereInput = {};
 
     if (query.status !== undefined) {
       where.status = query.status;
@@ -1498,7 +1552,9 @@ export class AdminWebsitesService {
 
   private async getActiveWebsiteForDomainAssignment(
     websiteId: string,
-  ): Promise<Pick<Website, "id" | "name" | "slug" | "status" | "domainGroupId">> {
+  ): Promise<
+    Pick<Website, "id" | "name" | "slug" | "status" | "domainGroupId">
+  > {
     const website = await this.prisma.website.findUnique({
       where: { id: websiteId },
       select: {
@@ -1885,6 +1941,12 @@ export class AdminWebsitesService {
             sizeBytes: true,
           },
         },
+        localFileAsset: {
+          select: {
+            mimeType: true,
+            sizeBytes: true,
+          },
+        },
       },
     });
 
@@ -1901,8 +1963,7 @@ export class AdminWebsitesService {
       video.sourceType === VideoSourceType.DIRECT_URL
     ) {
       return (
-        typeof video.playbackUrl === "string" &&
-        video.playbackUrl.trim() !== ""
+        typeof video.playbackUrl === "string" && video.playbackUrl.trim() !== ""
       );
     }
 
@@ -1913,6 +1974,17 @@ export class AdminWebsitesService {
     if (video.sourceType === VideoSourceType.DB_BLOB) {
       const mimeType = String(video.binaryAsset?.mimeType ?? "");
       const sizeBytes = Number(video.binaryAsset?.sizeBytes ?? 0);
+
+      return (
+        mimeType.startsWith("video/") &&
+        Number.isFinite(sizeBytes) &&
+        sizeBytes > 0
+      );
+    }
+
+    if (video.sourceType === VideoSourceType.LOCAL_FILE) {
+      const mimeType = String(video.localFileAsset?.mimeType ?? "");
+      const sizeBytes = Number(video.localFileAsset?.sizeBytes ?? 0);
 
       return (
         mimeType.startsWith("video/") &&
@@ -1966,9 +2038,7 @@ export class AdminWebsitesService {
     );
   }
 
-  private normalizeShareLinkVideoIds(
-    videoIds: string[] | undefined,
-  ): string[] {
+  private normalizeShareLinkVideoIds(videoIds: string[] | undefined): string[] {
     return Array.from(
       new Set(
         (videoIds ?? [])
@@ -2118,7 +2188,9 @@ export class AdminWebsitesService {
     };
   }
 
-  private toAdminDomainResponse(domain: DomainWithRelations): AdminDomainResponse {
+  private toAdminDomainResponse(
+    domain: DomainWithRelations,
+  ): AdminDomainResponse {
     return {
       ...this.toDomainResponse(domain),
       websiteName: domain.website?.name ?? null,

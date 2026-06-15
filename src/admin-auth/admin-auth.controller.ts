@@ -5,6 +5,7 @@ import {
   HttpCode,
   HttpStatus,
   Post,
+  Req,
   UseGuards,
 } from "@nestjs/common";
 import {
@@ -18,6 +19,14 @@ import {
   ApiTags,
   ApiUnauthorizedResponse,
 } from "@nestjs/swagger";
+import { ConfigService } from "@nestjs/config";
+import type { Request } from "express";
+import type { ApiEnvironmentConfig } from "../config/env.config";
+import { getRequestSecurityMeta } from "../common/utils/request-security.util";
+import {
+  THROTTLE_PROFILES,
+  ThrottleProfile,
+} from "../security/throttle-profile.decorator";
 import { AdminAuthService } from "./admin-auth.service";
 import { CurrentAdmin } from "./decorators/current-admin.decorator";
 import { ChangeAdminPasswordDto } from "./dto/change-admin-password.dto";
@@ -39,9 +48,13 @@ import {
 @ApiTags("admin-auth")
 @Controller("admin/auth")
 export class AdminAuthController {
-  constructor(private readonly adminAuthService: AdminAuthService) {}
+  constructor(
+    private readonly adminAuthService: AdminAuthService,
+    private readonly configService: ConfigService,
+  ) {}
 
   @Post("register")
+  @ThrottleProfile(THROTTLE_PROFILES.login)
   @ApiOperation({
     summary: "Register the initial owner admin",
     description:
@@ -68,6 +81,7 @@ export class AdminAuthController {
 
   @Post("login")
   @HttpCode(HttpStatus.OK)
+  @ThrottleProfile(THROTTLE_PROFILES.login)
   @ApiOperation({
     summary: "Verify admin login credentials",
     description:
@@ -83,12 +97,19 @@ export class AdminAuthController {
   @ApiUnauthorizedResponse({
     description: "Invalid username or password.",
   })
-  login(@Body() loginAdminDto: LoginAdminDto): Promise<LoginAdminResponse> {
-    return this.adminAuthService.login(loginAdminDto);
+  login(
+    @Body() loginAdminDto: LoginAdminDto,
+    @Req() request: Request,
+  ): Promise<LoginAdminResponse> {
+    return this.adminAuthService.login(
+      loginAdminDto,
+      this.getRequestMeta(request),
+    );
   }
 
   @Post("refresh")
   @HttpCode(HttpStatus.OK)
+  @ThrottleProfile(THROTTLE_PROFILES.refresh)
   @ApiOperation({
     summary: "Rotate admin refresh token",
     description:
@@ -106,12 +127,17 @@ export class AdminAuthController {
   })
   refresh(
     @Body() refreshAdminTokenDto: RefreshAdminTokenDto,
+    @Req() request: Request,
   ): Promise<RefreshAdminTokenResponse> {
-    return this.adminAuthService.refresh(refreshAdminTokenDto);
+    return this.adminAuthService.refresh(
+      refreshAdminTokenDto,
+      this.getRequestMeta(request),
+    );
   }
 
   @Post("logout")
   @HttpCode(HttpStatus.OK)
+  @ThrottleProfile(THROTTLE_PROFILES.logout)
   @ApiOperation({
     summary: "Log out an admin session",
     description:
@@ -124,12 +150,19 @@ export class AdminAuthController {
   @ApiBadRequestResponse({
     description: "Request body failed validation.",
   })
-  logout(@Body() logoutAdminDto: LogoutAdminDto): Promise<LogoutAdminResponse> {
-    return this.adminAuthService.logout(logoutAdminDto);
+  logout(
+    @Body() logoutAdminDto: LogoutAdminDto,
+    @Req() request: Request,
+  ): Promise<LogoutAdminResponse> {
+    return this.adminAuthService.logout(
+      logoutAdminDto,
+      this.getRequestMeta(request),
+    );
   }
 
   @Post("change-password")
   @HttpCode(HttpStatus.OK)
+  @ThrottleProfile(THROTTLE_PROFILES.admin)
   @UseGuards(AdminAccessTokenGuard)
   @ApiBearerAuth()
   @ApiOperation({
@@ -151,11 +184,17 @@ export class AdminAuthController {
   changePassword(
     @CurrentAdmin() admin: SafeAdminResponse,
     @Body() dto: ChangeAdminPasswordDto,
+    @Req() request: Request,
   ): Promise<ChangeAdminPasswordResponse> {
-    return this.adminAuthService.changePassword(admin.id, dto);
+    return this.adminAuthService.changePassword(
+      admin.id,
+      dto,
+      this.getRequestMeta(request),
+    );
   }
 
   @Get("me")
+  @ThrottleProfile(THROTTLE_PROFILES.admin)
   @UseGuards(AdminAccessTokenGuard)
   @ApiBearerAuth()
   @ApiOperation({
@@ -172,5 +211,15 @@ export class AdminAuthController {
   })
   getMe(@CurrentAdmin() admin: SafeAdminResponse): Promise<MeAdminResponse> {
     return this.adminAuthService.getMe(admin.id);
+  }
+
+  private getRequestMeta(request: Request) {
+    const apiEnvironment =
+      this.configService.getOrThrow<ApiEnvironmentConfig>("api");
+
+    return getRequestSecurityMeta(request, {
+      trustProxyEnabled: apiEnvironment.trustProxyEnabled,
+      trustProxyCloudflareOnly: apiEnvironment.trustProxyCloudflareOnly,
+    });
   }
 }

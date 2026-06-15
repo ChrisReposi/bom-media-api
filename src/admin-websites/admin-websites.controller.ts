@@ -26,6 +26,10 @@ import {
 import { CurrentAdmin } from "../admin-auth/decorators/current-admin.decorator";
 import { AdminAccessTokenGuard } from "../admin-auth/guards/admin-access-token.guard";
 import type { SafeAdminResponse } from "../admin-auth/types/admin-auth-response.type";
+import {
+  THROTTLE_PROFILES,
+  ThrottleProfile,
+} from "../security/throttle-profile.decorator";
 import { AdminWebsitesService } from "./admin-websites.service";
 import { ActivateWebsiteDomainDto } from "./dto/activate-website-domain.dto";
 import { AssignDomainToWebsiteDto } from "./dto/assign-domain-to-website.dto";
@@ -65,6 +69,7 @@ import {
 @ApiTags("admin-websites")
 @ApiBearerAuth()
 @UseGuards(AdminAccessTokenGuard)
+@ThrottleProfile(THROTTLE_PROFILES.admin)
 @Controller("admin")
 export class AdminWebsitesController {
   constructor(private readonly websitesService: AdminWebsitesService) {}

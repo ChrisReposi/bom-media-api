@@ -12,6 +12,133 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-06-15 — Public watch exchange endpoint
+
+### Summary
+
+- Added `POST /api/v1/public/watch/exchange` for static public sites that already prefer the JSON exchange flow.
+- The exchange endpoint uses the same `PublicService.resolvePublicWatch()` validation and response shape as legacy `GET /api/v1/public/watch`.
+- Added a validated exchange body DTO requiring `host` and `token`.
+- Added focused controller/DTO regression tests for route metadata, same response shape as legacy GET, generic invalid-token behavior, required body fields, no admin guard, and no `/admin/` media URLs in the sample public response.
+- Updated LOCAL_FILE public playback docs to document exchange as preferred and legacy GET as fallback.
+
+### Root Cause
+
+- The public static bundle called `POST /public/watch/exchange`, but the backend only exposed `GET /public/watch` plus public media/view routes.
+- The public client fallback kept playback working, but the missing backend route caused noisy `404 Not Found` responses.
+
+### Files Changed
+
+```txt
+src/public/public.controller.ts
+src/public/dto/public-watch-exchange.dto.ts
+test/public-watch-exchange.test.ts
+docs/architecture/local-file-video-storage.md
+docs/operations/local-video-storage-runbook.md
+session-log.md
+```
+
+### Commands Run
+
+```bash
+yarn db:local:generate
+yarn db:local:validate
+yarn typecheck
+yarn lint
+yarn format:check
+yarn test
+yarn build
+find . -maxdepth 3 \( -name package-lock.json -o -name pnpm-lock.yaml \) -print
+```
+
+### Verification Result
+
+- Prisma generate/validate passed.
+- Typecheck passed.
+- Lint passed with existing warning-only `consistent-type-imports` findings.
+- Format check passed.
+- Test suite passed: 33 tests.
+- Build passed.
+- npm/pnpm lockfile search returned no files.
+
+### Manual Test Steps
+
+- Pending local browser verification with a real public share token.
+- Expected: `POST /api/v1/public/watch/exchange` returns HTTP 200 and no longer logs a 404 in DevTools.
+- Expected: legacy `GET /api/v1/public/watch?host=...&token=...` still returns the same response shape.
+- Expected: LOCAL_FILE thumbnails, playback, seeking, and public view tracking still work through public routes.
+
+### Known Limitations
+
+- This pass did not start a local API server or run real curl/browser checks with a real share token.
+- Existing repo lint warnings were not refactored because they are unrelated warning-level import-type cleanup.
+
+### Next Recommended Prompt
+
+`PROMPT — Run end-to-end public site smoke test for exchange, LOCAL_FILE thumbnails, playback, seeking, and view tracking`
+
+## 2026-06-15 — Public LOCAL_FILE thumbnail URL serialization fix
+
+### Summary
+
+- Fixed public watch serialization for LOCAL_FILE thumbnails so image thumbnail assets produce token-gated public thumbnail URLs.
+- Added `publicThumbnailUrl` alongside existing `thumbnailUrl` without breaking clients that only read `thumbnailUrl`.
+- Prevented public watch media fields from echoing `/admin/` media URLs for LOCAL_FILE playback/thumbnail responses.
+- Added focused public thumbnail regression tests covering image thumbnails, invalid thumbnail fallback, public thumbnail streaming, and generic invalid-token behavior.
+
+### Root Cause
+
+- `toPlayablePublicVideos()` used the video asset validator for `localThumbnailAsset`.
+- The validator required `mimeType.startsWith("video/")`, so valid thumbnails such as `image/jpeg` failed and the serializer fell back to the stored admin thumbnail URL.
+
+### Files Changed
+
+```txt
+src/public/public.service.ts
+src/public/types/public-watch-response.type.ts
+test/public-local-thumbnail.test.ts
+session-log.md
+```
+
+### Commands Run
+
+```bash
+yarn db:local:generate
+yarn db:local:validate
+yarn typecheck
+yarn lint
+yarn format:check
+yarn prettier --check test/public-local-thumbnail.test.ts
+yarn test
+yarn build
+find . -maxdepth 3 \( -name package-lock.json -o -name pnpm-lock.yaml \) -print
+```
+
+### Verification Result
+
+- Prisma generate/validate passed.
+- Typecheck passed.
+- Lint passed with existing warning-only `consistent-type-imports` findings.
+- Format checks passed, including the new test file.
+- Test suite passed: 28 tests.
+- Build passed.
+- npm/pnpm lockfile search returned no files.
+
+### Manual Browser Test Notes
+
+- Pending real local browser/API verification with a READY LOCAL_FILE video, valid share link, and local thumbnail asset.
+- Expected public watch result: `thumbnailUrl` and `publicThumbnailUrl` point to `/api/v1/public/watch/:token/videos/:videoId/thumbnail?host=...`.
+- Expected public watch result: no LOCAL_FILE thumbnail/playback media field points to `/api/v1/admin/...`.
+
+### Known Limitations
+
+- This pass did not create live fixture data or perform a real share-token curl/browser test.
+- Existing repo lint warnings were not refactored because they are unrelated warning-level import-type cleanup.
+
+### Next Recommended Prompt
+
+`PROMPT — End-to-end verify LOCAL_FILE public thumbnail rendering with a real share link`
+
 ## 2026-06-15 — LOCAL_FILE purge reclaim and storage cleanup hardening
 
 ### Summary

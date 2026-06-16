@@ -484,61 +484,73 @@ export class PublicService {
     return shareLink.shareLinkVideos
       .map(({ video }) => video)
       .filter((video) => this.isPublicPlayableVideo(video))
-      .map((video) => ({
-        id: video.id,
-        title: video.title,
-        description: video.description,
-        sourceType: video.sourceType,
-        playbackUrl:
-          video.sourceType === VideoSourceType.DB_BLOB
-            ? null
-            : video.playbackUrl,
-        binaryPlaybackUrl:
+      .map((video) => {
+        const binaryPlaybackUrl =
           video.sourceType === VideoSourceType.DB_BLOB
             ? this.buildPublicBinaryPlaybackUrl({
                 token: playbackContext.token,
                 videoId: video.id,
                 host: playbackContext.host,
               })
-            : null,
-        publicPlaybackUrl:
-          video.sourceType === VideoSourceType.DB_BLOB
-            ? this.buildPublicBinaryPlaybackUrl({
-                token: playbackContext.token,
-                videoId: video.id,
-                host: playbackContext.host,
-              })
-            : video.sourceType === VideoSourceType.LOCAL_FILE
-              ? this.buildPublicLocalPlaybackUrl({
-                  token: playbackContext.token,
-                  videoId: video.id,
-                  host: playbackContext.host,
-                })
-              : null,
-        binaryAsset:
-          video.sourceType === VideoSourceType.DB_BLOB
-            ? this.toPublicBinaryAssetResponse(video.binaryAsset ?? null)
-            : null,
-        localFileAsset:
+            : null;
+        const localPlaybackUrl =
           video.sourceType === VideoSourceType.LOCAL_FILE
-            ? this.toPublicLocalAssetResponse(video.localFileAsset ?? null)
-            : null,
-        embedUrl: video.embedUrl,
-        embedProvider: video.embedProvider,
-        embedAllow: video.embedAllow,
-        thumbnailUrl:
+            ? this.buildPublicLocalPlaybackUrl({
+                token: playbackContext.token,
+                videoId: video.id,
+                host: playbackContext.host,
+              })
+            : null;
+        const localThumbnailUrl =
           video.sourceType === VideoSourceType.LOCAL_FILE &&
-          this.isPlayableLocalAsset(video.localThumbnailAsset ?? null)
+          this.isPlayableImageAsset(video.localThumbnailAsset ?? null)
             ? this.buildPublicLocalThumbnailUrl({
                 token: playbackContext.token,
                 videoId: video.id,
                 host: playbackContext.host,
               })
-            : video.thumbnailUrl,
-        durationSeconds: video.durationSeconds,
-        viewCount: video.viewCount.toString(),
-        publishedAt: video.publishedAt?.toISOString() ?? null,
-      }));
+            : null;
+        const thumbnailUrl =
+          video.sourceType === VideoSourceType.LOCAL_FILE
+            ? localThumbnailUrl
+            : this.toSafePublicMediaUrl(video.thumbnailUrl);
+
+        return {
+          id: video.id,
+          title: video.title,
+          description: video.description,
+          sourceType: video.sourceType,
+          playbackUrl:
+            video.sourceType === VideoSourceType.DB_BLOB ||
+            video.sourceType === VideoSourceType.LOCAL_FILE
+              ? null
+              : this.toSafePublicMediaUrl(video.playbackUrl),
+          binaryPlaybackUrl,
+          publicPlaybackUrl:
+            video.sourceType === VideoSourceType.DB_BLOB
+              ? binaryPlaybackUrl
+              : localPlaybackUrl,
+          binaryAsset:
+            video.sourceType === VideoSourceType.DB_BLOB
+              ? this.toPublicBinaryAssetResponse(video.binaryAsset ?? null)
+              : null,
+          localFileAsset:
+            video.sourceType === VideoSourceType.LOCAL_FILE
+              ? this.toPublicLocalAssetResponse(video.localFileAsset ?? null)
+              : null,
+          embedUrl: video.embedUrl,
+          embedProvider: video.embedProvider,
+          embedAllow: video.embedAllow,
+          thumbnailUrl,
+          publicThumbnailUrl:
+            video.sourceType === VideoSourceType.LOCAL_FILE
+              ? localThumbnailUrl
+              : thumbnailUrl,
+          durationSeconds: video.durationSeconds,
+          viewCount: video.viewCount.toString(),
+          publishedAt: video.publishedAt?.toISOString() ?? null,
+        };
+      });
   }
 
   private isPublicPlayableVideo(video: PublicWatchVideoWithBinary): boolean {
@@ -958,6 +970,30 @@ export class PublicService {
       localAsset.mimeType.startsWith("image/") &&
       localAsset.sizeBytes > BigInt(0)
     );
+  }
+
+  private toSafePublicMediaUrl(url: string | null): string | null {
+    const trimmedUrl = url?.trim();
+
+    if (!trimmedUrl || this.isAdminEndpointUrl(trimmedUrl)) {
+      return null;
+    }
+
+    return trimmedUrl;
+  }
+
+  private isAdminEndpointUrl(url: string): boolean {
+    try {
+      const parsed = new URL(url, "http://public-media.local");
+      const pathSegments = parsed.pathname
+        .split("/")
+        .map((segment) => segment.toLowerCase())
+        .filter(Boolean);
+
+      return pathSegments.includes("admin");
+    } catch {
+      return url.toLowerCase().split(/[?#]/, 1)[0].split("/").includes("admin");
+    }
   }
 
   private parseRangeHeader(

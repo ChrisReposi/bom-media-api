@@ -135,6 +135,23 @@ LOCAL_FILE thumbnails are stored on Hostinger/private storage:
 
 LOCAL_FILE public playback is token-protected.
 
+Public static sites should resolve share tokens with:
+
+```txt
+POST /api/v1/public/watch/exchange
+```
+
+Body:
+
+```json
+{
+  "host": "example.com",
+  "token": "<share-token>"
+}
+```
+
+The older `GET /api/v1/public/watch?host=<host>&token=<share-token>` endpoint remains available as a compatibility fallback. Both endpoints use the same public validation path and return the same response shape.
+
 Public watch returns safe media URLs for videos in valid share links. For LOCAL_FILE videos, current public URLs are API routes such as:
 
 ```txt

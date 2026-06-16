@@ -41,6 +41,7 @@ export type PublicWatchVideoResponse = {
   embedProvider: EmbedProvider | null;
   embedAllow: string | null;
   thumbnailUrl: string | null;
+  publicThumbnailUrl?: string | null;
   durationSeconds: number | null;
   viewCount: string;
   publishedAt: string | null;

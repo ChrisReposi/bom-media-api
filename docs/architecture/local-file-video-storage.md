@@ -69,6 +69,29 @@ Admin local-file preview is Bearer-token protected and supports HTTP Range. Thum
 
 ## Public Playback Contract
 
+Static public sites should prefer the JSON exchange endpoint for resolving a share token:
+
+```txt
+POST /api/v1/public/watch/exchange
+```
+
+Request body:
+
+```json
+{
+  "host": "example.com",
+  "token": "<share-token>"
+}
+```
+
+The legacy fallback remains available for older public bundles:
+
+```txt
+GET /api/v1/public/watch?host=<host>&token=<share-token>
+```
+
+Both endpoints return the same `PublicWatchResponse` shape and use the same host/domain, share-link, expiry/view-limit, and video membership validation.
+
 Public watch responses for `LOCAL_FILE` videos include a token-protected `publicPlaybackUrl`:
 
 ```json

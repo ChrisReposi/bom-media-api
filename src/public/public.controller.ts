@@ -1,6 +1,7 @@
 import {
   Controller,
   Get,
+  HttpCode,
   HttpStatus,
   Body,
   Param,
@@ -26,6 +27,7 @@ import {
   THROTTLE_PROFILES,
   ThrottleProfile,
 } from "../security/throttle-profile.decorator";
+import { PublicWatchExchangeDto } from "./dto/public-watch-exchange.dto";
 import { PublicWatchQueryDto } from "./dto/public-watch-query.dto";
 import { RecordPublicVideoViewDto } from "./dto/record-public-video-view.dto";
 import { PublicService } from "./public.service";
@@ -66,6 +68,39 @@ export class PublicController {
     return this.publicService.resolvePublicWatch({
       host: query.host,
       ...(query.token !== undefined ? { token: query.token } : {}),
+      requestMeta: {
+        ip: this.extractClientIp(request),
+        referer: readRequestHeader(request, "referer"),
+        userAgent: readRequestHeader(request, "user-agent"),
+      },
+    });
+  }
+
+  @Post("watch/exchange")
+  @HttpCode(HttpStatus.OK)
+  @ThrottleProfile(THROTTLE_PROFILES.publicWatch)
+  @ApiOperation({
+    summary: "Exchange a public share token for public watch videos.",
+    description:
+      "Preferred public endpoint for static custom websites. Uses the same validation and response shape as legacy GET /public/watch and does not require admin authentication.",
+  })
+  @ApiOkResponse({
+    type: PublicWatchResponse,
+    description: "Public watch result.",
+  })
+  @ApiBadRequestResponse({
+    description: "Invalid request body.",
+  })
+  exchangePublicWatch(
+    @Body() body: PublicWatchExchangeDto,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ): Promise<PublicWatchResponse> {
+    setNoStoreHeaders(response);
+
+    return this.publicService.resolvePublicWatch({
+      host: body.host,
+      token: body.token,
       requestMeta: {
         ip: this.extractClientIp(request),
         referer: readRequestHeader(request, "referer"),

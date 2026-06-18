@@ -433,6 +433,7 @@ model ShareLink {
   id           String          @id @default(cuid())
   websiteId    String
   tokenHash    String          @unique @db.VarChar(128)
+  alias        String?         @unique @db.VarChar(16)
   label        String?         @db.VarChar(255)
   expiresAt    DateTime?
   maxViews     Int?

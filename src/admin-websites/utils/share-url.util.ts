@@ -6,9 +6,14 @@ export function generateShareToken(): string {
   return `s_${randomBytes(32).toString("base64url")}`;
 }
 
+export function generateShareAlias(): string {
+  return randomBytes(5).toString("base64url");
+}
+
 export function buildPublicShareUrl(params: {
   domain: string;
-  token: string;
+  alias?: string | undefined;
+  token?: string | undefined;
   protocol?: string | undefined;
 }): string {
   const domain = params.domain.trim();
@@ -24,9 +29,22 @@ export function buildPublicShareUrl(params: {
   }
 
   const protocol = resolvePublicSiteProtocol(normalizedDomain, params.protocol);
+  const alias = params.alias?.trim();
+
+  if (alias) {
+    return `${protocol}://${normalizedDomain}/s/${encodeURIComponent(
+      alias,
+    )}#/videos`;
+  }
+
+  const token = params.token?.trim();
+
+  if (!token) {
+    throw new BadRequestException("Public share token or alias is required.");
+  }
 
   return `${protocol}://${normalizedDomain}/?token=${encodeURIComponent(
-    params.token,
+    token,
   )}#/videos`;
 }
 

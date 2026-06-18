@@ -15,6 +15,7 @@ import { PublicService } from "../src/public/public.service";
 import { hashShareToken } from "../src/public/utils/share-token.util";
 
 const token = "test-share-token";
+const shareAlias = "AbCd123";
 const tokenPepper = "test-share-token-pepper";
 const tokenHash = hashShareToken({ pepper: tokenPepper, token });
 const host = "localhost:5500";
@@ -50,6 +51,7 @@ type FakeShareLink = {
   id: string;
   websiteId: string;
   tokenHash: string;
+  alias: string | null;
   status: ShareLinkStatus;
   expiresAt: Date | null;
   maxViews: number | null;
@@ -90,6 +92,7 @@ class FakePrismaService {
       id: "share-1",
       websiteId: "website-1",
       tokenHash,
+      alias: shareAlias,
       status: ShareLinkStatus.ACTIVE,
       expiresAt: null,
       maxViews: null,
@@ -120,7 +123,7 @@ class FakePrismaService {
 
   shareLink = {
     findFirst: async (args: {
-      where: { tokenHash: string; websiteId: string };
+      where: { alias?: string; tokenHash?: string; websiteId: string };
       include?: {
         shareLinkVideos?: {
           where?: { videoId: string };
@@ -128,8 +131,12 @@ class FakePrismaService {
       };
     }) => {
       if (
-        args.where.tokenHash !== this.shareLinkRecord.tokenHash ||
-        args.where.websiteId !== this.shareLinkRecord.websiteId
+        args.where.websiteId !== this.shareLinkRecord.websiteId ||
+        (args.where.alias !== undefined &&
+          args.where.alias !== this.shareLinkRecord.alias) ||
+        (args.where.tokenHash !== undefined &&
+          args.where.tokenHash !== this.shareLinkRecord.tokenHash) ||
+        (args.where.alias === undefined && args.where.tokenHash === undefined)
       ) {
         return null;
       }
@@ -259,6 +266,37 @@ describe("PublicService LOCAL_FILE thumbnail serialization", () => {
       publicMediaFields.some((value) => value?.includes("/admin/")),
       false,
     );
+  });
+
+  it("resolves public LOCAL_FILE thumbnail and playback URLs by short alias", async () => {
+    const { service } = createService(createLocalFileVideo());
+
+    const response = await service.resolvePublicWatch({
+      host,
+      token: shareAlias,
+    });
+    const video = response.videos[0];
+
+    assert.equal(response.valid, true);
+    assert.ok(video);
+    assert.match(
+      video.thumbnailUrl ?? "",
+      /^\/api\/v1\/public\/watch\/AbCd123\/videos\/video-1\/thumbnail\?host=localhost%3A5500$/,
+    );
+    assert.match(
+      video.publicPlaybackUrl ?? "",
+      /^\/api\/v1\/public\/watch\/AbCd123\/videos\/video-1\/local-file\?host=localhost%3A5500$/,
+    );
+    assert.equal(video.thumbnailUrl?.includes("/admin/"), false);
+
+    const thumbnail = await service.getPublicLocalThumbnail({
+      host,
+      token: shareAlias,
+      videoId: "video-1",
+    });
+
+    assert.equal(thumbnail.mimeType, "image/jpeg");
+    assert.equal(thumbnail.contentLength, 4);
   });
 
   it("does not fall back to admin thumbnail URLs for invalid local thumbnail assets", async () => {

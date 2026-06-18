@@ -23,6 +23,9 @@ export class AdminShareLinkResponse {
   websiteId!: string;
 
   @ApiPropertyOptional({ nullable: true })
+  alias!: string | null;
+
+  @ApiPropertyOptional({ nullable: true })
   label!: string | null;
 
   @ApiProperty({ enum: ShareLinkStatus })

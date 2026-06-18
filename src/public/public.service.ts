@@ -212,43 +212,53 @@ export class PublicService {
       token: trimmedToken,
     });
 
-    const shareLink = await this.prisma.shareLink.findFirst({
-      where: {
-        tokenHash,
-        websiteId: website.id,
-      },
-      include: {
-        shareLinkVideos: {
-          orderBy: {
-            sortOrder: "asc",
-          },
-          include: {
-            video: {
-              include: {
-                binaryAsset: {
-                  select: {
-                    mimeType: true,
-                    sizeBytes: true,
-                  },
+    const publicWatchInclude = {
+      shareLinkVideos: {
+        orderBy: {
+          sortOrder: "asc" as const,
+        },
+        include: {
+          video: {
+            include: {
+              binaryAsset: {
+                select: {
+                  mimeType: true,
+                  sizeBytes: true,
                 },
-                localFileAsset: {
-                  select: {
-                    mimeType: true,
-                    sizeBytes: true,
-                  },
+              },
+              localFileAsset: {
+                select: {
+                  mimeType: true,
+                  sizeBytes: true,
                 },
-                localThumbnailAsset: {
-                  select: {
-                    mimeType: true,
-                    sizeBytes: true,
-                  },
+              },
+              localThumbnailAsset: {
+                select: {
+                  mimeType: true,
+                  sizeBytes: true,
                 },
               },
             },
           },
         },
       },
-    });
+    };
+
+    const shareLink =
+      (await this.prisma.shareLink.findFirst({
+        where: {
+          alias: trimmedToken,
+          websiteId: website.id,
+        },
+        include: publicWatchInclude,
+      })) ??
+      (await this.prisma.shareLink.findFirst({
+        where: {
+          tokenHash,
+          websiteId: website.id,
+        },
+        include: publicWatchInclude,
+      }));
 
     if (shareLink === null) {
       await this.writeAccessLog({
@@ -637,32 +647,42 @@ export class PublicService {
       token: trimmedToken,
     });
 
-    const shareLink = await this.prisma.shareLink.findFirst({
-      where: {
-        tokenHash,
-        websiteId: domainRecord.website.id,
-      },
-      include: {
-        shareLinkVideos: {
-          where: {
-            videoId: params.videoId,
-          },
-          take: 1,
-          include: {
-            video: {
-              include: {
-                binaryAsset: {
-                  select: {
-                    mimeType: true,
-                    sizeBytes: true,
-                  },
+    const binaryInclude = {
+      shareLinkVideos: {
+        where: {
+          videoId: params.videoId,
+        },
+        take: 1,
+        include: {
+          video: {
+            include: {
+              binaryAsset: {
+                select: {
+                  mimeType: true,
+                  sizeBytes: true,
                 },
               },
             },
           },
         },
       },
-    });
+    };
+
+    const shareLink =
+      (await this.prisma.shareLink.findFirst({
+        where: {
+          alias: trimmedToken,
+          websiteId: domainRecord.website.id,
+        },
+        include: binaryInclude,
+      })) ??
+      (await this.prisma.shareLink.findFirst({
+        where: {
+          tokenHash,
+          websiteId: domainRecord.website.id,
+        },
+        include: binaryInclude,
+      }));
 
     if (
       shareLink === null ||
@@ -782,40 +802,50 @@ export class PublicService {
       token: trimmedToken,
     });
 
-    const shareLink = await this.prisma.shareLink.findFirst({
-      where: {
-        tokenHash,
-        websiteId: domainRecord.website.id,
-      },
-      include: {
-        shareLinkVideos: {
-          where: {
-            videoId: params.videoId,
-          },
-          take: 1,
-          include: {
-            video: {
-              include: {
-                localFileAsset: {
-                  select: {
-                    storageKey: true,
-                    mimeType: true,
-                    sizeBytes: true,
-                  },
+    const localVideoInclude = {
+      shareLinkVideos: {
+        where: {
+          videoId: params.videoId,
+        },
+        take: 1,
+        include: {
+          video: {
+            include: {
+              localFileAsset: {
+                select: {
+                  storageKey: true,
+                  mimeType: true,
+                  sizeBytes: true,
                 },
-                localThumbnailAsset: {
-                  select: {
-                    storageKey: true,
-                    mimeType: true,
-                    sizeBytes: true,
-                  },
+              },
+              localThumbnailAsset: {
+                select: {
+                  storageKey: true,
+                  mimeType: true,
+                  sizeBytes: true,
                 },
               },
             },
           },
         },
       },
-    });
+    };
+
+    const shareLink =
+      (await this.prisma.shareLink.findFirst({
+        where: {
+          alias: trimmedToken,
+          websiteId: domainRecord.website.id,
+        },
+        include: localVideoInclude,
+      })) ??
+      (await this.prisma.shareLink.findFirst({
+        where: {
+          tokenHash,
+          websiteId: domainRecord.website.id,
+        },
+        include: localVideoInclude,
+      }));
 
     if (
       shareLink === null ||
@@ -884,46 +914,56 @@ export class PublicService {
       token: trimmedToken,
     });
 
-    const shareLink = await this.prisma.shareLink.findFirst({
-      where: {
-        tokenHash,
-        websiteId: domainRecord.website.id,
-      },
-      include: {
-        shareLinkVideos: {
-          where: {
-            videoId: params.videoId,
-          },
-          take: 1,
-          include: {
-            video: {
-              include: {
-                binaryAsset: {
-                  select: {
-                    mimeType: true,
-                    sizeBytes: true,
-                  },
+    const publicViewInclude = {
+      shareLinkVideos: {
+        where: {
+          videoId: params.videoId,
+        },
+        take: 1,
+        include: {
+          video: {
+            include: {
+              binaryAsset: {
+                select: {
+                  mimeType: true,
+                  sizeBytes: true,
                 },
-                localFileAsset: {
-                  select: {
-                    storageKey: true,
-                    mimeType: true,
-                    sizeBytes: true,
-                  },
+              },
+              localFileAsset: {
+                select: {
+                  storageKey: true,
+                  mimeType: true,
+                  sizeBytes: true,
                 },
-                localThumbnailAsset: {
-                  select: {
-                    storageKey: true,
-                    mimeType: true,
-                    sizeBytes: true,
-                  },
+              },
+              localThumbnailAsset: {
+                select: {
+                  storageKey: true,
+                  mimeType: true,
+                  sizeBytes: true,
                 },
               },
             },
           },
         },
       },
-    });
+    };
+
+    const shareLink =
+      (await this.prisma.shareLink.findFirst({
+        where: {
+          alias: trimmedToken,
+          websiteId: domainRecord.website.id,
+        },
+        include: publicViewInclude,
+      })) ??
+      (await this.prisma.shareLink.findFirst({
+        where: {
+          tokenHash,
+          websiteId: domainRecord.website.id,
+        },
+        include: publicViewInclude,
+      }));
 
     if (shareLink === null || this.getDeniedReason(shareLink, new Date())) {
       return null;

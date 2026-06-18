@@ -7,7 +7,7 @@ import {
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { PrismaService } from "../database/prisma.service";
-import type { Prisma } from "../generated/prisma/client";
+import { Prisma } from "../generated/prisma/client";
 import {
   AssignmentStatus,
   AuditStatus,
@@ -72,8 +72,11 @@ import {
 import { CorsOriginService } from "../security/cors-origin.service";
 import {
   buildPublicShareUrl,
+  generateShareAlias,
   generateShareToken,
 } from "./utils/share-url.util";
+
+const SHARE_LINK_ALIAS_CREATE_MAX_ATTEMPTS = 5;
 
 type WebsiteWithRelations = Website & {
   domains: WebsiteDomain[];
@@ -1270,54 +1273,82 @@ export class AdminWebsitesService {
         );
       }
 
-      stage = "generate-token";
-      const rawToken = generateShareToken();
-      const tokenHash = hashShareToken({
-        token: rawToken,
-        pepper: tokenPepper,
-      });
-
-      stage = "build-public-url";
-      const publicUrl = buildPublicShareUrl({
-        domain,
-        token: rawToken,
-        protocol: this.getConfiguredPublicSiteProtocol(domain),
-      });
-
       stage = "transaction-create-share-link";
-      const shareLink = await this.prisma.$transaction(async (tx) => {
-        const createdShareLink = await tx.shareLink.create({
-          data: {
-            websiteId,
-            tokenHash,
-            label,
-            expiresAt,
-            maxViews,
-            currentViews: 0,
-            status: ShareLinkStatus.ACTIVE,
-          },
+      let rawToken = "";
+      let alias = "";
+      let publicUrl = "";
+      let shareLink: ShareLinkWithVideos | null = null;
+
+      for (
+        let attempt = 1;
+        attempt <= SHARE_LINK_ALIAS_CREATE_MAX_ATTEMPTS;
+        attempt += 1
+      ) {
+        rawToken = generateShareToken();
+        alias = generateShareAlias();
+        const tokenHash = hashShareToken({
+          token: rawToken,
+          pepper: tokenPepper,
+        });
+        publicUrl = buildPublicShareUrl({
+          domain,
+          alias,
+          protocol: this.getConfiguredPublicSiteProtocol(domain),
         });
 
-        for (const [index, videoId] of selectedVideoIds.entries()) {
-          await tx.shareLinkVideo.create({
-            data: {
-              shareLinkId: createdShareLink.id,
-              videoId,
-              sortOrder: index,
-            },
+        try {
+          shareLink = await this.prisma.$transaction(async (tx) => {
+            const createdShareLink = await tx.shareLink.create({
+              data: {
+                websiteId,
+                tokenHash,
+                alias,
+                label,
+                expiresAt,
+                maxViews,
+                currentViews: 0,
+                status: ShareLinkStatus.ACTIVE,
+              },
+            });
+
+            for (const [index, videoId] of selectedVideoIds.entries()) {
+              await tx.shareLinkVideo.create({
+                data: {
+                  shareLinkId: createdShareLink.id,
+                  videoId,
+                  sortOrder: index,
+                },
+              });
+            }
+
+            return tx.shareLink.findUniqueOrThrow({
+              where: { id: createdShareLink.id },
+              include: {
+                shareLinkVideos: {
+                  include: { video: true },
+                  orderBy: { sortOrder: "asc" },
+                },
+              },
+            });
           });
-        }
+          break;
+        } catch (error) {
+          if (
+            attempt < SHARE_LINK_ALIAS_CREATE_MAX_ATTEMPTS &&
+            this.isShareLinkTokenOrAliasCollision(error)
+          ) {
+            continue;
+          }
 
-        return tx.shareLink.findUniqueOrThrow({
-          where: { id: createdShareLink.id },
-          include: {
-            shareLinkVideos: {
-              include: { video: true },
-              orderBy: { sortOrder: "asc" },
-            },
-          },
-        });
-      });
+          throw error;
+        }
+      }
+
+      if (shareLink === null) {
+        throw new ConflictException(
+          "Could not create a unique share link. Please try again.",
+        );
+      }
 
       stage = "write-audit";
       await this.writeAudit(
@@ -2245,6 +2276,7 @@ export class AdminWebsitesService {
     return {
       id: shareLink.id,
       websiteId: shareLink.websiteId,
+      alias: shareLink.alias ?? null,
       label: shareLink.label,
       status: shareLink.status,
       expiresAt: shareLink.expiresAt,
@@ -2261,6 +2293,27 @@ export class AdminWebsitesService {
         sortOrder: shareLinkVideo.sortOrder,
       })),
     };
+  }
+
+  private isShareLinkTokenOrAliasCollision(error: unknown): boolean {
+    if (
+      !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+      error.code !== "P2002"
+    ) {
+      return false;
+    }
+
+    const target = (error.meta as { target?: unknown } | undefined)?.target;
+
+    if (Array.isArray(target)) {
+      return target.some((field) => field === "alias" || field === "tokenHash");
+    }
+
+    if (typeof target === "string") {
+      return target.includes("alias") || target.includes("tokenHash");
+    }
+
+    return false;
   }
 
   private async writeAudit(

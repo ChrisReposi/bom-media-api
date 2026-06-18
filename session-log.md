@@ -12,6 +12,238 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-06-17 — Danny clean-path short-code fallback hardening
+
+### Summary
+
+- Hardened the Danny public route parser with a shared path/hash share-entry parser for `/s/<code>` and legacy `/watch/<token>` forms.
+- Switched `index.html` to root-absolute `/assets/*` URLs so clean-path fallback pages such as `/s/<code>` load the correct CSS/JS from the site root.
+- Kept `/s/assets/*` plus `/watch/assets/*` compatibility mappings in fallback configs for older cached relative shells.
+- Added `dev-server.mjs`, a Node-only local SPA fallback server for testing `/s/<code>#/videos` without VS Code Live Server clean-path 404s.
+- Kept the public site display-only and share-code/share-token-only; no admin UI or writable public flows were added.
+
+### Root Cause
+
+- The browser never sends `#/videos` to the server, so a URL such as `/s/<code>#/videos` first requests `/s/<code>`.
+- Static servers without SPA fallback return `Cannot GET /s/<code>` before `assets/app.js` can run.
+- CSP messages such as `default-src 'none'` on that URL are symptoms of the 404/error response, not the configured Danny site CSP.
+
+### Files Changed
+
+```txt
+bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/assets/app.js
+bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/index.html
+bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/dev-server.mjs
+bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/.htaccess
+bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/_redirects
+bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/PUBLIC_SECURITY_README.md
+bom-media-api/session-log.md
+```
+
+### Verification Commands
+
+```bash
+node --check bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/assets/app.js
+node --check bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/dev-server.mjs
+grep -R "localStorage" bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/index.html bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/assets/app.js || true
+grep -R "accessToken\|refreshToken\|Authorization\|Bearer" bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/index.html bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/assets/app.js || true
+grep -R "/admin/" bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/index.html bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/assets/app.js || true
+grep -R "/home/\|/var/\|/srv/\|/root/\|/etc/\|/opt/\|file:" bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/index.html bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/assets/app.js || true
+PORT=5599 node bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/dev-server.mjs
+curl -i http://127.0.0.1:5599/s/exampleCode
+curl -i http://127.0.0.1:5599/assets/app.js
+curl -i http://127.0.0.1:5599/assets/styles.css
+curl -i http://127.0.0.1:5599/s/assets/app.js
+curl -i http://127.0.0.1:5599/watch/assets/app.js
+yarn prisma validate
+yarn typecheck
+yarn lint
+yarn format:check
+yarn test
+yarn build
+find /Users/monarch/Desktop/bom-media -maxdepth 4 \( -name package-lock.json -o -name pnpm-lock.yaml \) -print
+```
+
+### Verification Result
+
+- Danny `assets/app.js` and `dev-server.mjs` syntax checks passed.
+- Static grep checks returned no `localStorage`, admin auth token names, or `/admin/` media URL strings.
+- Raw filesystem grep only matched existing `file:` local-development/media guard code.
+- Local fallback server returned HTTP 200 and `index.html` for `/s/exampleCode`.
+- Local fallback server returned HTTP 200 and JavaScript content type for `/assets/app.js`.
+- Local fallback server returned HTTP 200 and CSS content type for `/assets/styles.css`.
+- Local fallback server returned HTTP 200 and JavaScript content type for `/s/assets/app.js` and `/watch/assets/app.js`.
+- Backend Prisma schema validation passed.
+- Backend typecheck passed.
+- Backend format check passed.
+- Backend test suite passed: 37 tests.
+- Backend build passed.
+- Backend lint passed with existing warning-only `consistent-type-imports` findings.
+- npm/pnpm lockfile search returned no files.
+- Manual browser verification with a real short code is still required.
+
+### Manual Test Notes
+
+- Preferred production/root-local URL: `http://127.0.0.1:5500/s/<short-code>#/videos`.
+- For reliable local clean-path testing, serve the Danny site folder as the web root with `PORT=5500 node dev-server.mjs`.
+- If testing from a parent-folder static server, `index.html#/s/<short-code>/videos` can avoid the clean-path 404, but root `/assets/*` must still resolve to this site's assets.
+- The public site should scrub visible `/s/<short-code>` or `#/s/<short-code>` after reading it and continue through `sessionStorage` for same-tab navigation.
+- Legacy `?token=`, `?t=`, and `/watch/<token>` links must remain working.
+
+### Security Notes
+
+- Short visible codes weaken brute-force resistance compared with long opaque tokens; this remains a customer requirement.
+- Backend host/domain validation, share-link status, expiration, max views, video membership, READY checks, public-media authorization, and throttling must remain enabled.
+
+### Rollback Notes
+
+- If short-code rollout fails before production migration, revert the alias-related code and fallback static-site changes, then rebuild/redeploy the backend and public site.
+- If the alias migration has already been applied, take a fresh backup first; then either keep the nullable `ShareLink.alias` column unused while reverting URL generation to legacy `?token=` links, or restore the database from the pre-migration backup if a full rollback is required.
+- Existing legacy `?token=` and `/watch/<token>` readers are intentionally still present, so rollback can be gradual without invalidating old links.
+
+### Next Recommended Prompt
+
+`Prompt — Browser-test Danny /s/<short-code> links against a real local share link and verify host/domain assignment`
+
+## 2026-06-17 — Danny public site short-code route support
+
+### Summary
+
+- Verified the backend already has `ShareLink.alias`, short-link URL generation, and alias-first public watch/media/view lookup.
+- Updated the Danny public static site so `/s/<short-code>` and `#/s/<short-code>` entry points are treated like share credentials while preserving legacy `/watch/<token>`, `?token=`, and `?t=` links.
+- Added production SPA fallback templates for Hostinger/Apache/LiteSpeed and Cloudflare Pages-style hosting.
+- Updated Danny public security documentation with supported entry points, local dev caveats, rewrite requirements, and the short-code security tradeoff.
+
+### Root Cause
+
+- Admin Web can generate `.../s/<short-code>#/videos`, but the Danny app only parsed `/watch/<token>`, `#/watch/<token>`, `?token=`, and `?t=`.
+- Static servers without SPA fallback return a 404 for clean paths like `/s/<short-code>` before the app can boot. CSP errors such as `default-src 'none'` on that URL are usually from the server error response, not the Danny app.
+
+### Files Changed
+
+```txt
+bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/assets/app.js
+bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/index.html
+bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/.htaccess
+bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/_redirects
+bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/PUBLIC_SECURITY_README.md
+bom-media-api/session-log.md
+```
+
+### Verification Commands
+
+```bash
+node --check bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/assets/app.js
+grep -R "localStorage" bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/index.html bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/assets/app.js || true
+grep -R "accessToken\|refreshToken\|Authorization\|Bearer" bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/index.html bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/assets/app.js || true
+grep -R "/admin/" bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/index.html bom-media-sites/mau-lam-xong/danny/refactored_danny_public_site/assets/app.js || true
+yarn prisma generate
+yarn prisma validate
+yarn typecheck
+yarn lint
+yarn format:check
+yarn test
+yarn build
+find /Users/monarch/Desktop/bom-media -maxdepth 4 \( -name package-lock.json -o -name pnpm-lock.yaml \) -print
+```
+
+### Verification Result
+
+- Danny `assets/app.js` syntax check passed.
+- Danny public static grep checks returned no `localStorage`, admin auth token names, or `/admin/` media URL strings in `index.html`/`assets/app.js`.
+- Backend Prisma generate and validate passed.
+- Backend typecheck passed.
+- Backend format check passed.
+- Backend test suite passed: 37 tests.
+- Backend build passed.
+- Backend lint passed with existing warning-only `consistent-type-imports` findings.
+- npm/pnpm lockfile search returned no files.
+- Manual browser verification with a real short code is still required.
+
+### Manual Test Notes
+
+- Preferred new link: `https://<public-domain>/s/<short-code>#/videos`.
+- Hash-only local fallback when the dev server cannot rewrite clean paths: `http://127.0.0.1:5500/#/s/<short-code>/videos`.
+- Legacy links should still work: `?token=<legacy-token>#/videos`, `?t=<legacy-token>#/videos`, and `/watch/<legacy-token>#/videos`.
+- If a local link resolves to an invalid/empty watch response, confirm the backend share link is assigned to the exact host sent by the public site, such as `127.0.0.1:5500` versus the production domain.
+
+### Security And Rollback
+
+- Short visible codes weaken brute-force resistance compared with long opaque tokens; this is a customer-requested URL change. Keep public-watch throttling, host/domain validation, expiry, max-view limits, revocation, video membership checks, READY status checks, and protected media routes enabled.
+- Rollback path: remove `/s/` parsing from the public site, remove the fallback files if they are not needed, and generate/share legacy token URLs until public sites are updated again.
+
+### Next Recommended Prompt
+
+`Prompt — Run Danny public site browser smoke test for /s/<short-code>, legacy links, LOCAL_FILE playback, and host/domain mismatch handling`
+
+## 2026-06-17 — Short share-link aliases
+
+### Summary
+
+- Added nullable unique `ShareLink.alias` storage for short public share codes.
+- New share-link creation now generates both the legacy full raw token and a short URL-safe alias; the raw token is still hashed into `tokenHash`, while the alias is stored for short-link lookup.
+- New `publicUrl` values use `/s/<alias>#/videos` and no longer include `?token=`.
+- Public watch, LOCAL_FILE thumbnail/playback, DB_BLOB playback, and public view tracking now try alias lookup first and fall back to legacy hashed token lookup.
+- Admin share-link responses include the alias for operator visibility without exposing token hashes.
+
+### Files Changed
+
+```txt
+prisma/schema.prisma
+prisma/migrations/20260617000000_add_share_link_alias/migration.sql
+src/admin-websites/admin-websites.service.ts
+src/admin-websites/types/admin-share-link-response.type.ts
+src/admin-websites/utils/share-url.util.ts
+src/public/public.service.ts
+test/public-local-thumbnail.test.ts
+test/share-url-util.test.ts
+session-log.md
+```
+
+### Verification Commands
+
+```bash
+yarn db:local:generate
+yarn db:local:validate
+yarn typecheck
+yarn lint
+yarn format:check
+yarn test
+yarn build
+find . -maxdepth 3 \( -name package-lock.json -o -name pnpm-lock.yaml \) -print
+```
+
+### Verification Result
+
+- Prisma generate and validate passed.
+- Typecheck passed.
+- Format check passed after formatting `src/admin-websites/admin-websites.service.ts`.
+- Test suite passed: 37 tests.
+- Build passed.
+- Lint passed with the existing warning-only `consistent-type-imports` findings.
+- npm/pnpm lockfile search returned no files.
+
+### Manual Test Notes
+
+- New link example: `https://<public-domain>/s/<short-code>#/videos`.
+- Legacy link example still supported: `https://<public-domain>/?token=<legacy-share-token>#/videos`.
+- Browser testing should confirm the public static site parses `/s/<short-code>` and sends that code to `POST /api/v1/public/watch/exchange` or legacy `GET /api/v1/public/watch`.
+- If a static site only understands `/watch/<token>` or query tokens, it needs a small public-site parser update before `/s/<short-code>` links will load.
+
+### Security And Rollback
+
+- Short aliases are intentionally easier for customers to read and share, but they are weaker than long opaque share tokens because the searchable code space is smaller. Keep public-watch throttling, host/domain validation, expiry, max-view limits, and revocation enabled.
+- Rollback path: stop issuing new short links by reverting the URL/generation code, then roll back or ignore the nullable `ShareLink.alias` migration. If the migration has already deployed and must be removed, back up the DB first, remove any dependent code, and apply a controlled migration/drop in staging before production.
+
+### Known Limitations
+
+- Existing share links are not backfilled with aliases in this pass; they continue to work through the legacy token fallback.
+- No live browser/curl test with a real share link was performed in this session.
+
+### Next Recommended Prompt
+
+`Prompt — Update public static site token parser to support /s/<short-code> share links and run browser smoke tests`
+
 ## 2026-06-15 — Public watch exchange endpoint
 
 ### Summary

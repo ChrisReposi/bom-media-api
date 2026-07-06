@@ -7,7 +7,9 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { BadRequestException } from "@nestjs/common";
 import type { ApiEnvironmentConfig } from "../src/config/env.config";
 import {
+  AssignmentStatus,
   AuditStatus,
+  ShareLinkStatus,
   VideoProvider,
   VideoSourceType,
   VideoStatus,
@@ -39,9 +41,27 @@ type AuditRecord = {
   metadataJson: unknown;
 };
 
+type FakeWebsiteVideoRecord = {
+  videoId: string;
+  status: AssignmentStatus;
+};
+
+type FakeShareLinkRecord = {
+  id: string;
+  status: ShareLinkStatus;
+};
+
+type FakeShareLinkVideoRecord = {
+  shareLinkId: string;
+  videoId: string;
+};
+
 class FakePrismaService {
   readonly videos = new Map<string, FakeVideoRecord>();
   readonly audits: AuditRecord[] = [];
+  readonly websiteVideos: FakeWebsiteVideoRecord[] = [];
+  readonly shareLinks = new Map<string, FakeShareLinkRecord>();
+  readonly shareLinkVideos: FakeShareLinkVideoRecord[] = [];
   websiteAssignmentCount = 0;
   shareLinkVideoCount = 0;
   deletedVideoIds: string[] = [];
@@ -77,11 +97,88 @@ class FakePrismaService {
   };
 
   websiteVideo = {
-    count: async (): Promise<number> => this.websiteAssignmentCount,
+    count: async (args?: {
+      where?: { videoId?: string; status?: AssignmentStatus };
+    }): Promise<number> => {
+      if (this.websiteVideos.length === 0) {
+        return this.websiteAssignmentCount;
+      }
+
+      return this.websiteVideos.filter((assignment) => {
+        if (
+          args?.where?.videoId !== undefined &&
+          assignment.videoId !== args.where.videoId
+        ) {
+          return false;
+        }
+
+        if (
+          args?.where?.status !== undefined &&
+          assignment.status !== args.where.status
+        ) {
+          return false;
+        }
+
+        return true;
+      }).length;
+    },
   };
 
   shareLinkVideo = {
-    count: async (): Promise<number> => this.shareLinkVideoCount,
+    count: async (args?: { where?: { videoId?: string } }): Promise<number> => {
+      if (this.shareLinkVideos.length === 0) {
+        return this.shareLinkVideoCount;
+      }
+
+      return this.shareLinkVideos.filter((relation) => {
+        return (
+          args?.where?.videoId === undefined ||
+          relation.videoId === args.where.videoId
+        );
+      }).length;
+    },
+    deleteMany: async (args: {
+      where: { videoId: string };
+    }): Promise<{ count: number }> => {
+      const beforeCount = this.shareLinkVideos.length;
+      const remaining = this.shareLinkVideos.filter(
+        (relation) => relation.videoId !== args.where.videoId,
+      );
+      this.shareLinkVideos.length = 0;
+      this.shareLinkVideos.push(...remaining);
+
+      return { count: beforeCount - remaining.length };
+    },
+  };
+
+  shareLink = {
+    updateMany: async (args: {
+      where: {
+        status: ShareLinkStatus;
+        shareLinkVideos: { some: { videoId: string } };
+      };
+      data: { status: ShareLinkStatus };
+    }): Promise<{ count: number }> => {
+      const relatedShareLinkIds = new Set(
+        this.shareLinkVideos
+          .filter(
+            (relation) =>
+              relation.videoId === args.where.shareLinkVideos.some.videoId,
+          )
+          .map((relation) => relation.shareLinkId),
+      );
+      let count = 0;
+
+      for (const shareLinkId of relatedShareLinkIds) {
+        const shareLink = this.shareLinks.get(shareLinkId);
+        if (shareLink?.status === args.where.status) {
+          shareLink.status = args.data.status;
+          count += 1;
+        }
+      }
+
+      return { count };
+    },
   };
 
   adminAuditLog = {
@@ -183,6 +280,24 @@ function createVideo(
   };
 }
 
+function addShareLinkRelation(
+  prisma: FakePrismaService,
+  params: {
+    shareLinkId: string;
+    videoId: string;
+    status?: ShareLinkStatus;
+  },
+): void {
+  prisma.shareLinks.set(params.shareLinkId, {
+    id: params.shareLinkId,
+    status: params.status ?? ShareLinkStatus.ACTIVE,
+  });
+  prisma.shareLinkVideos.push({
+    shareLinkId: params.shareLinkId,
+    videoId: params.videoId,
+  });
+}
+
 function createVideosService(params?: {
   prisma?: FakePrismaService;
   localStorage?: FakeLocalStorageService;
@@ -221,7 +336,10 @@ describe("VideosService purge reclaim behavior", () => {
   it("rejects purge while assigned to a website", async () => {
     const { prisma, service } = createVideosService();
     prisma.videos.set("video-1", createVideo());
-    prisma.websiteAssignmentCount = 1;
+    prisma.websiteVideos.push({
+      videoId: "video-1",
+      status: AssignmentStatus.ACTIVE,
+    });
 
     await assert.rejects(
       service.purgeVideo("video-1", { confirmVideoId: "video-1" }, "admin-1"),
@@ -230,16 +348,54 @@ describe("VideosService purge reclaim behavior", () => {
     assert.deepEqual(prisma.deletedVideoIds, []);
   });
 
-  it("rejects purge while referenced by a share link", async () => {
+  it("rejects purge unless the video is already disabled", async () => {
     const { prisma, service } = createVideosService();
-    prisma.videos.set("video-1", createVideo());
-    prisma.shareLinkVideoCount = 1;
+    prisma.videos.set("video-1", createVideo({ status: VideoStatus.READY }));
 
     await assert.rejects(
       service.purgeVideo("video-1", { confirmVideoId: "video-1" }, "admin-1"),
       BadRequestException,
     );
     assert.deepEqual(prisma.deletedVideoIds, []);
+  });
+
+  it("purges a disabled video with old share-link rows by disabling and detaching them", async () => {
+    const { prisma, service } = createVideosService();
+    prisma.videos.set("video-1", createVideo());
+    prisma.videos.set("video-2", createVideo({ id: "video-2" }));
+    addShareLinkRelation(prisma, {
+      shareLinkId: "share-1",
+      videoId: "video-1",
+      status: ShareLinkStatus.ACTIVE,
+    });
+    addShareLinkRelation(prisma, {
+      shareLinkId: "share-2",
+      videoId: "video-2",
+      status: ShareLinkStatus.ACTIVE,
+    });
+
+    const result = await service.purgeVideo(
+      "video-1",
+      { confirmVideoId: "video-1" },
+      "admin-1",
+    );
+
+    assert.equal(result.status, "PURGED");
+    assert.equal(
+      prisma.shareLinks.get("share-1")?.status,
+      ShareLinkStatus.DISABLED,
+    );
+    assert.equal(
+      prisma.shareLinks.get("share-2")?.status,
+      ShareLinkStatus.ACTIVE,
+    );
+    assert.deepEqual(prisma.shareLinkVideos, [
+      { shareLinkId: "share-2", videoId: "video-2" },
+    ]);
+    assert.deepEqual(prisma.deletedVideoIds, ["video-1"]);
+    assert.equal(result.safety.hadShareLinks, true);
+    assert.equal(result.safety.disabledShareLinkCount, 1);
+    assert.equal(result.safety.detachedShareLinkVideoCount, 1);
   });
 
   it("purges LOCAL_FILE metadata and reports video/thumbnail reclaim", async () => {
@@ -258,6 +414,9 @@ describe("VideosService purge reclaim behavior", () => {
     assert.deepEqual(result.safety, {
       hadWebsiteAssignments: false,
       hadShareLinks: false,
+      activeWebsiteAssignmentCount: 0,
+      disabledShareLinkCount: 0,
+      detachedShareLinkVideoCount: 0,
     });
     assert.deepEqual(result.storage, {
       localVideoDeleteAttempted: true,
@@ -282,6 +441,9 @@ describe("VideosService purge reclaim behavior", () => {
       sourceType: VideoSourceType.LOCAL_FILE,
       hadWebsiteAssignments: false,
       hadShareLinks: false,
+      activeWebsiteAssignmentCount: 0,
+      disabledShareLinkCount: 0,
+      detachedShareLinkVideoCount: 0,
       deleteRemoteAsset: false,
       remoteAssetDeleteAttempted: false,
       remoteAssetDeleted: false,
@@ -327,6 +489,54 @@ describe("VideosService purge reclaim behavior", () => {
     assert.equal(result.message, "Video disabled successfully.");
     assert.equal(prisma.videos.get("video-1")?.status, VideoStatus.DISABLED);
     assert.deepEqual(localStorage.deleteCalls, []);
+  });
+
+  it("soft disable disables related active share links but not unrelated links", async () => {
+    const { prisma, service } = createVideosService();
+    prisma.videos.set("video-1", createVideo({ status: VideoStatus.READY }));
+    prisma.videos.set(
+      "video-2",
+      createVideo({ id: "video-2", status: VideoStatus.READY }),
+    );
+    addShareLinkRelation(prisma, {
+      shareLinkId: "share-1",
+      videoId: "video-1",
+      status: ShareLinkStatus.ACTIVE,
+    });
+    addShareLinkRelation(prisma, {
+      shareLinkId: "share-2",
+      videoId: "video-2",
+      status: ShareLinkStatus.ACTIVE,
+    });
+
+    await service.disableVideo("video-1", "admin-1");
+
+    assert.equal(prisma.videos.get("video-1")?.status, VideoStatus.DISABLED);
+    assert.equal(
+      prisma.shareLinks.get("share-1")?.status,
+      ShareLinkStatus.DISABLED,
+    );
+    assert.equal(
+      prisma.shareLinks.get("share-2")?.status,
+      ShareLinkStatus.ACTIVE,
+    );
+  });
+
+  it("soft disable remediates old active share links for already disabled videos", async () => {
+    const { prisma, service } = createVideosService();
+    prisma.videos.set("video-1", createVideo({ status: VideoStatus.DISABLED }));
+    addShareLinkRelation(prisma, {
+      shareLinkId: "share-1",
+      videoId: "video-1",
+      status: ShareLinkStatus.ACTIVE,
+    });
+
+    await service.disableVideo("video-1", "admin-1");
+
+    assert.equal(
+      prisma.shareLinks.get("share-1")?.status,
+      ShareLinkStatus.DISABLED,
+    );
   });
 });
 

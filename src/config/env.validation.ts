@@ -18,6 +18,13 @@ const DEFAULT_LOCAL_VIDEO_UPLOAD_SESSION_TTL_MINUTES = 120;
 const DEFAULT_LOCAL_VIDEO_MIN_FREE_SPACE_MB = 1024;
 const DEFAULT_LOCAL_VIDEO_STALE_UPLOAD_MAX_AGE_HOURS = 24;
 const DEFAULT_LOCAL_THUMBNAIL_UPLOAD_MB = 10;
+const DEFAULT_MEMORY_CACHE_MAX_ENTRIES = 1000;
+const DEFAULT_MEMORY_CACHE_DEFAULT_TTL_SECONDS = 60;
+const DEFAULT_MEMORY_CACHE_INFLIGHT_TTL_MS = 5000;
+const DEFAULT_ADMIN_VIDEOS_LIST_CACHE_TTL_SECONDS = 30;
+const DEFAULT_ADMIN_WEBSITES_LIST_CACHE_TTL_SECONDS = 60;
+const DEFAULT_PUBLIC_WATCH_METADATA_CACHE_TTL_SECONDS = 10;
+const DEFAULT_MEDIA_METADATA_CACHE_TTL_SECONDS = 300;
 const PROTOCOL_VALUES = new Set(["http", "https"]);
 const JWT_EXPIRES_IN_PATTERN = /^\d+[smhd]?$/;
 
@@ -103,6 +110,22 @@ function readPositiveInteger(
 
   if (!Number.isInteger(value) || value <= 0) {
     throw new Error(`${key} must be a positive integer`);
+  }
+
+  return value;
+}
+
+function readBoundedInteger(
+  config: Record<string, unknown>,
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const value = readPositiveInteger(config, key, fallback);
+
+  if (value < min || value > max) {
+    throw new Error(`${key} must be between ${min} and ${max}`);
   }
 
   return value;
@@ -320,6 +343,75 @@ export function validateEnv(
     config,
     "TRUST_PROXY_CLOUDFLARE_ONLY",
     false,
+  );
+
+  validated.MEMORY_CACHE_ENABLED = readBoolean(
+    config,
+    "MEMORY_CACHE_ENABLED",
+    true,
+  );
+  validated.MEMORY_CACHE_MAX_ENTRIES = String(
+    readBoundedInteger(
+      config,
+      "MEMORY_CACHE_MAX_ENTRIES",
+      DEFAULT_MEMORY_CACHE_MAX_ENTRIES,
+      100,
+      10_000,
+    ),
+  );
+  validated.MEMORY_CACHE_DEFAULT_TTL_SECONDS = String(
+    readBoundedInteger(
+      config,
+      "MEMORY_CACHE_DEFAULT_TTL_SECONDS",
+      DEFAULT_MEMORY_CACHE_DEFAULT_TTL_SECONDS,
+      1,
+      600,
+    ),
+  );
+  validated.MEMORY_CACHE_INFLIGHT_TTL_MS = String(
+    readBoundedInteger(
+      config,
+      "MEMORY_CACHE_INFLIGHT_TTL_MS",
+      DEFAULT_MEMORY_CACHE_INFLIGHT_TTL_MS,
+      500,
+      30_000,
+    ),
+  );
+  validated.ADMIN_VIDEOS_LIST_CACHE_TTL_SECONDS = String(
+    readBoundedInteger(
+      config,
+      "ADMIN_VIDEOS_LIST_CACHE_TTL_SECONDS",
+      DEFAULT_ADMIN_VIDEOS_LIST_CACHE_TTL_SECONDS,
+      1,
+      600,
+    ),
+  );
+  validated.ADMIN_WEBSITES_LIST_CACHE_TTL_SECONDS = String(
+    readBoundedInteger(
+      config,
+      "ADMIN_WEBSITES_LIST_CACHE_TTL_SECONDS",
+      DEFAULT_ADMIN_WEBSITES_LIST_CACHE_TTL_SECONDS,
+      1,
+      600,
+    ),
+  );
+  validated.PUBLIC_WATCH_METADATA_CACHE_TTL_SECONDS = String(
+    readBoundedInteger(
+      config,
+      "PUBLIC_WATCH_METADATA_CACHE_TTL_SECONDS",
+      DEFAULT_PUBLIC_WATCH_METADATA_CACHE_TTL_SECONDS,
+      1,
+      60,
+    ),
+  );
+  validated.MEDIA_METADATA_CACHE_TTL_SECONDS = String(
+    readBoundedInteger(
+      config,
+      "MEDIA_METADATA_CACHE_TTL_SECONDS",
+      DEFAULT_MEDIA_METADATA_CACHE_TTL_SECONDS,
+      1,
+      3600,
+    ),
   );
 
   validated.GLOBAL_THROTTLE_TTL_SECONDS = String(

@@ -4,8 +4,11 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
+import { buildCacheKey } from "../cache/memory-cache-key.util";
+import { MemoryCacheService } from "../cache/memory-cache.service";
 import { PrismaService } from "../database/prisma.service";
 import { Prisma } from "../generated/prisma/client";
 import {
@@ -163,6 +166,7 @@ export class AdminWebsitesService {
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
     private readonly corsOriginService: CorsOriginService,
+    @Optional() private readonly memoryCache?: MemoryCacheService,
   ) {}
 
   async listDomainGroups(
@@ -239,6 +243,7 @@ export class AdminWebsitesService {
       group.id,
       { key: group.key },
     );
+    this.invalidateWebsiteCaches();
 
     return this.toDomainGroupResponse(group);
   }
@@ -289,6 +294,7 @@ export class AdminWebsitesService {
       group.id,
       { key: group.key, status: group.status },
     );
+    this.invalidateWebsiteCaches();
 
     return this.toDomainGroupResponse(group);
   }
@@ -319,6 +325,7 @@ export class AdminWebsitesService {
         id,
         { key: existingGroup.key, previousStatus: existingGroup.status },
       );
+      this.invalidateWebsiteCaches();
     }
 
     return { message: "Domain group disabled successfully." };
@@ -413,6 +420,7 @@ export class AdminWebsitesService {
       },
     );
     this.clearCorsDomainCache();
+    this.invalidateWebsiteCaches();
 
     return this.toAdminDomainResponse(domainRecord);
   }
@@ -487,6 +495,7 @@ export class AdminWebsitesService {
       },
     );
     this.clearCorsDomainCache();
+    this.invalidateWebsiteCaches();
 
     return this.toAdminDomainResponse(domainRecord);
   }
@@ -530,6 +539,7 @@ export class AdminWebsitesService {
       { domain: domainRecord.domain },
     );
     this.clearCorsDomainCache();
+    this.invalidateWebsiteCaches();
 
     return this.toAdminDomainResponse(domainRecord);
   }
@@ -562,6 +572,7 @@ export class AdminWebsitesService {
       { domain: domainRecord.domain },
     );
     this.clearCorsDomainCache();
+    this.invalidateWebsiteCaches();
 
     return this.toAdminDomainResponse(domainRecord);
   }
@@ -619,6 +630,7 @@ export class AdminWebsitesService {
       { domain: domainRecord.domain, previousWebsiteId },
     );
     this.clearCorsDomainCache();
+    this.invalidateWebsiteCaches();
 
     return this.toAdminDomainResponse(domainRecord);
   }
@@ -628,6 +640,22 @@ export class AdminWebsitesService {
   ): Promise<AdminWebsiteListResponse> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
+    const cacheKey = this.buildAdminWebsitesListCacheKey(query, page, limit);
+    const loader = () => this.loadWebsitesFromDatabase(query, page, limit);
+
+    return (
+      this.memoryCache?.getOrSet(cacheKey, loader, {
+        ttlSeconds:
+          this.memoryCache.getRuntimeConfig().adminWebsitesListTtlSeconds,
+      }) ?? loader()
+    );
+  }
+
+  private async loadWebsitesFromDatabase(
+    query: ListWebsitesQueryDto,
+    page: number,
+    limit: number,
+  ): Promise<AdminWebsiteListResponse> {
     const skip = (page - 1) * limit;
     const where = this.buildWebsiteWhere(query);
 
@@ -732,6 +760,7 @@ export class AdminWebsitesService {
     await this.writeAudit(adminId, "WEBSITE_CREATE", "Website", website.id, {
       slug: website.slug,
     });
+    this.invalidateWebsiteCaches();
 
     return this.toWebsiteResponse(website);
   }
@@ -802,6 +831,7 @@ export class AdminWebsitesService {
     if (dto.status !== undefined) {
       this.clearCorsDomainCache();
     }
+    this.invalidateWebsiteCaches();
 
     return this.toWebsiteResponse(website);
   }
@@ -829,6 +859,7 @@ export class AdminWebsitesService {
         previousStatus: existingWebsite.status,
       });
       this.clearCorsDomainCache();
+      this.invalidateWebsiteCaches();
     }
 
     return { message: "Website disabled successfully." };
@@ -879,6 +910,7 @@ export class AdminWebsitesService {
       { domain: domainRecord.domain, websiteId },
     );
     this.clearCorsDomainCache();
+    this.invalidateWebsiteCaches();
 
     return this.toDomainResponse(domainRecord);
   }
@@ -942,6 +974,7 @@ export class AdminWebsitesService {
       { domain: domainRecord.domain, websiteId },
     );
     this.clearCorsDomainCache();
+    this.invalidateWebsiteCaches();
 
     return this.toDomainResponse(domainRecord);
   }
@@ -1018,6 +1051,7 @@ export class AdminWebsitesService {
       },
     );
     this.clearCorsDomainCache();
+    this.invalidateWebsiteCaches();
 
     return this.toDomainResponse(domainRecord);
   }
@@ -1118,6 +1152,7 @@ export class AdminWebsitesService {
       },
     );
     this.clearCorsDomainCache();
+    this.invalidateWebsiteCaches();
 
     return this.toDomainResponse(assignedDomain);
   }
@@ -1187,6 +1222,7 @@ export class AdminWebsitesService {
       websiteId,
       { count: assignments.length },
     );
+    this.invalidatePublicAccessCaches();
 
     return {
       items: assignments.map((assignment) =>
@@ -1358,6 +1394,7 @@ export class AdminWebsitesService {
         shareLink.id,
         { websiteId, videoCount: shareLink.shareLinkVideos.length },
       );
+      this.invalidatePublicAccessCaches();
 
       stage = "build-response";
       return {
@@ -1420,11 +1457,44 @@ export class AdminWebsitesService {
       shareLink.id,
       { previousStatus: existingShareLink.status },
     );
+    this.invalidatePublicAccessCaches();
 
     return {
       message: "Share link revoked successfully.",
       shareLink: this.toShareLinkResponse(shareLink, null),
     };
+  }
+
+  private buildAdminWebsitesListCacheKey(
+    query: ListWebsitesQueryDto,
+    page: number,
+    limit: number,
+  ): string {
+    return buildCacheKey(
+      "admin:websites:list",
+      page,
+      limit,
+      this.normalizeCacheText(query.search),
+      this.normalizeCacheText(query.domain),
+      this.normalizeCacheText(query.domainGroupKey),
+      query.status ?? "all",
+    );
+  }
+
+  private normalizeCacheText(value: string | undefined): string {
+    return value === undefined
+      ? ""
+      : value.normalize("NFC").trim().replace(/\s+/g, " ");
+  }
+
+  private invalidateWebsiteCaches(): void {
+    this.memoryCache?.deleteByPrefix("admin:websites:");
+    this.invalidatePublicAccessCaches();
+  }
+
+  private invalidatePublicAccessCaches(): void {
+    this.memoryCache?.deleteByPrefix("public:watch:");
+    this.memoryCache?.deleteByPrefix("media:metadata:");
   }
 
   private buildWebsiteWhere(query: ListWebsitesQueryDto): WebsiteWhereInput {
@@ -1651,6 +1721,7 @@ export class AdminWebsitesService {
       });
 
       this.clearCorsDomainCache();
+      this.invalidateWebsiteCaches();
 
       return assignedDomain;
     }
@@ -1731,6 +1802,7 @@ export class AdminWebsitesService {
       },
     );
     this.clearCorsDomainCache();
+    this.invalidateWebsiteCaches();
 
     return assignedDomain;
   }

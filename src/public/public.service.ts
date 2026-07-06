@@ -1,5 +1,15 @@
-import { Injectable, Logger, NotFoundException } from "@nestjs/common";
+import {
+  Injectable,
+  Logger,
+  NotFoundException,
+  Optional,
+} from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
+import {
+  buildCacheKey,
+  hashCacheKeyPart,
+} from "../cache/memory-cache-key.util";
+import { MemoryCacheService } from "../cache/memory-cache.service";
 import { PrismaService } from "../database/prisma.service";
 import { Prisma } from "../generated/prisma/client";
 import {
@@ -118,6 +128,17 @@ type ShareLinkWhereInput = Prisma.Args<
   "updateMany"
 >["where"];
 
+type ShareLinkViewPolicy = Pick<
+  ShareLink,
+  "id" | "status" | "expiresAt" | "maxViews" | "currentViews"
+>;
+
+type CachedPublicWatchMetadata = {
+  website: Pick<Website, "id" | "name" | "slug">;
+  shareLink: ShareLinkViewPolicy;
+  videos: PublicWatchVideoWithBinary[];
+};
+
 @Injectable()
 export class PublicService {
   private readonly logger = new Logger(PublicService.name);
@@ -127,9 +148,42 @@ export class PublicService {
     private readonly configService: ConfigService,
     private readonly localVideoStorageService: LocalVideoStorageService,
     private readonly videoViewGrowthService: VideoViewGrowthService,
+    @Optional() private readonly memoryCache?: MemoryCacheService,
   ) {}
 
   async resolvePublicWatch(
+    params: ResolvePublicWatchParams,
+  ): Promise<PublicWatchResponse> {
+    const normalizedHost = normalizePublicHost(params.host);
+    const trimmedToken = params.token?.trim();
+
+    if (normalizedHost !== null && trimmedToken) {
+      const cacheKey = this.buildPublicWatchCacheKey(
+        normalizedHost,
+        trimmedToken,
+      );
+      const cachedMetadata =
+        this.memoryCache?.get<CachedPublicWatchMetadata>(cacheKey) ?? null;
+
+      if (cachedMetadata !== null) {
+        const cachedResponse = await this.resolveCachedPublicWatch({
+          params,
+          cacheKey,
+          normalizedHost,
+          trimmedToken,
+          cachedMetadata,
+        });
+
+        if (cachedResponse !== null) {
+          return cachedResponse;
+        }
+      }
+    }
+
+    return this.resolvePublicWatchUncached(params);
+  }
+
+  private async resolvePublicWatchUncached(
     params: ResolvePublicWatchParams,
   ): Promise<PublicWatchResponse> {
     const normalizedHost = normalizePublicHost(params.host);
@@ -333,6 +387,13 @@ export class PublicService {
       shareLinkId: shareLink.id,
       requestMeta: params.requestMeta,
     });
+    this.writePublicWatchCache({
+      normalizedHost,
+      trimmedToken,
+      website,
+      shareLink,
+      now,
+    });
 
     return {
       valid: true,
@@ -439,8 +500,154 @@ export class PublicService {
     };
   }
 
-  private getDeniedReason(
+  private async resolveCachedPublicWatch(params: {
+    params: ResolvePublicWatchParams;
+    cacheKey: string;
+    normalizedHost: string;
+    trimmedToken: string;
+    cachedMetadata: CachedPublicWatchMetadata;
+  }): Promise<PublicWatchResponse | null> {
+    const now = new Date();
+    const deniedReason = this.getDeniedReason(
+      params.cachedMetadata.shareLink,
+      now,
+    );
+    if (deniedReason !== null) {
+      this.memoryCache?.delete(params.cacheKey);
+      return null;
+    }
+
+    const videos = this.toPublicVideoResponses(params.cachedMetadata.videos, {
+      host: params.normalizedHost,
+      token: params.trimmedToken,
+    });
+    if (videos.length === 0) {
+      this.memoryCache?.delete(params.cacheKey);
+      return null;
+    }
+
+    const viewIncremented = await this.incrementShareLinkView(
+      params.cachedMetadata.shareLink,
+      now,
+    );
+    if (!viewIncremented) {
+      this.memoryCache?.delete(params.cacheKey);
+      return this.resolvePublicWatchUncached(params.params);
+    }
+
+    await this.writeAccessLog({
+      domain: params.normalizedHost,
+      reasonCode: "OK",
+      status: AccessLogStatus.ALLOWED,
+      websiteId: params.cachedMetadata.website.id,
+      shareLinkId: params.cachedMetadata.shareLink.id,
+      requestMeta: params.params.requestMeta,
+    });
+
+    return {
+      valid: true,
+      reasonCode: "OK",
+      website: this.toPublicWebsiteResponse(
+        params.cachedMetadata.website,
+        params.normalizedHost,
+      ),
+      videos,
+    };
+  }
+
+  private writePublicWatchCache(params: {
+    normalizedHost: string;
+    trimmedToken: string;
+    website: Pick<Website, "id" | "name" | "slug">;
+    shareLink: ShareLinkWithVideos;
+    now: Date;
+  }): void {
+    if (this.memoryCache === undefined) {
+      return;
+    }
+
+    const ttlSeconds =
+      this.memoryCache.getRuntimeConfig().publicWatchMetadataTtlSeconds;
+    if (
+      !this.canCachePublicWatchShareLink(
+        params.shareLink,
+        params.now,
+        ttlSeconds,
+      )
+    ) {
+      return;
+    }
+
+    const videos = params.shareLink.shareLinkVideos
+      .map(({ video }) => video)
+      .filter((video) => this.isPublicPlayableVideo(video));
+    if (videos.length === 0) {
+      return;
+    }
+
+    this.memoryCache.set(
+      this.buildPublicWatchCacheKey(params.normalizedHost, params.trimmedToken),
+      {
+        website: {
+          id: params.website.id,
+          name: params.website.name,
+          slug: params.website.slug,
+        },
+        shareLink: {
+          id: params.shareLink.id,
+          status: params.shareLink.status,
+          expiresAt: params.shareLink.expiresAt,
+          maxViews: params.shareLink.maxViews,
+          currentViews: params.shareLink.currentViews,
+        },
+        videos,
+      } satisfies CachedPublicWatchMetadata,
+      { ttlSeconds },
+    );
+  }
+
+  private canCachePublicWatchShareLink(
     shareLink: ShareLink,
+    now: Date,
+    ttlSeconds: number,
+  ): boolean {
+    if (shareLink.status !== ShareLinkStatus.ACTIVE) {
+      return false;
+    }
+
+    if (shareLink.maxViews !== null) {
+      return false;
+    }
+
+    if (
+      shareLink.expiresAt !== null &&
+      shareLink.expiresAt.getTime() - now.getTime() <= ttlSeconds * 1000
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private buildPublicWatchCacheKey(host: string, tokenOrAlias: string): string {
+    return buildCacheKey("public:watch", host, hashCacheKeyPart(tokenOrAlias));
+  }
+
+  private buildPublicLocalMediaMetadataCacheKey(
+    host: string,
+    tokenOrAlias: string,
+    videoId: string,
+  ): string {
+    return buildCacheKey(
+      "media:metadata:public:local-video",
+      host,
+      hashCacheKeyPart(tokenOrAlias),
+      videoId,
+    );
+  }
+
+  private getDeniedReason(
+    shareLink: ShareLinkViewPolicy,
     now: Date,
   ): PublicWatchReasonCode | null {
     if (shareLink.status !== ShareLinkStatus.ACTIVE) {
@@ -462,7 +669,7 @@ export class PublicService {
   }
 
   private async incrementShareLinkView(
-    shareLink: ShareLink,
+    shareLink: ShareLinkViewPolicy,
     now: Date,
   ): Promise<boolean> {
     const where: ShareLinkWhereInput = {
@@ -491,8 +698,17 @@ export class PublicService {
     shareLink: ShareLinkWithVideos,
     playbackContext: { host: string; token: string },
   ): PublicWatchVideoResponse[] {
-    return shareLink.shareLinkVideos
-      .map(({ video }) => video)
+    return this.toPublicVideoResponses(
+      shareLink.shareLinkVideos.map(({ video }) => video),
+      playbackContext,
+    );
+  }
+
+  private toPublicVideoResponses(
+    videos: PublicWatchVideoWithBinary[],
+    playbackContext: { host: string; token: string },
+  ): PublicWatchVideoResponse[] {
+    return videos
       .filter((video) => this.isPublicPlayableVideo(video))
       .map((video) => {
         const binaryPlaybackUrl =
@@ -772,8 +988,42 @@ export class PublicService {
       throw new NotFoundException("Video not found.");
     }
 
+    const cacheKey = this.buildPublicLocalMediaMetadataCacheKey(
+      normalizedHost,
+      trimmedToken,
+      params.videoId,
+    );
+    const cachedVideo =
+      this.memoryCache?.get<PublicWatchVideoWithBinary>(cacheKey) ?? null;
+    if (cachedVideo !== null) {
+      return cachedVideo;
+    }
+
+    const { shareLink, video } = await this.loadAuthorizedPublicLocalVideo({
+      normalizedHost,
+      trimmedToken,
+      videoId: params.videoId,
+    });
+    const ttlSeconds =
+      this.memoryCache?.getRuntimeConfig().mediaMetadataTtlSeconds ?? null;
+    if (
+      this.memoryCache !== undefined &&
+      ttlSeconds !== null &&
+      this.canCachePublicWatchShareLink(shareLink, new Date(), ttlSeconds)
+    ) {
+      this.memoryCache.set(cacheKey, video, { ttlSeconds });
+    }
+
+    return video;
+  }
+
+  private async loadAuthorizedPublicLocalVideo(params: {
+    normalizedHost: string;
+    trimmedToken: string;
+    videoId: string;
+  }): Promise<{ shareLink: ShareLink; video: PublicWatchVideoWithBinary }> {
     const domainRecord = await this.prisma.websiteDomain.findUnique({
-      where: { domain: normalizedHost },
+      where: { domain: params.normalizedHost },
       include: { website: true },
     });
 
@@ -799,7 +1049,7 @@ export class PublicService {
 
     const tokenHash = hashShareToken({
       pepper: tokenPepper,
-      token: trimmedToken,
+      token: params.trimmedToken,
     });
 
     const localVideoInclude = {
@@ -834,7 +1084,7 @@ export class PublicService {
     const shareLink =
       (await this.prisma.shareLink.findFirst({
         where: {
-          alias: trimmedToken,
+          alias: params.trimmedToken,
           websiteId: domainRecord.website.id,
         },
         include: localVideoInclude,
@@ -865,7 +1115,7 @@ export class PublicService {
       throw new NotFoundException("Video not found.");
     }
 
-    return video;
+    return { shareLink, video };
   }
 
   private async getAuthorizedPublicVideoForView(params: {
@@ -1163,7 +1413,7 @@ export class PublicService {
   }
 
   private toPublicWebsiteResponse(
-    website: Website,
+    website: Pick<Website, "id" | "name" | "slug">,
     domain: string | null,
   ): PublicWatchWebsiteResponse {
     return {
@@ -1176,7 +1426,7 @@ export class PublicService {
 
   private invalidResponse(
     reasonCode: PublicWatchReasonCode,
-    website?: Website,
+    website?: Pick<Website, "id" | "name" | "slug">,
     domain: string | null = null,
   ): PublicWatchResponse {
     return {

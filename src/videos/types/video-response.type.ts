@@ -170,6 +170,13 @@ export class VideoResponse {
   @ApiProperty({ enum: VideoStatus, example: VideoStatus.READY })
   status!: VideoStatus;
 
+  @ApiPropertyOptional({
+    example: "sml",
+    nullable: true,
+    description: "Optional short grouping key used for admin filtering.",
+  })
+  filterKey!: string | null;
+
   @ApiPropertyOptional({ example: { source: "cloudinary" }, nullable: true })
   metadataJson!: unknown;
 
@@ -268,11 +275,17 @@ export class PurgeVideoResponse {
     example: {
       hadWebsiteAssignments: false,
       hadShareLinks: false,
+      activeWebsiteAssignmentCount: 0,
+      disabledShareLinkCount: 0,
+      detachedShareLinkVideoCount: 0,
     },
   })
   safety!: {
     hadWebsiteAssignments: boolean;
     hadShareLinks: boolean;
+    activeWebsiteAssignmentCount: number;
+    disabledShareLinkCount: number;
+    detachedShareLinkVideoCount: number;
   };
 
   @ApiProperty({

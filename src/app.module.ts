@@ -10,6 +10,7 @@ import { AppService } from "./app.service";
 import { apiConfig } from "./config/env.config";
 import { validateEnv } from "./config/env.validation";
 import { loadApiEnv } from "./config/load-env";
+import { MemoryCacheModule } from "./cache/memory-cache.module";
 import { DatabaseModule } from "./database/database.module";
 import { HealthModule } from "./health/health.module";
 import { PublicModule } from "./public/public.module";
@@ -100,6 +101,7 @@ function serializeRequestForLogs(
       inject: [ConfigService],
       useFactory: buildThrottlerOptions,
     }),
+    MemoryCacheModule,
     DatabaseModule,
     SecurityModule,
     HealthModule,

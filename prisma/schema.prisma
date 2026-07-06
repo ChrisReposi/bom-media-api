@@ -183,6 +183,7 @@ model VideoAsset {
   viewCount       BigInt          @default(0)
   publishedAt     DateTime?
   status          VideoStatus     @default(DRAFT)
+  filterKey       String?         @db.VarChar(64)
   metadataJson    Json?
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
@@ -197,6 +198,9 @@ model VideoAsset {
   viewGrowthEvents  VideoViewGrowthEvent[]
 
   @@index([status])
+  @@index([status, createdAt])
+  @@index([filterKey])
+  @@index([filterKey, status, createdAt])
   @@index([provider, providerAssetId])
   @@index([createdAt])
   @@index([publishedAt])

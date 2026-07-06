@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import { describe, it } from "node:test";
 import { NotFoundException } from "@nestjs/common";
+import { MemoryCacheService } from "../src/cache/memory-cache.service";
+import type { MemoryCacheRuntimeConfig } from "../src/cache/memory-cache.types";
 import {
   AccessLogStatus,
   DomainStatus,
@@ -19,6 +21,17 @@ const shareAlias = "AbCd123";
 const tokenPepper = "test-share-token-pepper";
 const tokenHash = hashShareToken({ pepper: tokenPepper, token });
 const host = "localhost:5500";
+
+const defaultMemoryCacheConfig: MemoryCacheRuntimeConfig = {
+  enabled: true,
+  maxEntries: 1000,
+  defaultTtlSeconds: 60,
+  inflightTtlMs: 5000,
+  adminVideosListTtlSeconds: 30,
+  adminWebsitesListTtlSeconds: 60,
+  publicWatchMetadataTtlSeconds: 10,
+  mediaMetadataTtlSeconds: 300,
+};
 
 type FakeVideo = {
   id: string;
@@ -80,8 +93,21 @@ class FakeConfigService {
   }
 }
 
+class FakeMemoryCacheConfigService {
+  get<T = unknown>(key: string): T | undefined {
+    if (key === "api") {
+      return { memoryCache: defaultMemoryCacheConfig } as T;
+    }
+
+    return undefined;
+  }
+}
+
 class FakePrismaService {
   shareLinkRecord: FakeShareLink;
+  websiteDomainFindUniqueCalls = 0;
+  shareLinkFindFirstCalls = 0;
+  shareLinkUpdateManyCalls = 0;
   readonly accessLogs: Array<{
     status: AccessLogStatus;
     reasonCode: string;
@@ -103,6 +129,7 @@ class FakePrismaService {
 
   websiteDomain = {
     findUnique: async (args: { where: { domain: string } }) => {
+      this.websiteDomainFindUniqueCalls += 1;
       if (args.where.domain !== host) {
         return null;
       }
@@ -130,6 +157,7 @@ class FakePrismaService {
         };
       };
     }) => {
+      this.shareLinkFindFirstCalls += 1;
       if (
         args.where.websiteId !== this.shareLinkRecord.websiteId ||
         (args.where.alias !== undefined &&
@@ -155,6 +183,7 @@ class FakePrismaService {
       };
     },
     updateMany: async (): Promise<{ count: number }> => {
+      this.shareLinkUpdateManyCalls += 1;
       this.shareLinkRecord.currentViews += 1;
 
       return { count: 1 };
@@ -220,7 +249,14 @@ function createLocalFileVideo(overrides: Partial<FakeVideo> = {}): FakeVideo {
   };
 }
 
-function createService(video: FakeVideo): {
+function createMemoryCache(): MemoryCacheService {
+  return new MemoryCacheService(new FakeMemoryCacheConfigService() as never);
+}
+
+function createService(
+  video: FakeVideo,
+  options: { memoryCache?: boolean } = {},
+): {
   prisma: FakePrismaService;
   service: PublicService;
 } {
@@ -230,6 +266,7 @@ function createService(video: FakeVideo): {
     new FakeConfigService() as never,
     new FakeLocalVideoStorageService() as never,
     new FakeVideoViewGrowthService() as never,
+    options.memoryCache === true ? createMemoryCache() : undefined,
   );
 
   return { prisma, service };
@@ -345,5 +382,50 @@ describe("PublicService LOCAL_FILE thumbnail serialization", () => {
         error instanceof NotFoundException &&
         error.message === "Video not found.",
     );
+  });
+
+  it("caches safe public watch metadata while preserving view and access-log side effects", async () => {
+    const { prisma, service } = createService(createLocalFileVideo(), {
+      memoryCache: true,
+    });
+
+    const first = await service.resolvePublicWatch({ host, token });
+    const second = await service.resolvePublicWatch({ host, token });
+
+    assert.equal(first.valid, true);
+    assert.equal(second.valid, true);
+    assert.equal(prisma.websiteDomainFindUniqueCalls, 1);
+    assert.equal(prisma.shareLinkFindFirstCalls, 2);
+    assert.equal(prisma.shareLinkUpdateManyCalls, 2);
+    assert.equal(prisma.shareLinkRecord.currentViews, 2);
+    assert.deepEqual(
+      prisma.accessLogs.map((log) => log.status),
+      [AccessLogStatus.ALLOWED, AccessLogStatus.ALLOWED],
+    );
+  });
+
+  it("does not cache max-view-limited public watch metadata", async () => {
+    const { prisma, service } = createService(createLocalFileVideo(), {
+      memoryCache: true,
+    });
+    prisma.shareLinkRecord.maxViews = 10;
+
+    await service.resolvePublicWatch({ host, token });
+    await service.resolvePublicWatch({ host, token });
+
+    assert.equal(prisma.shareLinkFindFirstCalls, 4);
+    assert.equal(prisma.shareLinkUpdateManyCalls, 2);
+    assert.equal(prisma.shareLinkRecord.currentViews, 2);
+  });
+
+  it("keeps public watch response generic after a share link is disabled", async () => {
+    const { service, prisma } = createService(createLocalFileVideo());
+    prisma.shareLinkRecord.status = ShareLinkStatus.DISABLED;
+
+    const response = await service.resolvePublicWatch({ host, token });
+
+    assert.equal(response.valid, false);
+    assert.equal(response.reasonCode, "INVALID_LINK");
+    assert.deepEqual(response.videos, []);
   });
 });

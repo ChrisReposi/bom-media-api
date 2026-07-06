@@ -22,6 +22,16 @@ export interface ApiEnvironmentConfig {
   trustProxyEnabled: boolean;
   trustProxyHops: number;
   trustProxyCloudflareOnly: boolean;
+  memoryCache: {
+    enabled: boolean;
+    maxEntries: number;
+    defaultTtlSeconds: number;
+    inflightTtlMs: number;
+    adminVideosListTtlSeconds: number;
+    adminWebsitesListTtlSeconds: number;
+    publicWatchMetadataTtlSeconds: number;
+    mediaMetadataTtlSeconds: number;
+  };
   throttles: {
     global: ThrottleProfileConfig;
     login: ThrottleProfileConfig;
@@ -97,6 +107,17 @@ function parsePositiveInteger(
     : fallback;
 }
 
+function parseBoundedInteger(
+  value: string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const parsedValue = parsePositiveInteger(value, fallback);
+
+  return Math.min(Math.max(parsedValue, min), max);
+}
+
 export const apiConfig = registerAs("api", (): ApiEnvironmentConfig => {
   const nodeEnv = process.env.NODE_ENV ?? "development";
   const appEnv = process.env.APP_ENV ?? nodeEnv;
@@ -138,6 +159,51 @@ export const apiConfig = registerAs("api", (): ApiEnvironmentConfig => {
       process.env.TRUST_PROXY_CLOUDFLARE_ONLY,
       false,
     ),
+    memoryCache: {
+      enabled: parseBoolean(process.env.MEMORY_CACHE_ENABLED, true),
+      maxEntries: parseBoundedInteger(
+        process.env.MEMORY_CACHE_MAX_ENTRIES,
+        1000,
+        100,
+        10_000,
+      ),
+      defaultTtlSeconds: parseBoundedInteger(
+        process.env.MEMORY_CACHE_DEFAULT_TTL_SECONDS,
+        60,
+        1,
+        600,
+      ),
+      inflightTtlMs: parseBoundedInteger(
+        process.env.MEMORY_CACHE_INFLIGHT_TTL_MS,
+        5000,
+        500,
+        30_000,
+      ),
+      adminVideosListTtlSeconds: parseBoundedInteger(
+        process.env.ADMIN_VIDEOS_LIST_CACHE_TTL_SECONDS,
+        30,
+        1,
+        600,
+      ),
+      adminWebsitesListTtlSeconds: parseBoundedInteger(
+        process.env.ADMIN_WEBSITES_LIST_CACHE_TTL_SECONDS,
+        60,
+        1,
+        600,
+      ),
+      publicWatchMetadataTtlSeconds: parseBoundedInteger(
+        process.env.PUBLIC_WATCH_METADATA_CACHE_TTL_SECONDS,
+        10,
+        1,
+        60,
+      ),
+      mediaMetadataTtlSeconds: parseBoundedInteger(
+        process.env.MEDIA_METADATA_CACHE_TTL_SECONDS,
+        300,
+        1,
+        3600,
+      ),
+    },
     throttles: {
       global: {
         ttlSeconds: parsePositiveInteger(

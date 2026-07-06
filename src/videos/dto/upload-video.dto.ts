@@ -12,8 +12,13 @@ import {
   Max,
   MaxLength,
   Min,
+  NotEquals,
 } from "class-validator";
 import { VideoStatus } from "../../generated/prisma/client";
+import {
+  VIDEO_FILTER_KEY_MAX_LENGTH,
+  normalizeVideoFilterKey,
+} from "../utils/video-filter-key.util";
 
 function toOptionalNumericString(value: unknown): string | undefined {
   if (value === undefined || value === null || value === "") {
@@ -102,6 +107,25 @@ export class UploadVideoDto {
   @IsOptional()
   @IsEnum(VideoStatus)
   status?: VideoStatus;
+
+  @ApiPropertyOptional({
+    example: "sml",
+    description:
+      "Optional short grouping key used for admin filtering, e.g. sml, msa, judge_judy.",
+    maxLength: VIDEO_FILTER_KEY_MAX_LENGTH,
+  })
+  @IsOptional()
+  @Transform(({ value }) => normalizeVideoFilterKey(value))
+  @IsString()
+  @MaxLength(VIDEO_FILTER_KEY_MAX_LENGTH)
+  @NotEquals("all", {
+    message: "filterKey must not be the reserved value all.",
+  })
+  @Matches(/^[a-z0-9]+(?:_[a-z0-9]+)*$/, {
+    message:
+      "filterKey must contain only lowercase letters, numbers, and underscores.",
+  })
+  filterKey?: string;
 
   @ApiPropertyOptional({
     example: "training,internal",

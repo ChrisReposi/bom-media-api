@@ -6,16 +6,27 @@ import {
   IsInt,
   IsOptional,
   IsString,
+  Matches,
   Max,
+  MaxLength,
   Min,
+  NotEquals,
 } from "class-validator";
 import { VideoProvider, VideoStatus } from "../../generated/prisma/client";
+import {
+  VIDEO_FILTER_KEY_MAX_LENGTH,
+  normalizeVideoFilterKey,
+} from "../utils/video-filter-key.util";
+import {
+  ADMIN_VIDEO_SEARCH_MAX_LENGTH,
+  normalizeAdminVideoSearch,
+} from "../utils/video-search.util";
 
 export const VIDEO_SORT_FIELDS = [
   "createdAt",
+  "updatedAt",
   "publishedAt",
   "title",
-  "viewCount",
 ] as const;
 
 export const SORT_ORDERS = ["asc", "desc"] as const;
@@ -41,8 +52,11 @@ export class ListVideosQueryDto {
 
   @ApiPropertyOptional({ example: "demo" })
   @IsOptional()
-  @Transform(({ value }) => (typeof value === "string" ? value.trim() : value))
+  @Transform(({ value }) =>
+    typeof value === "string" ? normalizeAdminVideoSearch(value) : value,
+  )
   @IsString()
+  @MaxLength(ADMIN_VIDEO_SEARCH_MAX_LENGTH)
   search?: string;
 
   @ApiPropertyOptional({ enum: VideoStatus, example: VideoStatus.READY })
@@ -57,6 +71,25 @@ export class ListVideosQueryDto {
   @IsOptional()
   @IsEnum(VideoProvider)
   provider?: VideoProvider;
+
+  @ApiPropertyOptional({
+    example: "sml",
+    description:
+      "Optional short grouping key used for admin filtering. Omit this query param to list all videos.",
+    maxLength: VIDEO_FILTER_KEY_MAX_LENGTH,
+  })
+  @IsOptional()
+  @Transform(({ value }) => normalizeVideoFilterKey(value))
+  @IsString()
+  @MaxLength(VIDEO_FILTER_KEY_MAX_LENGTH)
+  @NotEquals("all", {
+    message: "filterKey must not be the reserved value all.",
+  })
+  @Matches(/^[a-z0-9]+(?:_[a-z0-9]+)*$/, {
+    message:
+      "filterKey must contain only lowercase letters, numbers, and underscores.",
+  })
+  filterKey?: string;
 
   @ApiPropertyOptional({
     enum: VIDEO_SORT_FIELDS,

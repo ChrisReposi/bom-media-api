@@ -4,16 +4,21 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { randomUUID } from "node:crypto";
 import { readFile, unlink } from "node:fs/promises";
+import { buildCacheKey } from "../cache/memory-cache-key.util";
+import { MemoryCacheService } from "../cache/memory-cache.service";
 import { CloudinaryService } from "../cloudinary/cloudinary.service";
 import { PrismaService } from "../database/prisma.service";
 import {
+  AssignmentStatus,
   AuditStatus,
   EmbedProvider,
   Prisma,
+  ShareLinkStatus,
   VideoProvider,
   VideoSourceType,
   VideoUploadSessionStatus,
@@ -25,7 +30,11 @@ import type { CreateEmbedVideoDto } from "./dto/create-embed-video.dto";
 import type { CreateVideoDto } from "./dto/create-video.dto";
 import type { InitLocalVideoUploadDto } from "./dto/init-local-video-upload.dto";
 import type { ListVideosQueryDto } from "./dto/list-videos-query.dto";
-import { type VideoSortField } from "./dto/list-videos-query.dto";
+import {
+  SORT_ORDERS,
+  VIDEO_SORT_FIELDS,
+  type VideoSortField,
+} from "./dto/list-videos-query.dto";
 import type { PurgeVideoDto } from "./dto/purge-video.dto";
 import type { ReplaceDatabaseVideoBinaryDto } from "./dto/replace-database-video-binary.dto";
 import type { UploadDatabaseVideoDto } from "./dto/upload-database-video.dto";
@@ -43,6 +52,14 @@ import type {
   VideoResponse,
 } from "./types/video-response.type";
 import { buildCloudinaryVideoThumbnailUrl } from "./utils/cloudinary-video.util";
+import {
+  isValidVideoFilterKey,
+  normalizeVideoFilterKey,
+} from "./utils/video-filter-key.util";
+import {
+  isShortAdminVideoSearch,
+  normalizeAdminVideoSearch,
+} from "./utils/video-search.util";
 import {
   DEFAULT_VIDEO_EMBED_ALLOW,
   DEFAULT_VIDEO_EMBED_ALLOWED_HOSTS,
@@ -96,6 +113,15 @@ type VideoAssetWithBinaryMetadata = VideoAsset & {
     checksumSha256: string | null;
     originalFilename: string;
   } | null;
+};
+
+type AdminLocalMediaMetadata = {
+  storageKey: string;
+  originalFilename: string;
+  mimeType: string;
+  sizeBytes: bigint;
+  checksumSha256: string | null;
+  updatedAt: Date;
 };
 
 export type DatabaseVideoBinary = {
@@ -163,24 +189,77 @@ export class VideosService {
     private readonly configService: ConfigService,
     private readonly videoMetadataService: VideoMetadataService,
     private readonly localVideoStorageService: LocalVideoStorageService,
+    @Optional() private readonly memoryCache?: MemoryCacheService,
   ) {}
 
   async listVideos(query: ListVideosQueryDto): Promise<VideoListResponse> {
-    const page = query.page ?? 1;
-    const limit = query.limit ?? 20;
-    const skip = (page - 1) * limit;
-    const where = this.buildVideoWhere(query);
-    const orderBy = this.buildVideoOrderBy(
-      query.sortBy ?? "createdAt",
-      query.sortOrder ?? "desc",
+    const page = this.resolveVideoListPage(query.page);
+    const limit = this.resolveVideoListLimit(query.limit);
+    const normalizedSearch = normalizeAdminVideoSearch(query.search);
+    const normalizedFilterKey = this.normalizeOptionalVideoFilterKey(
+      query.filterKey,
     );
+    const sortBy = this.resolveVideoSortField(query.sortBy);
+    const sortOrder = this.resolveVideoSortOrder(query.sortOrder);
+    const hasSearchInput =
+      typeof query.search === "string" && query.search.trim() !== "";
+
+    if (hasSearchInput && isShortAdminVideoSearch(normalizedSearch)) {
+      return this.buildEmptyVideoListResponse(page, limit);
+    }
+
+    const loader = () =>
+      this.loadVideoListFromDatabase({
+        query,
+        page,
+        limit,
+        normalizedSearch,
+        normalizedFilterKey,
+        sortBy,
+        sortOrder,
+      });
+    const cacheKey = this.buildAdminVideoListCacheKey({
+      page,
+      limit,
+      normalizedSearch,
+      filterKey: normalizedFilterKey,
+      status: query.status,
+      provider: query.provider,
+      sortBy,
+      sortOrder,
+    });
+
+    return (
+      this.memoryCache?.getOrSet(cacheKey, loader, {
+        ttlSeconds:
+          this.memoryCache.getRuntimeConfig().adminVideosListTtlSeconds,
+      }) ?? loader()
+    );
+  }
+
+  private async loadVideoListFromDatabase(params: {
+    query: ListVideosQueryDto;
+    page: number;
+    limit: number;
+    normalizedSearch: string;
+    normalizedFilterKey: string | undefined;
+    sortBy: VideoSortField;
+    sortOrder: "asc" | "desc";
+  }): Promise<VideoListResponse> {
+    const skip = (params.page - 1) * params.limit;
+    const where = this.buildVideoWhere(
+      params.query,
+      params.normalizedSearch,
+      params.normalizedFilterKey,
+    );
+    const orderBy = this.buildVideoOrderBy(params.sortBy, params.sortOrder);
 
     const [items, total] = await this.prisma.$transaction([
       this.prisma.videoAsset.findMany({
         where,
         orderBy,
         skip,
-        take: limit,
+        take: params.limit,
         include: {
           binaryAsset: {
             select: {
@@ -212,10 +291,10 @@ export class VideosService {
     return {
       items: items.map((video) => this.toVideoResponse(video)),
       meta: {
-        page,
-        limit,
+        page: params.page,
+        limit: params.limit,
         total,
-        totalPages: Math.ceil(total / limit),
+        totalPages: Math.ceil(total / params.limit),
       },
     };
   }
@@ -303,6 +382,7 @@ export class VideosService {
         viewCount: this.parseViewCount(dto.viewCount),
         publishedAt: this.parseNullableDate(dto.publishedAt),
         status,
+        filterKey: this.normalizeNullableVideoFilterKey(dto.filterKey),
         metadataJson: this.buildMetadataJson(
           dto.metadataJson,
           thumbnail.thumbnailMetadata,
@@ -314,6 +394,7 @@ export class VideosService {
       provider: video.provider,
       status: video.status,
     });
+    this.invalidateAdminVideoCaches();
 
     return this.toVideoResponse(video);
   }
@@ -356,6 +437,7 @@ export class VideosService {
         viewCount: this.parseViewCount(dto.viewCount),
         publishedAt: this.parseNullableDate(dto.publishedAt),
         status: dto.status ?? VideoStatus.READY,
+        filterKey: this.normalizeNullableVideoFilterKey(dto.filterKey),
         metadataJson: this.buildMetadataJson(
           undefined,
           thumbnail.thumbnailMetadata,
@@ -368,6 +450,7 @@ export class VideosService {
       provider: video.provider,
       status: video.status,
     });
+    this.invalidateAdminVideoCaches();
 
     return this.toVideoResponse(video);
   }
@@ -432,6 +515,7 @@ export class VideosService {
         viewCount: this.parseViewCount(dto.viewCount),
         publishedAt: this.parseNullableDate(dto.publishedAt),
         status: dto.status ?? VideoStatus.READY,
+        filterKey: this.normalizeNullableVideoFilterKey(dto.filterKey),
         metadataJson: this.buildMetadataJson(
           uploadMetadata,
           thumbnail.thumbnailMetadata,
@@ -443,6 +527,7 @@ export class VideosService {
       provider: video.provider,
       status: video.status,
     });
+    this.invalidateAdminVideoCaches();
 
     return this.toVideoResponse(video);
   }
@@ -493,6 +578,7 @@ export class VideosService {
               viewCount: this.parseViewCount(dto.viewCount),
               publishedAt: this.parseNullableDate(dto.publishedAt),
               status: dto.status ?? VideoStatus.READY,
+              filterKey: this.normalizeNullableVideoFilterKey(dto.filterKey),
               metadataJson: this.buildMetadataJson(
                 undefined,
                 thumbnail.thumbnailMetadata,
@@ -530,6 +616,7 @@ export class VideosService {
         mimeType: file.mimetype,
         sizeBytes: String(file.size),
       });
+      this.invalidateAdminVideoCaches();
 
       return this.toVideoResponse(video);
     } finally {
@@ -563,6 +650,7 @@ export class VideosService {
       viewCount: dto.viewCount,
       publishedAt: dto.publishedAt,
       status: dto.status,
+      filterKey: this.normalizeOptionalVideoFilterKey(dto.filterKey),
       checksumSha256: dto.checksumSha256?.toLowerCase(),
     });
 
@@ -802,6 +890,11 @@ export class VideosService {
                 : undefined,
             ),
             status: this.parseVideoStatusFromMetadata(metadata),
+            filterKey: this.normalizeNullableVideoFilterKey(
+              typeof metadata.filterKey === "string"
+                ? metadata.filterKey
+                : undefined,
+            ),
             metadataJson: this.buildMetadataJson(
               {
                 localFile: {
@@ -888,6 +981,7 @@ export class VideosService {
         sourceType: video.sourceType,
         sizeBytes: finalFile.sizeBytes.toString(),
       });
+      this.invalidateAdminVideoCaches();
 
       return this.toVideoResponse(video);
     } catch (error) {
@@ -975,48 +1069,26 @@ export class VideosService {
     id: string,
     rangeHeader: string | undefined,
   ): Promise<LocalVideoFileStream> {
-    const video = await this.prisma.videoAsset.findUnique({
-      where: { id },
-      include: {
-        localFileAsset: true,
-      },
-    });
-
-    if (
-      video === null ||
-      video.sourceType !== VideoSourceType.LOCAL_FILE ||
-      video.localFileAsset === null
-    ) {
-      throw new NotFoundException("Local video file not found.");
-    }
+    const localFileAsset = await this.getAdminLocalVideoMetadata(id);
 
     return {
-      mimeType: video.localFileAsset.mimeType,
+      mimeType: localFileAsset.mimeType,
       ...this.localVideoStorageService.createRangeReadStream({
-        storageKey: video.localFileAsset.storageKey,
+        storageKey: localFileAsset.storageKey,
         rangeHeader,
       }),
     };
   }
 
   async getLocalThumbnailStream(id: string): Promise<LocalThumbnailStream> {
-    const video = await this.prisma.videoAsset.findUnique({
-      where: { id },
-      include: {
-        localThumbnailAsset: true,
-      },
-    });
-
-    if (video === null || video.localThumbnailAsset === null) {
-      throw new NotFoundException("Local thumbnail not found.");
-    }
+    const localThumbnailAsset = await this.getAdminLocalThumbnailMetadata(id);
 
     const result = this.localVideoStorageService.createFullReadStream(
-      video.localThumbnailAsset.storageKey,
+      localThumbnailAsset.storageKey,
     );
 
     return {
-      mimeType: video.localThumbnailAsset.mimeType,
+      mimeType: localThumbnailAsset.mimeType,
       contentLength: result.contentLength,
       stream: result.stream,
     };
@@ -1122,6 +1194,7 @@ export class VideosService {
       await this.writeAudit(adminId, "VIDEO_LOCAL_THUMBNAIL_UPDATE", id, {
         sourceType: video.sourceType,
       });
+      this.invalidateAdminVideoCaches();
 
       return this.toVideoResponse(video);
     } catch (error) {
@@ -1249,6 +1322,7 @@ export class VideosService {
         thumbnailReplaced:
           hasThumbnailInput && nextThumbnailUrl !== existingVideo.thumbnailUrl,
       });
+      this.invalidateAdminVideoCaches();
 
       return this.toVideoResponse(video);
     } finally {
@@ -1359,6 +1433,10 @@ export class VideosService {
       data.status = dto.status;
     }
 
+    if (Object.prototype.hasOwnProperty.call(dto, "filterKey")) {
+      data.filterKey = this.normalizeNullableVideoFilterKey(dto.filterKey);
+    }
+
     if (dto.metadataJson !== undefined) {
       data.metadataJson = this.toJsonInput(dto.metadataJson);
     }
@@ -1372,33 +1450,45 @@ export class VideosService {
       data.slug = await this.ensureUniqueSlug(dto.title, existingVideo.id);
     }
 
-    const video = await this.prisma.videoAsset.update({
-      where: { id },
-      data,
-      include: {
-        binaryAsset: {
-          select: {
-            mimeType: true,
-            sizeBytes: true,
+    let disabledShareLinkCount = 0;
+    const video = await this.prisma.$transaction(async (tx) => {
+      const updatedVideo = await tx.videoAsset.update({
+        where: { id },
+        data,
+        include: {
+          binaryAsset: {
+            select: {
+              mimeType: true,
+              sizeBytes: true,
+            },
+          },
+          localFileAsset: {
+            select: {
+              mimeType: true,
+              sizeBytes: true,
+              checksumSha256: true,
+              originalFilename: true,
+            },
+          },
+          localThumbnailAsset: {
+            select: {
+              mimeType: true,
+              sizeBytes: true,
+              checksumSha256: true,
+              originalFilename: true,
+            },
           },
         },
-        localFileAsset: {
-          select: {
-            mimeType: true,
-            sizeBytes: true,
-            checksumSha256: true,
-            originalFilename: true,
-          },
-        },
-        localThumbnailAsset: {
-          select: {
-            mimeType: true,
-            sizeBytes: true,
-            checksumSha256: true,
-            originalFilename: true,
-          },
-        },
-      },
+      });
+
+      if (dto.status === VideoStatus.DISABLED) {
+        disabledShareLinkCount = await this.disableActiveShareLinksForVideo(
+          tx,
+          id,
+        );
+      }
+
+      return updatedVideo;
     });
 
     if (shouldCleanupOldThumbnail) {
@@ -1410,8 +1500,11 @@ export class VideosService {
     }
 
     await this.writeAudit(adminId, "VIDEO_UPDATE", video.id, {
-      status: video.status,
+      previousStatus: existingVideo.status,
+      nextStatus: video.status,
+      disabledShareLinkCount,
     });
+    this.invalidateAdminVideoCaches();
 
     return this.toVideoResponse(video);
   }
@@ -1420,24 +1513,44 @@ export class VideosService {
     id: string,
     adminId: string,
   ): Promise<DisableVideoResponse> {
-    const existingVideo = await this.prisma.videoAsset.findUnique({
-      where: { id },
-      select: { id: true, status: true },
+    const result = await this.prisma.$transaction(async (tx) => {
+      const existingVideo = await tx.videoAsset.findUnique({
+        where: { id },
+        select: { id: true, status: true },
+      });
+
+      if (existingVideo === null) {
+        throw new NotFoundException("Video not found.");
+      }
+
+      const videoStatusChanged = existingVideo.status !== VideoStatus.DISABLED;
+
+      if (videoStatusChanged) {
+        await tx.videoAsset.update({
+          where: { id },
+          data: { status: VideoStatus.DISABLED },
+        });
+      }
+
+      const disabledShareLinkCount = await this.disableActiveShareLinksForVideo(
+        tx,
+        id,
+      );
+
+      return {
+        previousStatus: existingVideo.status,
+        videoStatusChanged,
+        disabledShareLinkCount,
+      };
     });
 
-    if (existingVideo === null) {
-      throw new NotFoundException("Video not found.");
-    }
-
-    if (existingVideo.status !== VideoStatus.DISABLED) {
-      await this.prisma.videoAsset.update({
-        where: { id },
-        data: { status: VideoStatus.DISABLED },
-      });
-
+    if (result.videoStatusChanged || result.disabledShareLinkCount > 0) {
       await this.writeAudit(adminId, "VIDEO_DISABLE", id, {
-        previousStatus: existingVideo.status,
+        previousStatus: result.previousStatus,
+        nextStatus: VideoStatus.DISABLED,
+        disabledShareLinkCount: result.disabledShareLinkCount,
       });
+      this.invalidateAdminVideoCaches();
     }
 
     return {
@@ -1462,6 +1575,7 @@ export class VideosService {
         where: { id },
         select: {
           id: true,
+          status: true,
           provider: true,
           sourceType: true,
           providerAssetId: true,
@@ -1486,18 +1600,34 @@ export class VideosService {
         throw new NotFoundException("Video not found.");
       }
 
-      const [websiteAssignmentCount, shareLinkVideoCount] = await Promise.all([
-        transaction.websiteVideo.count({ where: { videoId: id } }),
-        transaction.shareLinkVideo.count({ where: { videoId: id } }),
-      ]);
-      const hadWebsiteAssignments = websiteAssignmentCount > 0;
-      const hadShareLinks = shareLinkVideoCount > 0;
-
-      if (hadWebsiteAssignments || hadShareLinks) {
+      if (video.status !== VideoStatus.DISABLED) {
         throw new BadRequestException(
-          "Video cannot be permanently deleted while it is assigned to websites or share links.",
+          "Video must be disabled before it can be permanently deleted.",
         );
       }
+
+      const [activeWebsiteAssignmentCount, shareLinkVideoCount] =
+        await Promise.all([
+          transaction.websiteVideo.count({
+            where: { videoId: id, status: AssignmentStatus.ACTIVE },
+          }),
+          transaction.shareLinkVideo.count({ where: { videoId: id } }),
+        ]);
+      const hadWebsiteAssignments = activeWebsiteAssignmentCount > 0;
+      const hadShareLinks = shareLinkVideoCount > 0;
+
+      if (hadWebsiteAssignments) {
+        throw new BadRequestException(
+          "Video cannot be permanently deleted while it is assigned to active websites.",
+        );
+      }
+
+      const disabledShareLinkCount = await this.disableActiveShareLinksForVideo(
+        transaction,
+        id,
+      );
+      const detachedShareLinkVideoCount =
+        await this.detachShareLinkVideosForVideo(transaction, id);
 
       await transaction.videoAsset.delete({ where: { id } });
 
@@ -1505,6 +1635,9 @@ export class VideosService {
         video,
         hadWebsiteAssignments,
         hadShareLinks,
+        activeWebsiteAssignmentCount,
+        disabledShareLinkCount,
+        detachedShareLinkVideoCount,
       };
     });
 
@@ -1556,6 +1689,9 @@ export class VideosService {
       sourceType: purgeResult.video.sourceType,
       hadWebsiteAssignments: purgeResult.hadWebsiteAssignments,
       hadShareLinks: purgeResult.hadShareLinks,
+      activeWebsiteAssignmentCount: purgeResult.activeWebsiteAssignmentCount,
+      disabledShareLinkCount: purgeResult.disabledShareLinkCount,
+      detachedShareLinkVideoCount: purgeResult.detachedShareLinkVideoCount,
       deleteRemoteAsset,
       remoteAssetDeleteAttempted: shouldDeleteRemoteAsset,
       remoteAssetDeleted,
@@ -1567,6 +1703,7 @@ export class VideosService {
       bytesReclaimed: bytesReclaimed.toString(),
       orphanCleanupRequired,
     });
+    this.invalidateAdminVideoCaches();
 
     return {
       message: "Video permanently deleted successfully.",
@@ -1576,6 +1713,9 @@ export class VideosService {
       safety: {
         hadWebsiteAssignments: purgeResult.hadWebsiteAssignments,
         hadShareLinks: purgeResult.hadShareLinks,
+        activeWebsiteAssignmentCount: purgeResult.activeWebsiteAssignmentCount,
+        disabledShareLinkCount: purgeResult.disabledShareLinkCount,
+        detachedShareLinkVideoCount: purgeResult.detachedShareLinkVideoCount,
       },
       storage: {
         localVideoDeleteAttempted,
@@ -1590,6 +1730,89 @@ export class VideosService {
         remoteAssetDeleted,
       },
     };
+  }
+
+  private async getAdminLocalVideoMetadata(
+    id: string,
+  ): Promise<AdminLocalMediaMetadata> {
+    const loader = async (): Promise<AdminLocalMediaMetadata> => {
+      const video = await this.prisma.videoAsset.findUnique({
+        where: { id },
+        select: {
+          sourceType: true,
+          localFileAsset: {
+            select: {
+              storageKey: true,
+              originalFilename: true,
+              mimeType: true,
+              sizeBytes: true,
+              checksumSha256: true,
+              updatedAt: true,
+            },
+          },
+        },
+      });
+
+      if (
+        video === null ||
+        video.sourceType !== VideoSourceType.LOCAL_FILE ||
+        video.localFileAsset === null
+      ) {
+        throw new NotFoundException("Local video file not found.");
+      }
+
+      return video.localFileAsset;
+    };
+
+    return (
+      this.memoryCache?.getOrSet(
+        buildCacheKey("media:metadata:admin:local-file", id),
+        loader,
+        {
+          ttlSeconds:
+            this.memoryCache.getRuntimeConfig().mediaMetadataTtlSeconds,
+        },
+      ) ?? loader()
+    );
+  }
+
+  private async getAdminLocalThumbnailMetadata(
+    id: string,
+  ): Promise<AdminLocalMediaMetadata> {
+    const loader = async (): Promise<AdminLocalMediaMetadata> => {
+      const video = await this.prisma.videoAsset.findUnique({
+        where: { id },
+        select: {
+          localThumbnailAsset: {
+            select: {
+              storageKey: true,
+              originalFilename: true,
+              mimeType: true,
+              sizeBytes: true,
+              checksumSha256: true,
+              updatedAt: true,
+            },
+          },
+        },
+      });
+
+      if (video === null || video.localThumbnailAsset === null) {
+        throw new NotFoundException("Local thumbnail not found.");
+      }
+
+      return video.localThumbnailAsset;
+    };
+
+    return (
+      this.memoryCache?.getOrSet(
+        buildCacheKey("media:metadata:admin:thumbnail", id),
+        loader,
+        {
+          ttlSeconds:
+            this.memoryCache.getRuntimeConfig().mediaMetadataTtlSeconds,
+        },
+      ) ?? loader()
+    );
   }
 
   private async probeRemoteDurationSeconds(
@@ -1627,7 +1850,101 @@ export class VideosService {
     }
   }
 
-  private buildVideoWhere(query: ListVideosQueryDto): VideoAssetWhereInput {
+  private resolveVideoListPage(value: number | undefined): number {
+    if (value === undefined || !Number.isInteger(value) || value < 1) {
+      return 1;
+    }
+
+    return value;
+  }
+
+  private resolveVideoListLimit(value: number | undefined): number {
+    if (value === undefined || !Number.isInteger(value) || value < 1) {
+      return 20;
+    }
+
+    return Math.min(value, 100);
+  }
+
+  private buildEmptyVideoListResponse(
+    page: number,
+    limit: number,
+  ): VideoListResponse {
+    return {
+      items: [],
+      meta: {
+        page,
+        limit,
+        total: 0,
+        totalPages: 0,
+      },
+    };
+  }
+
+  private buildAdminVideoListCacheKey(params: {
+    page: number;
+    limit: number;
+    normalizedSearch: string;
+    filterKey: string | undefined;
+    status: VideoStatus | undefined;
+    provider: VideoProvider | undefined;
+    sortBy: VideoSortField;
+    sortOrder: "asc" | "desc";
+  }): string {
+    return buildCacheKey(
+      "admin:videos:list",
+      params.page,
+      params.limit,
+      params.normalizedSearch,
+      params.filterKey ?? "all",
+      params.status ?? "all",
+      params.provider ?? "all",
+      params.sortBy,
+      params.sortOrder,
+    );
+  }
+
+  private invalidateAdminVideoCaches(): void {
+    this.memoryCache?.deleteByPrefix("admin:videos:");
+    this.memoryCache?.deleteByPrefix("media:metadata:");
+    this.memoryCache?.deleteByPrefix("public:watch:");
+  }
+
+  private async disableActiveShareLinksForVideo(
+    tx: Prisma.TransactionClient,
+    videoId: string,
+  ): Promise<number> {
+    const result = await tx.shareLink.updateMany({
+      where: {
+        status: ShareLinkStatus.ACTIVE,
+        shareLinkVideos: {
+          some: { videoId },
+        },
+      },
+      data: {
+        status: ShareLinkStatus.DISABLED,
+      },
+    });
+
+    return result.count;
+  }
+
+  private async detachShareLinkVideosForVideo(
+    tx: Prisma.TransactionClient,
+    videoId: string,
+  ): Promise<number> {
+    const result = await tx.shareLinkVideo.deleteMany({
+      where: { videoId },
+    });
+
+    return result.count;
+  }
+
+  private buildVideoWhere(
+    query: ListVideosQueryDto,
+    normalizedSearch: string,
+    normalizedFilterKey: string | undefined,
+  ): VideoAssetWhereInput {
     const where: VideoAssetWhereInput = {};
 
     if (query.status !== undefined) {
@@ -1638,15 +1955,40 @@ export class VideosService {
       where.provider = query.provider;
     }
 
-    if (query.search !== undefined && query.search.trim() !== "") {
-      const search = query.search.trim();
+    if (normalizedFilterKey !== undefined) {
+      where.filterKey = normalizedFilterKey;
+    }
+
+    if (normalizedSearch.length > 0) {
       where.OR = [
-        { title: { contains: search } },
-        { slug: { contains: search } },
+        { title: { contains: normalizedSearch } },
+        { slug: { contains: normalizedSearch } },
       ];
     }
 
     return where;
+  }
+
+  private resolveVideoSortField(value: unknown): VideoSortField {
+    if (
+      typeof value === "string" &&
+      VIDEO_SORT_FIELDS.includes(value as VideoSortField)
+    ) {
+      return value as VideoSortField;
+    }
+
+    return "createdAt";
+  }
+
+  private resolveVideoSortOrder(value: unknown): "asc" | "desc" {
+    if (
+      typeof value === "string" &&
+      SORT_ORDERS.includes(value as "asc" | "desc")
+    ) {
+      return value as "asc" | "desc";
+    }
+
+    return "desc";
   }
 
   private buildVideoOrderBy(
@@ -2489,6 +2831,26 @@ export class VideosService {
     return new Date(value);
   }
 
+  private normalizeOptionalVideoFilterKey(value: unknown): string | undefined {
+    const normalizedFilterKey = normalizeVideoFilterKey(value);
+
+    if (normalizedFilterKey === undefined) {
+      return undefined;
+    }
+
+    if (!isValidVideoFilterKey(normalizedFilterKey)) {
+      throw new BadRequestException(
+        "filterKey must contain only lowercase letters, numbers, and underscores.",
+      );
+    }
+
+    return normalizedFilterKey;
+  }
+
+  private normalizeNullableVideoFilterKey(value: unknown): string | null {
+    return this.normalizeOptionalVideoFilterKey(value) ?? null;
+  }
+
   private toJsonInput(value: Record<string, unknown>): Prisma.InputJsonValue {
     return value as Prisma.InputJsonValue;
   }
@@ -2803,6 +3165,7 @@ export class VideosService {
       viewCount: video.viewCount.toString(),
       publishedAt: video.publishedAt,
       status: video.status,
+      filterKey: video.filterKey,
       metadataJson: video.metadataJson,
       binaryAsset:
         binaryAsset === null

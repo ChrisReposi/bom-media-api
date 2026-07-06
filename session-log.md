@@ -12,6 +12,416 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-04 — Continue Video filterKey safe purge verification
+
+### Continued From
+
+- Previous run hit the rate limit after implementing `VideoAsset.filterKey` and the safe video disable/purge/share-link disable flow.
+- Continued from the existing dirty working tree without resetting, discarding, or rewriting stable implementation.
+
+### Confirmed
+
+- `VideoAsset.filterKey` exists as nullable `String? @db.VarChar(64)`.
+- Additive migration `20260704034452_add_video_filter_key_and_safe_purge_flow` only adds the nullable column and `filterKey` indexes.
+- DTOs expose optional `filterKey` for admin create, embed create, upload, DB upload, local upload init, update, and list query paths.
+- `filterKey` normalization lowercases, converts spaces/hyphens to underscores, trims repeated/edge underscores, and rejects unsafe/reserved values such as `all`.
+- Admin list filtering combines `filterKey` with existing status/provider/search/sort/pagination and includes `filterKey` in the admin video list cache key.
+- Create/update/local-upload paths persist normalized `filterKey`; update can explicitly clear it to `null`.
+- `VideoResponse` includes `filterKey`; public watch responses do not expose it.
+- Disabling a video disables related active share links, including already-disabled videos with old inconsistent active links.
+- Purge requires the video to already be `DISABLED`, blocks active website assignments, disables related active share links, detaches only that video's `ShareLinkVideo` rows, and audits safe counts.
+
+### Fixed
+
+- No code gaps were found in this continuation pass, so no implementation code was changed.
+- Added this verification-focused session-log entry only.
+
+### Verified
+
+- `yarn prisma generate` passed.
+- `yarn prisma validate` passed.
+- `yarn typecheck` passed.
+- `yarn lint` passed with warning-only `consistent-type-imports` findings and no errors.
+- `yarn test` passed: 69 tests.
+- `yarn build` passed.
+- `git diff --check` passed.
+- `git ls-files --others --exclude-standard | findstr /i "package-lock pnpm-lock"` produced no matches.
+- `yarn dev:local` compiled, mapped routes, connected to local Prisma DB target, and reached `Nest application successfully started`.
+- `yarn format:check` still fails on 67 pre-existing repository formatting issues.
+- Focused Prettier check passed for task-touched filterKey/purge TypeScript files.
+
+### Manual Smoke Test
+
+- Ran a local API smoke with `.env.local` bootstrap credentials and kept the access token in memory only.
+- Created temporary READY videos with `filterKey=sml` and `filterKey=msa`.
+- Confirmed `GET /admin/videos` isolates `filterKey=sml` and `filterKey=msa`.
+- Confirmed combined `search + filterKey` returns the expected temporary video.
+- Confirmed list with no `filterKey` includes the temporary video.
+- Confirmed PATCH normalizes `filterKey: "Judge Judy"` to `judge_judy`.
+- Confirmed PATCH with empty `filterKey` clears the field to `null`.
+- Confirmed purge of a READY video returns `400`.
+- Disabled and purged the temporary videos successfully, leaving no smoke-test video records behind.
+- Share-link disable and generic public invalid behavior were re-confirmed by automated tests, not by creating live local share-link fixtures in this pass.
+
+### Pending
+
+- Admin Web follow-up: add filter-key fields to create/edit forms and add filter UI.
+- Production deploy: run `yarn prisma migrate deploy` only; never run reset or force-push Prisma commands.
+- Production smoke after deploy: verify real share-link/video combinations so disabled/purged videos make related public watch links return no playable videos.
+
+## 2026-07-04 — Video filterKey and safe purge/share-link disable flow
+
+### Summary
+
+- Added nullable `VideoAsset.filterKey` for admin video grouping/filtering.
+- Added admin list filtering by `filterKey`, combined with existing status/provider/search/sort/pagination filters.
+- Added `filterKey` to admin create, embed create, upload, DB upload, local upload init/complete, update, list DTOs, admin `VideoResponse`, and admin video list cache keys.
+- Enforced `VideoStatus.DISABLED` before permanent purge.
+- Disabling a video now disables related active share links, including old inconsistent rows when the video was already disabled.
+- Purging a disabled video now disables related active share links, detaches that video's `ShareLinkVideo` rows, then deletes the video.
+
+### Migration
+
+- Created additive migration:
+  `prisma/migrations/20260704034452_add_video_filter_key_and_safe_purge_flow/migration.sql`
+- Migration adds:
+  - `VideoAsset.filterKey String? @db.VarChar(64)`
+  - `VideoAsset_filterKey_idx`
+  - `VideoAsset_filterKey_status_createdAt_idx`
+- Existing videos remain valid with `filterKey=null`; no backfill was added.
+- Production deploy should use `yarn prisma migrate deploy` only.
+
+### Files Changed
+
+- `prisma/schema.prisma`
+- `prisma/migrations/20260704034452_add_video_filter_key_and_safe_purge_flow/migration.sql`
+- `src/videos/utils/video-filter-key.util.ts`
+- `src/videos/dto/create-video.dto.ts`
+- `src/videos/dto/create-embed-video.dto.ts`
+- `src/videos/dto/upload-video.dto.ts`
+- `src/videos/dto/upload-database-video.dto.ts`
+- `src/videos/dto/init-local-video-upload.dto.ts`
+- `src/videos/dto/update-video.dto.ts`
+- `src/videos/dto/list-videos-query.dto.ts`
+- `src/videos/types/video-response.type.ts`
+- `src/videos/videos.service.ts`
+- `test/admin-video-search.test.ts`
+- `test/video-purge.test.ts`
+- `test/public-local-thumbnail.test.ts`
+- `docs/architecture/backend-context.md`
+- `docs/operations/production-deployment-checklist.md`
+- `session-log.md`
+
+### Safety Notes
+
+- `filterKey` normalization uses Unicode NFKC, trim, lowercase, spaces/hyphens to underscores, repeated underscore collapse, and leading/trailing underscore trim.
+- Valid keys are lowercase letters, numbers, and single underscores between segments; `all` is reserved and rejected.
+- Public watch response shapes were not expanded with `filterKey`.
+- Share links disabled by video disable/purge are not auto-reactivated if the video returns to `READY`.
+- Purge still keeps explicit confirmation and blocks active website assignments.
+- Public invalid watch responses remain generic and do not reveal token/share-link status details.
+- Existing in-memory cache invalidation remains broad for video mutations: admin videos, media metadata, and public watch prefixes are cleared.
+
+### Verified
+
+- `yarn db:migrate:dev --name add_video_filter_key_and_safe_purge_flow` passed.
+- `yarn prisma generate` passed.
+- `yarn prisma validate` passed.
+- `yarn typecheck` passed.
+- `yarn lint` passed with warning-only `consistent-type-imports` findings and no errors.
+- `yarn test` passed: 69 tests.
+- `yarn build` passed.
+- `yarn dev:local` compiled, mapped routes, connected to the local DB target, and reached `Nest application successfully started`.
+- `git diff --check` passed.
+- `git ls-files --others --exclude-standard | findstr /i "package-lock pnpm-lock"` produced no matches.
+- `yarn format:check` still fails on 67 pre-existing repository formatting issues.
+- Focused Prettier check passed for task-touched TypeScript files.
+
+### Pending
+
+- Manual local smoke test with a valid admin token for:
+  `GET /admin/videos?filterKey=sml`, `GET /admin/videos?filterKey=msa`, combined `search+filterKey`, PATCH `filterKey`, disable, and purge.
+- Production deploy should apply migrations with `yarn prisma migrate deploy`, then test that disabling/purging videos makes related public watch links return no playable videos.
+- Admin Web follow-up: add filter-key fields to create/edit forms and add admin filtering UI.
+
+## 2026-07-04 — Fix NestJS DI runtime errors after memory cache work
+
+### Root Cause
+
+- `CorsOriginService` injected `PrismaService` but imported it with `import type`, so NestJS emitted the second constructor dependency as `Function` and could not resolve it at runtime.
+- The same type-only runtime provider pattern was present in several constructor-injected services/controllers after import-style cleanup.
+- With `emitDecoratorMetadata` enabled, DTO/controller service classes used by decorated routes also need runtime imports when Nest relies on metadata.
+
+### Changed
+
+- Restored runtime imports for constructor-injected providers:
+  `PrismaService`, `JwtService`, `MemoryCacheService`, `CloudinaryService`, `VideoMetadataService`, `LocalVideoStorageService`, `VideoViewGrowthService`, `CorsOriginService`, and controller service dependencies.
+- Restored runtime DTO imports in controllers where decorated route parameters need emitted metadata for validation/transform.
+- Kept pure TypeScript-only imports, response types, config types, and helper callback types as type-only.
+- Confirmed `SecurityModule` already imports `ConfigModule` and `DatabaseModule`, so no fake `Function` provider or security-loosening workaround was added.
+
+### Verified
+
+- `yarn typecheck` passed.
+- `yarn dev:local` initially compiled but hit `EADDRINUSE` because an old local `dist/main` Node process was already bound to port 3000.
+- Stopped that stale local API process, re-ran `yarn dev:local`, and confirmed Nest booted successfully with module initialization, route mappings, Prisma local DB connection, and `Nest application successfully started`.
+- `yarn lint` passed with warning-only `consistent-type-imports` findings and no errors.
+- `yarn test` passed: 59 tests.
+- `yarn build` passed.
+- `git ls-files --others --exclude-standard | findstr /i "package-lock pnpm-lock"` produced no matches.
+
+### Pending
+
+- Avoid running automatic ESLint import-type fixes blindly on decorated Nest controllers/services; some runtime imports are intentionally required for DI/metadata even when ESLint reports them as type-only.
+
+## 2026-07-04 — Backend in-memory cache layer recovery
+
+### Summary
+
+- Continued the interrupted in-memory backend cache implementation from the existing working tree without discarding partial changes.
+- Added an optional process-local TTL/LRU memory cache and short in-flight request dedupe for safe read-heavy metadata paths.
+- Cached successful admin video list/search responses, admin website list responses, safe public watch metadata projections, and local media metadata only.
+- Preserved MySQL as the source of truth and kept binary buffers, streams, Range responses, raw tokens, and invalid public responses out of cache.
+
+### Interruption Recovery
+
+- Inspected `git status --short`, `git diff --stat`, and the targeted working-tree diff before editing.
+- Preserved existing partial files and left the interrupted patch snapshots untouched:
+  `codex-interrupted-memory-cache-full.patch` and `codex-interrupted-memory-cache.patch`.
+- Continued from the partial implementation instead of restarting or rewriting stable code.
+
+### Root Cause of Typecheck Failure
+
+- `src/cache/memory-cache.service.ts` passed a `number | undefined` value into `Math.max()` in the runtime numeric clamp helper.
+- TypeScript did not narrow the optional value sufficiently through the existing integer check.
+- Fixed by assigning a finite integer `numericValue` with a safe fallback before clamping.
+
+### Files Changed
+
+- `.env.example`
+- `docs/architecture/backend-context.md`
+- `docs/operations/production-deployment-checklist.md`
+- `prisma/schema.prisma`
+- `prisma/migrations/20260629024948_add_video_list_search_indexes/migration.sql`
+- `src/app.module.ts`
+- `src/cache/memory-cache-key.util.ts`
+- `src/cache/memory-cache.module.ts`
+- `src/cache/memory-cache.service.ts`
+- `src/cache/memory-cache.types.ts`
+- `src/config/env.config.ts`
+- `src/config/env.validation.ts`
+- `src/videos/dto/list-videos-query.dto.ts`
+- `src/videos/utils/video-search.util.ts`
+- `src/videos/videos.service.ts`
+- `src/admin-websites/admin-websites.service.ts`
+- `src/public/public.service.ts`
+- `test/admin-video-search.test.ts`
+- `test/admin-websites-cache.test.ts`
+- `test/memory-cache.test.ts`
+- `test/public-local-thumbnail.test.ts`
+- `session-log.md`
+
+### Cache Policy
+
+- Cache is optional via `MEMORY_CACHE_ENABLED` and remains process-local; it is cleared on restart and is not shared across Hostinger Node processes.
+- Runtime/env config clamps cache sizes and TTLs defensively.
+- Admin video list/search cache key includes page, limit, normalized search, status, provider, sort field, and sort direction.
+- Admin website list cache key includes page, limit, normalized search, normalized domain, domain group key, and status.
+- Media cache stores local metadata only, such as storage key, MIME type, size, checksum/version, and updated timestamp; streams and buffers are still created fresh per request.
+- Mutations invalidate relevant prefixes only after successful database writes.
+
+### Safety Notes
+
+- Public watch cache stores only short-lived successful metadata projections.
+- Raw share tokens/aliases are not stored in cache keys; token-like parts are SHA-256 hashed.
+- Invalid, revoked, expired, and max-view-limited public watch responses are not cached.
+- Public watch cache hits still rebuild token-bearing media URLs for the current request, run the guarded `currentViews` update, and write access logs.
+- Broad public watch in-flight dedupe was intentionally avoided because watch resolve has side effects.
+- No Redis, MySQL cache tables, queue, paid service, or external cache infrastructure was added.
+
+### Verified
+
+- `yarn prisma generate` passed.
+- `yarn prisma validate` passed.
+- `yarn typecheck` passed.
+- `yarn lint` passed with 68 warning-only `consistent-type-imports` findings and no errors.
+- `yarn test` passed: 59 tests.
+- `yarn build` passed.
+- `yarn format:check` still fails on 78 pre-existing repository formatting issues.
+- Focused Prettier write/check passed for the files changed in this cache task.
+- `git ls-files --others --exclude-standard | findstr /i "package-lock pnpm-lock"` produced no matches.
+
+### Pending
+
+- Run production-like manual checks for repeated admin video list/search, admin website list, safe public watch, max-view-limited watch links, and LOCAL_FILE thumbnail/video streaming.
+- Deploy API first. If the existing admin video search index migration is not already applied in production, run only `yarn prisma migrate deploy`.
+- Confirm public watch repeats still write expected access logs/current-view updates in production logs/DB without exposing raw tokens.
+
+## 2026-06-29 — Cross-project admin video search pipeline audit
+
+### Summary
+
+- Re-audited the backend `/api/v1/admin/videos` search implementation together with the Admin Web Dashboard picker behavior.
+- Confirmed the backend search-hardening work already present in the working tree matches the intended production-safe contract.
+- No additional backend code changes were needed in this pass beyond the existing uncommitted search-hardening files.
+
+### Confirmed Backend Behavior
+
+- Prisma datasource provider is MySQL.
+- `/admin/videos` remains protected by admin access-token auth.
+- The list endpoint uses `ListVideosQueryDto` and strict global validation.
+- Admin video search is normalized with Unicode NFC, trim, whitespace collapse, and an 80-character cap.
+- Non-empty search below 2 characters returns an empty page with `total=0` and does not call Prisma.
+- Normal searches use MySQL-compatible Prisma `contains` filters on `title` and `slug`.
+- No raw SQL, unsafe query concatenation, or PostgreSQL-only `mode: "insensitive"` search option is used.
+- Pagination, provider/status filters, and sort allowlists remain in place.
+- The default Dashboard query shape has an index via `@@index([status, createdAt])`.
+
+### Verified
+
+- `yarn typecheck` passed.
+- `yarn lint` passed with existing warning-only `consistent-type-imports` findings and no errors.
+- `yarn test` passed: 45 tests.
+- `yarn build` passed and regenerated Prisma Client.
+- `yarn prisma validate` passed.
+- PowerShell equivalent of `db:migrate:status` passed and reported the local MySQL schema is up to date with 13 migrations.
+- Repository-wide `yarn format:check` still fails on 78 pre-existing unrelated formatting issues.
+- Focused Prettier check passed for the changed search TS files:
+  `src/videos/dto/list-videos-query.dto.ts`, `src/videos/utils/video-search.util.ts`, `src/videos/videos.service.ts`, `test/admin-video-search.test.ts`.
+- No `package-lock.json` or `pnpm-lock.yaml` was found in the Admin Web or API repo roots.
+
+### Deployment Checklist
+
+1. Deploy API first.
+2. Run `yarn prisma migrate deploy` in production if `20260629024948_add_video_list_search_indexes` is not applied yet.
+3. Restart the Hostinger Node/API process.
+4. Deploy the rebuilt Admin Web.
+5. Hard refresh Admin Web.
+6. Test Dashboard search with `i`, `i fell`, special characters, clear search, and Load more.
+7. Confirm no 500 responses from `/api/v1/admin/videos`.
+8. Confirm the frontend sends no request for one-character search.
+9. Confirm selected videos persist and share links can still be created.
+
+### Pending
+
+- Run the production manual checklist after API and Admin Web deployment.
+- If production still returns 500 for valid multi-character search after deployment, capture the sanitized production stack trace and investigate DB timeout/connection limits as a separate incident.
+
+## 2026-06-29 — Admin video search 500 hardening
+
+### Summary
+
+- Hardened `GET /api/v1/admin/videos` search handling for Dashboard/Admin Web server-side search.
+- Added normalization and a two-character minimum for non-empty admin video searches.
+- Short real searches such as `search=i` now return a safe empty page instead of querying MySQL.
+- Normal searches such as `search=i%20fell` still search `title` and `slug` with Prisma `contains`.
+- Tightened admin video `sortBy` allowlist to `createdAt`, `updatedAt`, `publishedAt`, and `title`.
+- Added a composite index for the default Dashboard query shape: `status=READY&sortBy=createdAt&sortOrder=desc`.
+
+### Root Cause
+
+- The current admin video list search branch sent every non-empty trimmed `search` value directly into Prisma `contains` filters for `title` and `slug`.
+- That meant one-character and wildcard-like values such as `i` or `%` still triggered database search/count work.
+- Local reproduction against `.env.local` did not produce a 500, but it confirmed the unsafe behavior: one-character searches and `%` entered the search branch and hit the DB.
+- Production 500s are consistent with this unbounded search branch becoming expensive or failing under real production data/DB conditions.
+- Current source did not use raw SQL or Prisma `mode: "insensitive"`; the fix keeps the query MySQL/MariaDB-compatible and avoids unsupported Prisma search options.
+
+### Search Normalization Rules
+
+- Only strings are considered searchable.
+- Search is normalized to Unicode NFC.
+- Leading/trailing whitespace is trimmed.
+- Repeated whitespace is collapsed to one space.
+- Search text is capped at 80 characters.
+- Empty or whitespace-only search behaves like no search and returns the normal list.
+- Non-empty search shorter than 2 characters returns:
+
+  ```ts
+  {
+    items: [],
+    meta: { page, limit, total: 0, totalPages: 0 }
+  }
+  ```
+
+### Files Changed
+
+```txt
+prisma/schema.prisma
+prisma/migrations/20260629024948_add_video_list_search_indexes/migration.sql
+src/videos/dto/list-videos-query.dto.ts
+src/videos/utils/video-search.util.ts
+src/videos/videos.service.ts
+test/admin-video-search.test.ts
+session-log.md
+```
+
+### Migration Note
+
+- Added migration `20260629024948_add_video_list_search_indexes`.
+- Migration SQL:
+
+  ```sql
+  CREATE INDEX `VideoAsset_status_createdAt_idx` ON `VideoAsset`(`status`, `createdAt`);
+  ```
+
+- Local migration was created/applied with `yarn prisma migrate dev --name add_video_list_search_indexes` under `.env.local`.
+- Production deployment should use `yarn prisma migrate deploy`; do not use reset/db-push force commands.
+
+### Verification Commands
+
+```bash
+yarn typecheck
+yarn lint
+yarn test
+yarn build
+yarn prisma validate
+yarn prisma migrate status
+yarn prettier --ignore-path .prettierignore --check src/videos/dto/list-videos-query.dto.ts src/videos/utils/video-search.util.ts src/videos/videos.service.ts test/admin-video-search.test.ts
+rg --files -g "package-lock.json" -g "pnpm-lock.yaml"
+git diff --check
+```
+
+### Verification Result
+
+- `yarn.cmd typecheck` passed.
+- `yarn.cmd lint` passed with the repo's existing warning-only `consistent-type-imports` findings and no errors.
+- `yarn.cmd test` passed: 45 tests.
+- `yarn.cmd build` passed and regenerated Prisma Client.
+- `yarn.cmd prisma validate` passed with PowerShell-provided local env vars.
+- `yarn.cmd prisma migrate status` reported the local DB schema is up to date with 13 migrations.
+- Focused Prettier check passed for changed TS files.
+- Repository-wide `yarn.cmd format:check` was run but still fails on 79 pre-existing unrelated formatting issues; changed TS files pass focused Prettier.
+- npm/pnpm lockfile scan returned no files.
+- `git diff --check` passed with Windows LF-to-CRLF working-copy notices only.
+
+### Manual Local Test Results
+
+Started the API locally against `.env.local`, logged in with local bootstrap credentials without printing the token, and called:
+
+```txt
+/api/v1/admin/videos?page=1&limit=24&status=READY&sortBy=createdAt&sortOrder=desc
+/api/v1/admin/videos?page=1&limit=24&search=i&status=READY&sortBy=createdAt&sortOrder=desc
+/api/v1/admin/videos?page=1&limit=24&search=i%20fell&status=READY&sortBy=createdAt&sortOrder=desc
+/api/v1/admin/videos?page=1&limit=24&search=%25&status=READY&sortBy=createdAt&sortOrder=desc
+```
+
+Observed:
+
+```txt
+no search => 200, normal READY page
+search=i => 200, items=0, total=0, totalPages=0
+search=i fell => 200, results or empty result, no 500
+search=% => 200, items=0, total=0, totalPages=0
+```
+
+Logs redacted the Authorization header during the manual test.
+
+### Pending
+
+- Deploy the backend build and migration to production.
+- Re-test the same Admin Web Dashboard search requests against production with a valid admin session.
+- If production still returns 500 for normal searches after this deploy, inspect the production stack trace for DB timeout/connection errors and consider a separate indexed/FULLTEXT search design.
+
 ## 2026-06-17 — Danny clean-path short-code fallback hardening
 
 ### Summary
@@ -933,3 +1343,44 @@ The current live-code behavior reported by Codex:
 ### Recommended Next Implementation
 
 Run `docs/prompts/PROMPT_B_backend_auth_hardening.md`.
+
+## 2026-07-03 — Admin video search regression coverage
+
+### Changed
+
+- Preserved the existing safe `/admin/videos` search implementation:
+  - MySQL Prisma provider.
+  - `ADMIN_VIDEO_SEARCH_MIN_LENGTH = 2`.
+  - normalized search capped to 80 characters.
+  - one-character search returns an empty page without querying Prisma.
+  - MySQL-compatible Prisma `contains` search over `title` and `slug`.
+  - sort allowlist and default `status + createdAt` list index.
+- Added regression coverage for the production `search=msa` failure case.
+- Expanded special-character search coverage to include comma and slash in addition to `%`, `_`, quotes, backslash, parentheses, plus, and minus.
+
+Files involved in the current search hardening worktree:
+
+```txt
+prisma/schema.prisma
+prisma/migrations/20260629024948_add_video_list_search_indexes/migration.sql
+src/videos/dto/list-videos-query.dto.ts
+src/videos/videos.service.ts
+src/videos/utils/video-search.util.ts
+test/admin-video-search.test.ts
+session-log.md
+```
+
+### Verified
+
+- `yarn typecheck` passed.
+- `yarn lint` passed with existing `consistent-type-imports` warnings only.
+- `yarn test` passed: 46 tests.
+- `yarn build` passed.
+- `yarn format:check` was also run and failed on 78 pre-existing formatting warnings across unrelated API files; no repo-wide formatter was run to avoid unrelated churn.
+- Lockfile scan found no `package-lock.json` or `pnpm-lock.yaml`.
+
+### Pending
+
+- Deploy API before Admin Web for this incident.
+- If the index migration has not reached production, run production deployment with `yarn prisma migrate deploy` only; do not use destructive Prisma reset/push commands.
+- Production smoke test `/admin/videos` with empty search, `i`, `msa`, `i fell`, `%`, `_`, quotes, comma, slash, backslash, plus, and minus.

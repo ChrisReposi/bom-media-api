@@ -159,6 +159,8 @@ Public watch returns safe media URLs for videos in valid share links. For LOCAL_
 /api/v1/public/watch/:token/videos/:videoId/thumbnail?host=<host>
 ```
 
+For a max-view-limited share link, the returned URLs also contain a signed `grant` query parameter. Public sites must use the URLs returned by the API. A hand-built limited media URL without the grant is denied generically.
+
 The public playback endpoint validates:
 
 - public token
@@ -166,6 +168,7 @@ The public playback endpoint validates:
 - active share link
 - expiry/view rules
 - video membership in the share link
+- active assignment of the video to the same website
 - `READY` status
 - `LOCAL_FILE` source type
 - local file metadata and storage presence
@@ -202,12 +205,13 @@ Soft disable:
 Guarded purge:
 
 - `POST /api/v1/admin/videos/:id/purge`
+- OWNER role only; ADMIN and STAFF receive `403`.
 - Requires `confirmVideoId`.
-- Rejects videos still assigned to websites or share links.
+- Rejects active website assignments and detaches old share-link membership in the database transaction.
 - Deletes the `VideoAsset` row.
 - Deletes owned local video and thumbnail files best-effort.
 - Returns a safe storage reclaim summary with `localVideoDeleted`, `localThumbnailDeleted`, `bytesReclaimed`, and `orphanCleanupRequired`.
-- Writes an audit log with safe metadata, including delete attempts/results and reclaimed bytes.
+- Writes a commit audit in the delete transaction and a second safe success/failure audit for physical cleanup.
 
 Current purge response shape:
 

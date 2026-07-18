@@ -98,7 +98,7 @@ Public watch responses for `LOCAL_FILE` videos include a token-protected `public
 {
   "sourceType": "LOCAL_FILE",
   "playbackUrl": null,
-  "publicPlaybackUrl": "/api/v1/public/watch/<token>/videos/<videoId>/local-file?host=<host>",
+  "publicPlaybackUrl": "/api/v1/public/watch/<token>/videos/<videoId>/local-file?host=<host>&grant=<signed-grant-for-limited-link>",
   "localFileAsset": {
     "mimeType": "video/mp4",
     "sizeBytes": "524288000"
@@ -113,7 +113,7 @@ GET /api/v1/public/watch/:token/videos/:videoId/local-file?host=<host>
 GET /api/v1/public/watch/:token/videos/:videoId/thumbnail?host=<host>
 ```
 
-The public routes validate token, host/domain, active share link, expiry/view rules, video membership, `READY` status, source type, and local file presence. Video streaming supports HTTP Range and returns no-store cache headers.
+The public routes validate token, host/domain, active share link, active website assignment, expiry, video membership, `READY` status, source type, and local file presence. Max-view-limited links also require the host/video/share-bound signed grant returned by public watch so the final admitted watch can continue seeking after `currentViews` reaches its limit. Unlimited links keep the legacy URL behavior. Video streaming supports HTTP Range and returns no-store cache headers.
 
 Public display views are not counted from these media routes. Browser playback and seeking can create many Range requests, so view growth uses a separate endpoint:
 
@@ -127,7 +127,7 @@ The static public site should call this endpoint once after real playback starts
 
 `DELETE /api/v1/admin/videos/:id` remains a soft disable.
 
-`POST /api/v1/admin/videos/:id/purge` remains the guarded permanent purge route. It still requires `confirmVideoId`, rejects videos assigned to websites/share links, deletes the database row, and now deletes owned local video/thumbnail files best-effort.
+`POST /api/v1/admin/videos/:id/purge` is OWNER-only. It requires `confirmVideoId`, rejects active website assignments, safely disables/detaches historical share-link rows, commits a purge audit in the database transaction, then deletes owned local video/thumbnail files best-effort with a separate cleanup-result audit.
 
 Expired upload sessions are cleaned opportunistically during local upload init/chunk/complete/cancel calls. If physical cleanup fails, logs contain safe metadata only; operators should inspect the private storage tree manually and remove orphaned files after verifying no matching database metadata remains.
 

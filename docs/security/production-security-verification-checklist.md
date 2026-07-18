@@ -9,12 +9,14 @@ Use this after deploying auth/security changes, rotating secrets, changing Cloud
 - [ ] Repeated invalid login attempts eventually return `429 Too Many Requests`.
 - [ ] Refresh returns a new access token and rotates the refresh token.
 - [ ] Reusing an old refresh token is rejected.
+- [ ] Two concurrent refresh requests produce at most one rotation and revoke the replayed session/token family.
 - [ ] Refresh-token replay creates a safe audit event without raw token values.
 - [ ] Logout is idempotent and generic.
 - [ ] Logout revokes the active server-side admin session.
 - [ ] An access token issued before logout fails on protected admin endpoints.
 - [ ] Password change succeeds for an active admin.
 - [ ] Password change revokes active sessions and refresh tokens.
+- [ ] STAFF mutations and ADMIN permanent purge return `403`; OWNER purge still requires explicit confirmation.
 - [ ] An access token issued before password change fails on protected admin endpoints.
 
 ## Docs And Admin Surface
@@ -55,7 +57,8 @@ Use this after deploying auth/security changes, rotating secrets, changing Cloud
 
 ## Proxy And CORS
 
-- [ ] `TRUST_PROXY_ENABLED` and `TRUST_PROXY_HOPS` match the actual Cloudflare/Hostinger path.
+- [ ] `TRUST_PROXY_ENABLED`, hop behavior, and `TRUSTED_PROXY_CIDRS` match the actual Cloudflare/Hostinger path.
+- [ ] A direct-origin request cannot spoof `CF-Connecting-IP` into logs or throttle keys.
 - [ ] If `TRUST_PROXY_CLOUDFLARE_ONLY=true`, direct-to-origin spoofing is blocked or otherwise controlled.
 - [ ] Auth audit IP hashes reflect the real client path expected behind Cloudflare.
 - [ ] Admin Web origin is allowed by CORS.
@@ -69,6 +72,8 @@ Use this after deploying auth/security changes, rotating secrets, changing Cloud
 - [ ] Production database does not store large video binaries.
 - [ ] `LOCAL_FILE` storage root is private and outside public web roots.
 - [ ] `LOCAL_FILE` video playback uses token-protected public URLs and Range requests.
+- [ ] Limited links use returned signed-grant URLs; missing/tampered/wrong-host grants fail generically.
+- [ ] Removing an ACTIVE website assignment denies watch, video, and thumbnail access.
 - [ ] Hostinger/private NVMe file backups are coordinated with DB backups.
 - [ ] `LOCAL_VIDEO_UPLOAD_MAX_MB=500` unless a staging 1GB test has passed.
 - [ ] `LOCAL_VIDEO_CHUNK_SIZE_MB` is below Cloudflare/upstream body-size limits.
@@ -76,7 +81,8 @@ Use this after deploying auth/security changes, rotating secrets, changing Cloud
 - [ ] `LOCAL_FILE` thumbnails are stored on private local storage and served through safe API URLs.
 - [ ] `LOCAL_FILE` purge deletes owned video and thumbnail files best-effort.
 - [ ] `LOCAL_FILE` purge response reports local video/thumbnail delete attempts, delete results, reclaimed bytes, and orphan cleanup status without exposing paths.
-- [ ] `LOCAL_FILE` purge rejects videos still assigned to websites/share links.
+- [ ] `LOCAL_FILE` purge rejects active website assignments and safely detaches historical share-link rows.
+- [ ] `/api/v1/health/ready` returns success only when DB and enabled private storage are accessible.
 - [ ] Soft disable does not delete local video files or thumbnails.
 - [ ] Temp upload directories do not accumulate beyond the expected stale upload window.
 - [ ] Restore testing verifies DB metadata and physical video/thumbnail files together.

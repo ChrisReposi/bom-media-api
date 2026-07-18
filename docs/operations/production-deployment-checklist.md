@@ -35,6 +35,7 @@ Use this checklist with:
 - [ ] Restore test covers DB metadata and physical LOCAL_FILE files together.
 - [ ] Temp upload cleanup procedure is documented and dry-run reviewed.
 - [ ] `ADMIN_REGISTER_ENABLED=false` unless controlled onboarding is required.
+- [ ] `PUBLIC_MEDIA_GRANT_SECRET` is an independent secret of at least 32 characters and grant TTL is 5 minutes to 24 hours.
 - [ ] Cloudinary secret rotated if ever exposed.
 - [ ] JWT/refresh/share peppers rotated as planned.
 - [ ] Database backup taken.
@@ -48,7 +49,7 @@ Use this checklist with:
 - [ ] Cloudflare Access policy protects admin-web hostname.
 - [ ] Cloudflare WAF/rate-limit rules reviewed.
 - [ ] Raw origin is protected by Tunnel or origin firewall where possible.
-- [ ] Trust proxy env matches the actual Cloudflare/Hostinger path.
+- [ ] Trust proxy env and `TRUSTED_PROXY_CIDRS` match the actual Cloudflare/Hostinger path; raw origin ingress is restricted.
 - [ ] DB pool envs are conservative for the production MySQL host.
 
 ## Deploy
@@ -62,6 +63,7 @@ Use this checklist with:
 ## After Deploy
 
 - [ ] `GET /api/v1/health` OK.
+- [ ] `GET /api/v1/health/ready` confirms database and private storage readiness without exposing a path.
 - [ ] `/docs` is not publicly available.
 - [ ] Admin login works.
 - [ ] Refresh works.
@@ -71,6 +73,9 @@ Use this checklist with:
 - [ ] Repeated bad login attempts trigger throttling.
 - [ ] Public watch valid test link works.
 - [ ] Public watch invalid link remains generic.
+- [ ] Limited public watch returns grant-bearing media URLs; tampered/missing/wrong-host grants fail generically while the final admitted watch can seek.
+- [ ] Removing a website video assignment immediately denies that video's watch/media access.
+- [ ] STAFF write operations and ADMIN purge return `403`; OWNER purge remains guarded by confirmation.
 - [ ] Admin `/admin/videos` works with no `filterKey`, with `filterKey=sml`, and with combined `search` + `filterKey`.
 - [ ] Public watch max-view-limited links are not served from stale cache.
 - [ ] Public watch valid unlimited links still increment `currentViews` and write access logs on repeat requests.

@@ -14,10 +14,11 @@ This document summarizes the live backend auth hardening state. For operational 
 - Login creates an `AdminSession`.
 - Access-token JWT payloads include `sid` and `jti`.
 - The access-token guard verifies JWT signature, payload type, active admin, active session, session expiry, and session revocation.
-- Logout remains idempotent, but now revokes the submitted refresh token and linked session.
+- Logout requires a valid session-bound access token and revokes that `sid` plus every refresh token in the session. The request remains idempotent even when the submitted refresh token is already unknown or revoked; database failures return 5xx instead of false success.
 - Password change revokes all active refresh tokens and all active sessions for the admin.
 - Refresh token rotation remains opaque-token based and hash-only in MySQL.
-- Reuse of a revoked refresh token revokes the linked session when identifiable and writes a safe audit event.
+- Refresh rotation uses a compare-and-set claim. Concurrent reuse revokes the linked session and token family and writes a safe audit event.
+- Admin authorization uses the current database role: `STAFF` is read-only, `ADMIN` may mutate but cannot permanently purge, and `OWNER` may purge.
 - Auth success/failure/replay/logout/password-change events are written to `AdminAuditLog`.
 - Login, refresh, logout, admin APIs, and public watch endpoints are throttled with env-tunable limits.
 - `/docs` is disabled by default in production and requires two explicit flags to mount.
@@ -42,6 +43,8 @@ REFRESH_TOKEN_PEPPER=replace-with-long-random-refresh-token-pepper
 REFRESH_TOKEN_BYTES=32
 REFRESH_TOKEN_EXPIRES_DAYS=30
 SHARE_TOKEN_PEPPER=replace-with-long-random-share-token-pepper
+PUBLIC_MEDIA_GRANT_SECRET=replace-with-an-independent-32-character-or-longer-secret
+PUBLIC_MEDIA_GRANT_TTL_SECONDS=21600
 ACCESS_LOG_IP_PEPPER=replace-with-long-random-ip-hash-pepper
 ```
 
@@ -87,9 +90,10 @@ Use these only when the API is actually behind a trusted reverse proxy path:
 TRUST_PROXY_ENABLED=true
 TRUST_PROXY_HOPS=1
 TRUST_PROXY_CLOUDFLARE_ONLY=false
+TRUSTED_PROXY_CIDRS=<actual-proxy-cidr-list>
 ```
 
-When `TRUST_PROXY_CLOUDFLARE_ONLY=true`, the app may prefer `cf-connecting-ip`. Do not enable this unless direct-to-origin traffic is blocked or otherwise controlled.
+Production requires `TRUSTED_PROXY_CIDRS` whenever trusted proxy mode is enabled. `CF-Connecting-IP` is accepted only when the immediate socket peer matches this allowlist. Do not enable proxy trust unless direct-to-origin traffic is blocked or otherwise controlled.
 
 ## Prisma Pool Defaults
 
@@ -119,6 +123,7 @@ DB_BLOB is a small local/testing fallback only. Large production videos must use
 - [ ] Rotate `REFRESH_TOKEN_PEPPER`.
 - [ ] Rotate `ACCESS_LOG_IP_PEPPER`.
 - [ ] Rotate `SHARE_TOKEN_PEPPER` only with a share-link invalidation plan.
+- [ ] Set a separate `PUBLIC_MEDIA_GRANT_SECRET`; do not reuse or rotate `SHARE_TOKEN_PEPPER` for grants.
 - [ ] Rotate `CLOUDINARY_API_SECRET` in Cloudinary dashboard, then production env, then restart API.
 - [ ] Set `ADMIN_REGISTER_ENABLED=false` unless onboarding is intentionally open.
 - [ ] Apply Prisma migrations before restarting the API.
@@ -126,6 +131,7 @@ DB_BLOB is a small local/testing fallback only. Large production videos must use
 - [ ] Verify `/docs` is not mounted publicly.
 - [ ] Verify repeated bad logins return `429`.
 - [ ] Verify logout makes the old access token fail.
+- [ ] Verify STAFF write and ADMIN purge requests return `403`.
 - [ ] Verify password change makes old access tokens fail.
 - [ ] Verify public watch invalid-token responses remain generic.
 - [ ] Verify production `VIDEO_DB_STORAGE_ENABLED=false`.

@@ -12,6 +12,24 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-18 — Release packaging, CI, and release identity
+
+### Changed
+
+- Created branch `release/2026-07-18-production-hardening` and committed the audited working tree exactly per the persisted manifests (`~/Desktop/bom-media/release-manifests/2026-07-18/`): A1 (24 files, scoped video access + search hardening), A2 (51, auth/accounts/runtime security incl. the test-env fixture), A3 (11, operations docs). Every commit was staged with `git add --pathspec-from-file` and verified name-for-name against its manifest before committing.
+- Added `.github/workflows/ci.yml`: install → prisma generate/validate (placeholder DATABASE_URL, no DB connection) → typecheck → lint → test → format:check → build → `git diff --check`; concurrency cancel, pinned action majors, Node 22, Yarn only.
+- Added safe release identity: optional `APP_RELEASE_VERSION` / `APP_BUILD_SHA` / `APP_BUILD_TIME` (validated strictly when present, never required, never read from `.git` at runtime) surfaced as an additive `release` object on `/health` (and therefore `/health/ready`). New `test/release-identity.test.ts` (+6 tests). Env examples updated.
+- Added `docs/operations/production-release-runbook.md` — full operator pack with placeholders (backup, migrate deploy, restart, API/Admin smoke incl. the filterKey PATCH regression, atomic Admin upload, Cloudflare purge, rollback decision tree).
+
+### Verified
+
+- Post-commit and post-identity suites: typecheck, lint (0 errors), **tests 133/133**, build, format:check, `git diff --check` — clean tree after every commit.
+- Live probe: boot with injected metadata → `/health` returns `release {version, commit, builtAt}`; without metadata the legacy payload shape is unchanged.
+
+### Pending
+
+- Push/merge/deploy are intentionally left to the operator; production evidence remains NOT_VERIFIED until the runbook is executed.
+
 ## 2026-07-18 — CreateVideo filterKey persistence incident
 
 ### Incident

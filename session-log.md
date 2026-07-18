@@ -12,6 +12,32 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-18 — Canonical website-video share links (feature branch)
+
+### Goal
+
+- One stable canonical public URL per website+video pair for DMCA/provenance records: repeated create-or-get returns byte-for-byte the same URL; a different website or video always yields a different alias/URL; nothing is silently replaced.
+
+### Changed
+
+- Schema: additive `CanonicalVideoShareLink` (`@@unique(websiteId, videoId)`, unique `shareLinkId`, snapshotted host/protocol, evidence fingerprint/snapshot; video+domain FKs Restrict, website+shareLink Cascade). Migration `20260718113156_canonical_video_share_links` (applied local only).
+- `CanonicalShareLinkService`: idempotent create-or-get (Serializable tx, DB unique as arbiter, alias/token collision + P2034 retry, raced-loser reload → REUSED), read path with `evidenceDrift`, owner adoption operation (audit in-transaction), domain guard helper. Stable codes: CANONICAL_LINK_{REVOKED,INACTIVE}, CANONICAL_DOMAIN_UNAVAILABLE, CANONICAL_EVIDENCE_DRIFT, CANONICAL_VIDEO_NOT_SHAREABLE.
+- Endpoints: GET/POST `/admin/websites/:websiteId/videos/:videoId/canonical-share-link` (POST accepts no body — no expiry/maxViews/caller alias/token; rawToken only on CREATED).
+- Guards: purge blocked while canonical exists (`VIDEO_HAS_CANONICAL_SHARE_LINK`); domain host-rename and unassign blocked (`DOMAIN_HAS_ACTIVE_CANONICAL_LINKS`); disable/transfer transitively blocked; delete DB-Restricted.
+- **Latent bug fixed for all share-link retries:** with `@prisma/adapter-mariadb`, P2002 has no `meta.target` — the constraint arrives only in `meta.driverAdapterError.cause.constraint.index` (proven by probing MySQL 1062 through the live adapter). New `share-link-errors.util.ts` consults both shapes; the pre-existing alias-collision retry in `createShareLink` silently never matched adapter-shaped errors before this.
+- Tooling: read-only masked audit CLI (`audit:canonical-share-links`, `--counts-only`, never selects tokenHash) + local-only confirmation-gated adoption CLI (`remediate:local:adopt-canonical`). Docs: canonical runbook + owner adoption worksheet.
+
+### Verified (local MySQL 8, real HTTP)
+
+- 20 concurrent create-or-get on one pair → **1 CREATED + 19 REUSED, 0 errors**, one alias/URL/link id across all responses; DB exactly 1 canonical + 1 ShareLink + 1 ShareLinkVideo.
+- Conflict matrix live: title edit → POST 409 CANONICAL_EVIDENCE_DRIFT while GET returns drift=true with unchanged URL; title revert → REUSED same alias; purge → 409; domain unassign → 409; revoke → POST 409 with mapping preserved.
+- Adoption CLI adopted a legacy single-video link (GET then returns the same link id/alias); audit CLI classified 5 pairs.
+- Suites: typecheck, lint 0 errors, **tests 152/152** (18 canonical unit tests incl. both P2002 meta shapes; purge-guard regression), build, format. Fixtures fully cleaned (canonical rows + fixture ShareLinks cascade-deleted; dev titles restored via API).
+
+### Pending
+
+- Production migration/deploy and legacy adoption remain operator work (see canonical runbook). Rotation endpoint intentionally not implemented.
+
 ## 2026-07-18 — Release packaging, CI, and release identity
 
 ### Changed

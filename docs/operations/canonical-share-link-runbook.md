@@ -1,0 +1,84 @@
+# Canonical Video Share Links — Definitions, Operations, Adoption
+
+## Link purposes
+
+| Purpose | Shape | Rules |
+|---|---|---|
+| CANONICAL_VIDEO | exactly one website + one video | one mapping per pair (DB-unique), stable alias, snapshotted host/protocol, no expiresAt/maxViews, never silently replaced |
+| REVIEW_BUNDLE | one website + many videos | created via the generic share-link endpoint; each call may create a new link; **not** the canonical URL of any member video |
+| TEMPORARY_ACCESS | generic link with expiry/maxViews | unchanged legacy behavior, revocable |
+
+Canonical URL format (byte-for-byte stable, recorded in DMCA filings):
+
+```txt
+<protocol>://<snapshotted-host>/#/s/<alias>/videos
+```
+
+It is built only from the `CanonicalVideoShareLink` snapshot — never from the
+currently preferred/primary domain. A canonical URL does not prove copyright
+ownership and does not guarantee DMCA acceptance; the checksum in the evidence
+snapshot proves content integrity only.
+
+## API
+
+```txt
+POST /api/v1/admin/websites/:websiteId/videos/:videoId/canonical-share-link   (idempotent create-or-get)
+GET  /api/v1/admin/websites/:websiteId/videos/:videoId/canonical-share-link   (read-only, reports evidenceDrift)
+```
+
+- Same pair → same ShareLink id, alias, and identical publicUrl; outcome
+  `REUSED`; `rawToken` is returned only on first creation.
+- Stable conflict codes: `CANONICAL_LINK_REVOKED`, `CANONICAL_LINK_INACTIVE`,
+  `CANONICAL_DOMAIN_UNAVAILABLE`, `CANONICAL_EVIDENCE_DRIFT`,
+  `CANONICAL_VIDEO_NOT_SHAREABLE`. No silent replacement, ever.
+
+## Mutation policy while a canonical mapping exists
+
+| Mutation | Policy |
+|---|---|
+| thumbnail/description/filterKey/viewCount edits | ALLOWED_WITHOUT_DRIFT |
+| title / duration / publishedAt / playback / provider / embed identity edit | MARKS_DRIFT → POST returns `CANONICAL_EVIDENCE_DRIFT` until owner review |
+| LOCAL_FILE / DB_BLOB binary replacement | MARKS_DRIFT (checksum/size change) |
+| video disable / assignment deactivate | OWNER action; POST returns `CANONICAL_VIDEO_NOT_SHAREABLE`; URL preserved |
+| video purge | BLOCKED (`VIDEO_HAS_CANONICAL_SHARE_LINK`, DB FK Restrict backs it) |
+| domain host rename / unassign | BLOCKED (`DOMAIN_HAS_ACTIVE_CANONICAL_LINKS`); disable/transfer are transitively blocked because they require unassign first; domain delete is DB-Restricted |
+| share-link revoke | allowed (owner incident action); mapping stays; POST returns `CANONICAL_LINK_REVOKED` |
+| isPrimary toggle | allowed — canonical resolution never depends on primary flag |
+
+Drift/revoked resolution is an OWNER decision. Rotation (new alias for a pair)
+is intentionally **not implemented**; if ever needed it must be a separate
+step-up-authenticated OWNER endpoint that audits old and new ids.
+
+## Legacy audit and adoption (owner-driven, never automatic)
+
+```bash
+yarn audit:canonical-share-links --counts-only   # summary
+yarn audit:canonical-share-links                 # masked owner worksheet
+```
+
+The audit is read-only, masks ids/aliases, never selects tokenHash, and in
+production requires `AUDIT_CONFIRM_READ_ONLY=yes` on a read-only connection.
+See `canonical-share-link-adoption-worksheet.md` for the decision procedure.
+
+Adoption of one chosen legacy link (local tooling; production adoption is a
+manual operator procedure after backup):
+
+```bash
+yarn remediate:local:adopt-canonical \
+  --website-id <id> --video-id <id> --share-link-id <id> \
+  --admin-id <adminUserId> --confirm-local
+```
+
+Adoption verifies: link belongs to the website, contains exactly the target
+video, has an alias, no expiry/maxViews, ACTIVE assignment, READY/playable
+video, a known ACTIVE domain, and no existing mapping; it snapshots evidence
+and writes the audit row in the same transaction. There is no bulk mode.
+
+## Migration and rollback
+
+- Migration `20260718113156_canonical_video_share_links` is additive
+  (CREATE TABLE + FKs). Legacy ShareLink rows are untouched; nothing is
+  auto-marked canonical.
+- Production: `yarn db:migrate:deploy` after backup, then restart. Rollback =
+  redeploy the previous API build; the table is ignored by the old build. Do
+  not drop the table while any canonical URL is in a filing.

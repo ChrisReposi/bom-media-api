@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { BadRequestException } from "@nestjs/common";
+import { BadRequestException, ConflictException } from "@nestjs/common";
 import type { ApiEnvironmentConfig } from "../src/config/env.config";
 import {
   AssignmentStatus,
@@ -182,6 +182,13 @@ class FakePrismaService {
     },
   };
 
+  /** Canonical mappings block purge; tests opt in via this counter. */
+  canonicalLinkCount = 0;
+
+  canonicalVideoShareLink = {
+    count: async (): Promise<number> => this.canonicalLinkCount,
+  };
+
   adminAuditLog = {
     create: async (args: {
       data: {
@@ -332,6 +339,23 @@ describe("VideosService purge reclaim behavior", () => {
       ),
       BadRequestException,
     );
+  });
+
+  it("rejects purge while the video anchors a canonical share link", async () => {
+    const { prisma, service } = createVideosService();
+    prisma.videos.set("video-1", createVideo());
+    prisma.canonicalLinkCount = 1;
+
+    await assert.rejects(
+      service.purgeVideo("video-1", { confirmVideoId: "video-1" }, "admin-1"),
+      (error: unknown) => {
+        assert.ok(error instanceof ConflictException);
+        const body = error.getResponse() as { code?: string };
+        assert.equal(body.code, "VIDEO_HAS_CANONICAL_SHARE_LINK");
+        return true;
+      },
+    );
+    assert.deepEqual(prisma.deletedVideoIds, []);
   });
 
   it("rejects purge while assigned to a website", async () => {

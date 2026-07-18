@@ -38,6 +38,7 @@ type FakeVideoRecord = {
 type AuditRecord = {
   action: string;
   entityId: string;
+  status: AuditStatus;
   metadataJson: unknown;
 };
 
@@ -190,10 +191,10 @@ class FakePrismaService {
         metadataJson: unknown;
       };
     }): Promise<void> => {
-      assert.equal(args.data.status, AuditStatus.SUCCESS);
       this.audits.push({
         action: args.data.action,
         entityId: args.data.entityId,
+        status: args.data.status,
         metadataJson: args.data.metadataJson,
       });
     },
@@ -434,9 +435,12 @@ describe("VideosService purge reclaim behavior", () => {
       "videos/video-1/source/video.mp4",
       "videos/video-1/thumbnails/thumb.jpg",
     ]);
-    assert.equal(prisma.audits.length, 1);
-    assert.equal(prisma.audits[0]?.action, "VIDEO_PURGE");
-    assert.deepEqual(prisma.audits[0]?.metadataJson, {
+    assert.equal(prisma.audits.length, 2);
+    assert.equal(prisma.audits[0]?.action, "VIDEO_PURGE_COMMIT");
+    assert.equal(prisma.audits[0]?.status, AuditStatus.SUCCESS);
+    assert.equal(prisma.audits[1]?.action, "VIDEO_PURGE_STORAGE");
+    assert.equal(prisma.audits[1]?.status, AuditStatus.SUCCESS);
+    assert.deepEqual(prisma.audits[1]?.metadataJson, {
       provider: VideoProvider.MANUAL,
       sourceType: VideoSourceType.LOCAL_FILE,
       hadWebsiteAssignments: false,
@@ -478,6 +482,9 @@ describe("VideosService purge reclaim behavior", () => {
       bytesReclaimed: "25",
       orphanCleanupRequired: true,
     });
+    assert.equal(prisma.audits[0]?.action, "VIDEO_PURGE_COMMIT");
+    assert.equal(prisma.audits[1]?.action, "VIDEO_PURGE_STORAGE");
+    assert.equal(prisma.audits[1]?.status, AuditStatus.FAIL);
   });
 
   it("soft disable does not delete local files", async () => {

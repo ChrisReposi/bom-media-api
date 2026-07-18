@@ -9,6 +9,9 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   createReadStream,
   createWriteStream,
+  constants,
+  lstatSync,
+  realpathSync,
   statSync,
   statfsSync,
   type ReadStream,
@@ -19,6 +22,7 @@ import {
   mkdir,
   readdir,
   rename,
+  realpath,
   rm,
   stat,
   unlink,
@@ -31,7 +35,6 @@ import {
   relative,
   resolve,
 } from "node:path";
-import { once } from "node:events";
 import type { ApiEnvironmentConfig } from "../../config/env.config";
 
 export type LocalStorageRangeResult = {
@@ -114,13 +117,28 @@ export class LocalVideoStorageService {
     this.assertEnabled();
     const root = this.getRoot();
     await mkdir(root, { recursive: true });
+    await realpath(root);
     await this.ensureMinimumFreeSpace(root);
   }
 
+  ensureAvailableCapacity(requiredBytes: number): void {
+    const root = this.getRoot();
+    const statfs = statfsSync(root);
+    const availableBytes = statfs.bavail * statfs.bsize;
+    const reserveBytes = this.getConfig().minFreeSpaceMb * 1024 * 1024;
+    if (availableBytes < reserveBytes + Math.max(requiredBytes, 0)) {
+      throw new BadRequestException(
+        "Local video storage does not have enough free space.",
+      );
+    }
+  }
+
   async ensureDirectoryForKey(storageKey: string): Promise<void> {
-    await mkdir(dirname(this.resolveStoragePath(storageKey)), {
+    const directory = dirname(this.resolveStoragePath(storageKey));
+    await mkdir(directory, {
       recursive: true,
     });
+    this.assertPathSafeSync(directory, false);
   }
 
   async saveUploadedChunk(params: {
@@ -128,9 +146,9 @@ export class LocalVideoStorageService {
     tempStorageKey: string;
     chunkIndex: number;
   }): Promise<LocalStoredFileResult> {
-    const storageKey = this.buildChunkKey(
+    const storageKey = this.joinStorageKey(
       params.tempStorageKey,
-      params.chunkIndex,
+      `chunk-${params.chunkIndex}-${randomUUID()}.part`,
     );
 
     await this.ensureDirectoryForKey(storageKey);
@@ -150,36 +168,52 @@ export class LocalVideoStorageService {
   }
 
   async mergeChunksToFinalFile(params: {
-    tempStorageKey: string;
-    totalChunks: number;
+    tempStorageKey?: string;
+    totalChunks?: number;
+    chunkStorageKeys?: string[];
     finalStorageKey: string;
   }): Promise<LocalStoredFileResult> {
     await this.ensureDirectoryForKey(params.finalStorageKey);
 
+    const chunkStorageKeys =
+      params.chunkStorageKeys ??
+      Array.from({ length: params.totalChunks ?? 0 }, (_, index) =>
+        this.buildChunkKey(params.tempStorageKey ?? "", index),
+      );
+    if (chunkStorageKeys.length === 0) {
+      throw new BadRequestException("Upload has no chunks to merge.");
+    }
+
     const outputPath = this.resolveStoragePath(params.finalStorageKey);
+    const stagingPath = `${outputPath}.partial-${randomUUID()}`;
     const hash = createHash("sha256");
     let sizeBytes = 0;
-    const output = createWriteStream(outputPath, { flags: "wx" });
+    const output = createWriteStream(stagingPath, { flags: "wx" });
+    let outputError: Error | null = null;
+    const captureOutputError = (error: Error): void => {
+      outputError = error;
+    };
+    output.on("error", captureOutputError);
 
     try {
-      for (let index = 0; index < params.totalChunks; index += 1) {
-        const chunkKey = this.buildChunkKey(params.tempStorageKey, index);
+      for (const chunkKey of chunkStorageKeys) {
         const chunkPath = this.resolveStoragePath(chunkKey);
+        this.assertPathSafeSync(chunkPath, true);
         const input = createReadStream(chunkPath);
 
         for await (const chunk of input) {
           const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
           hash.update(buffer);
           sizeBytes += buffer.length;
-          if (!output.write(buffer)) {
-            await once(output, "drain");
-          }
+          await this.writeBuffer(output, buffer);
         }
-
-        await unlink(chunkPath);
       }
 
+      if (outputError !== null) {
+        throw outputError;
+      }
       await this.closeWriteStream(output);
+      await rename(stagingPath, outputPath);
 
       return {
         storageKey: params.finalStorageKey,
@@ -188,8 +222,10 @@ export class LocalVideoStorageService {
       };
     } catch (error) {
       output.destroy();
-      await this.deleteStorageKeyBestEffort(params.finalStorageKey);
+      await rm(stagingPath, { force: true });
       throw error;
+    } finally {
+      output.off("error", captureOutputError);
     }
   }
 
@@ -214,7 +250,9 @@ export class LocalVideoStorageService {
   }
 
   async readMagicBytes(storageKey: string, byteCount = 16): Promise<Buffer> {
-    const stream = createReadStream(this.resolveStoragePath(storageKey), {
+    const filePath = this.resolveStoragePath(storageKey);
+    this.assertPathSafeSync(filePath, true);
+    const stream = createReadStream(filePath, {
       start: 0,
       end: Math.max(byteCount - 1, 0),
     });
@@ -228,7 +266,9 @@ export class LocalVideoStorageService {
   }
 
   async statStorageKey(storageKey: string): Promise<{ size: number }> {
-    const info = await stat(this.resolveStoragePath(storageKey));
+    const filePath = this.resolveStoragePath(storageKey);
+    this.assertPathSafeSync(filePath, true);
+    const info = await stat(filePath);
     if (!info.isFile()) {
       throw new BadRequestException("Stored file is unavailable.");
     }
@@ -241,6 +281,7 @@ export class LocalVideoStorageService {
     rangeHeader?: string | undefined;
   }): LocalStorageRangeResult {
     const filePath = this.resolveStoragePath(params.storageKey);
+    this.assertPathSafeSync(filePath, true);
     const fileSize = this.getFileSizeSync(filePath);
     const range = this.parseRangeHeader(params.rangeHeader, fileSize);
 
@@ -272,6 +313,7 @@ export class LocalVideoStorageService {
     contentLength: number;
   } {
     const filePath = this.resolveStoragePath(storageKey);
+    this.assertPathSafeSync(filePath, true);
     return {
       stream: createReadStream(filePath),
       contentLength: this.getFileSizeSync(filePath),
@@ -286,7 +328,9 @@ export class LocalVideoStorageService {
     }
 
     try {
-      await unlink(this.resolveStoragePath(storageKey));
+      const filePath = this.resolveStoragePath(storageKey);
+      this.assertPathSafeSync(filePath, true);
+      await unlink(filePath);
       await this.pruneEmptyParents(storageKey);
       return true;
     } catch (error) {
@@ -316,7 +360,9 @@ export class LocalVideoStorageService {
     }
 
     try {
-      await rm(this.resolveStoragePath(storageKey), {
+      const directoryPath = this.resolveStoragePath(storageKey);
+      this.assertPathSafeSync(directoryPath, false);
+      await rm(directoryPath, {
         recursive: true,
         force: true,
       });
@@ -420,20 +466,25 @@ export class LocalVideoStorageService {
     sourcePath: string,
     destinationPath: string,
   ): Promise<void> {
+    let copied = false;
     try {
-      await rename(sourcePath, destinationPath);
-    } catch {
-      await copyFile(sourcePath, destinationPath);
+      await copyFile(sourcePath, destinationPath, constants.COPYFILE_EXCL);
+      copied = true;
       await unlink(sourcePath);
+    } catch (error) {
+      if (copied) {
+        await rm(destinationPath, { force: true });
+      }
+      throw error;
     }
   }
 
   private async computeFileChecksum(storageKey: string): Promise<string> {
     const hash = createHash("sha256");
+    const filePath = this.resolveStoragePath(storageKey);
+    this.assertPathSafeSync(filePath, true);
 
-    for await (const chunk of createReadStream(
-      this.resolveStoragePath(storageKey),
-    )) {
+    for await (const chunk of createReadStream(filePath)) {
       hash.update(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     }
 
@@ -441,16 +492,70 @@ export class LocalVideoStorageService {
   }
 
   private async closeWriteStream(output: WriteStream): Promise<void> {
-    output.end();
-    await once(output, "finish");
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      const onFinish = (): void => {
+        output.off("error", onError);
+        resolvePromise();
+      };
+      const onError = (error: Error): void => {
+        output.off("finish", onFinish);
+        rejectPromise(error);
+      };
+
+      output.once("finish", onFinish);
+      output.once("error", onError);
+      output.end();
+    });
+  }
+
+  private async writeBuffer(
+    output: WriteStream,
+    buffer: Buffer,
+  ): Promise<void> {
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      output.write(buffer, (error) => {
+        if (error) {
+          rejectPromise(error);
+          return;
+        }
+        resolvePromise();
+      });
+    });
   }
 
   private getFileSizeSync(filePath: string): number {
+    this.assertPathSafeSync(filePath, true);
     const info = statSync(filePath);
     if (!info.isFile()) {
       throw new BadRequestException("Stored file is unavailable.");
     }
     return info.size;
+  }
+
+  private assertPathSafeSync(path: string, requireFile: boolean): void {
+    const configuredRoot = this.getRoot();
+    const canonicalRoot = realpathSync(configuredRoot);
+    const relativePath = relative(configuredRoot, path);
+    const segments = relativePath.split(/[/\\]/).filter(Boolean);
+    let current = configuredRoot;
+
+    for (const segment of segments) {
+      current = resolve(current, segment);
+      const info = lstatSync(current);
+      if (info.isSymbolicLink()) {
+        throw new BadRequestException("Stored file is unavailable.");
+      }
+    }
+
+    const canonicalPath = realpathSync(path);
+    const canonicalRelative = relative(canonicalRoot, canonicalPath);
+    if (
+      canonicalRelative.startsWith("..") ||
+      isAbsolute(canonicalRelative) ||
+      (requireFile && !lstatSync(path).isFile())
+    ) {
+      throw new BadRequestException("Stored file is unavailable.");
+    }
   }
 
   private parseRangeHeader(

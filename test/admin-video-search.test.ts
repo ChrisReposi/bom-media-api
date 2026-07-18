@@ -14,8 +14,10 @@ import {
   type Prisma,
 } from "../src/generated/prisma/client";
 import { ListVideosQueryDto } from "../src/videos/dto/list-videos-query.dto";
+import { UpdateVideoDto } from "../src/videos/dto/update-video.dto";
 import {
   ADMIN_VIDEO_SEARCH_MAX_LENGTH,
+  escapeAdminVideoSearchLike,
   normalizeAdminVideoSearch,
 } from "../src/videos/utils/video-search.util";
 import {
@@ -445,6 +447,22 @@ describe("admin video search normalization", () => {
   });
 });
 
+describe("admin video search LIKE escaping", () => {
+  it("escapes MySQL LIKE metacharacters so search matches literally", () => {
+    assert.equal(escapeAdminVideoSearchLike("s%l"), "s\\%l");
+    assert.equal(escapeAdminVideoSearchLike("a_b"), "a\\_b");
+    assert.equal(escapeAdminVideoSearchLike("50%"), "50\\%");
+    assert.equal(escapeAdminVideoSearchLike("back\\slash"), "back\\\\slash");
+    assert.equal(escapeAdminVideoSearchLike("%%__"), "\\%\\%\\_\\_");
+  });
+
+  it("leaves normal search text unchanged", () => {
+    assert.equal(escapeAdminVideoSearchLike("sml"), "sml");
+    assert.equal(escapeAdminVideoSearchLike("Tiếng Việt"), "Tiếng Việt");
+    assert.equal(escapeAdminVideoSearchLike("demo-video 01"), "demo-video 01");
+  });
+});
+
 describe("video filter key normalization", () => {
   it("normalizes valid grouping keys", () => {
     assert.equal(normalizeVideoFilterKey("sml"), "sml");
@@ -671,6 +689,53 @@ describe("VideosService admin list search", () => {
     assert.equal(cleared.filterKey, null);
   });
 
+  it("keeps filterKey when a validated metadata-only PATCH omits the field", async () => {
+    // Regression for the production incident: validated DTOs are class
+    // instances whose declared fields are always own properties, so the old
+    // hasOwnProperty guard treated every PATCH as an explicit filterKey write
+    // and cleared the column. Must go through plainToInstance to reproduce
+    // the real pipeline shape — a plain object literal cannot catch this.
+    const { service } = createVideosService();
+
+    const dto = plainToInstance(UpdateVideoDto, { durationSeconds: 42 });
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(dto, "filterKey"),
+      true,
+      "class instance must expose filterKey as an own undefined property",
+    );
+    assert.equal(await validate(dto).then((e) => e.length), 0);
+
+    const updated = await service.updateVideo("ready-1", dto, "admin-1");
+
+    assert.equal(updated.durationSeconds, 42);
+    assert.equal(updated.filterKey, "sml");
+  });
+
+  it("clears and sets filterKey through the validated DTO pipeline", async () => {
+    const { service } = createVideosService();
+
+    const clearedByNull = await service.updateVideo(
+      "ready-1",
+      plainToInstance(UpdateVideoDto, { filterKey: null }),
+      "admin-1",
+    );
+    assert.equal(clearedByNull.filterKey, null);
+
+    const set = await service.updateVideo(
+      "ready-1",
+      plainToInstance(UpdateVideoDto, { filterKey: "SML" }),
+      "admin-1",
+    );
+    assert.equal(set.filterKey, "sml");
+
+    const clearedByEmpty = await service.updateVideo(
+      "ready-1",
+      plainToInstance(UpdateVideoDto, { filterKey: "  " }),
+      "admin-1",
+    );
+    assert.equal(clearedByEmpty.filterKey, null);
+  });
+
   it("stores normalized filterKey in local upload session metadata", async () => {
     const { service, prisma } = createVideosService([]);
 
@@ -709,6 +774,42 @@ describe("VideosService admin list search", () => {
 
     assert.deepEqual(response.items, []);
     assert.equal(response.meta.total, 0);
+  });
+
+  it("passes LIKE-escaped search into the Prisma where clause", async () => {
+    const { service, prisma } = createVideosService();
+
+    await service.listVideos({
+      page: 1,
+      limit: 20,
+      search: "s%l",
+      sortBy: "createdAt",
+      sortOrder: "desc",
+    });
+
+    const where = prisma.lastFindManyArgs?.where;
+    assert.deepEqual(where?.OR, [
+      { title: { contains: "s\\%l" } },
+      { slug: { contains: "s\\%l" } },
+    ]);
+  });
+
+  it("keeps plain search text unescaped in the Prisma where clause", async () => {
+    const { service, prisma } = createVideosService();
+
+    await service.listVideos({
+      page: 1,
+      limit: 20,
+      search: "sml",
+      sortBy: "createdAt",
+      sortOrder: "desc",
+    });
+
+    const where = prisma.lastFindManyArgs?.where;
+    assert.deepEqual(where?.OR, [
+      { title: { contains: "sml" } },
+      { slug: { contains: "sml" } },
+    ]);
   });
 
   it("does not throw for special-character searches", async () => {

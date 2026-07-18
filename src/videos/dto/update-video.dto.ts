@@ -125,7 +125,14 @@ export class UpdateVideoDto {
     nullable: true,
   })
   @IsOptional()
-  @Transform(({ value }) => normalizeVideoFilterKey(value))
+  @Transform(({ value }) =>
+    // Preserve the explicit clear signals. The plain normalizer collapses
+    // null/"" to undefined, which the service must treat as "field omitted";
+    // mapping them to null here keeps the documented clear contract working.
+    value === null || (typeof value === "string" && value.trim() === "")
+      ? null
+      : normalizeVideoFilterKey(value),
+  )
   @IsString()
   @MaxLength(VIDEO_FILTER_KEY_MAX_LENGTH)
   @NotEquals("all", {

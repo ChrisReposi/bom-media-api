@@ -6,6 +6,7 @@ import {
   VideoStatus,
   WebsiteStatus,
 } from "../../generated/prisma/client";
+import { VideoResponse } from "../../videos/types/video-response.type";
 
 export class AdminDomainGroupBasicResponse {
   @ApiProperty()
@@ -136,6 +137,9 @@ export class AdminWebsiteAssignedVideoResponse {
 
   @ApiPropertyOptional({ nullable: true })
   playbackUrl!: string | null;
+
+  @ApiProperty({ type: VideoResponse })
+  video!: VideoResponse;
 }
 
 export class AdminWebsiteResponse {
@@ -199,4 +203,14 @@ export class DisableWebsiteResponse {
 export class AssignWebsiteVideosResponse {
   @ApiProperty({ type: [AdminWebsiteAssignedVideoResponse] })
   items!: AdminWebsiteAssignedVideoResponse[];
+
+  @ApiPropertyOptional()
+  meta?: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+    activeAssignmentTotal: number;
+    eligibleAssignmentTotal: number;
+  };
 }

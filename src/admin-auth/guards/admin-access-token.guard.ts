@@ -6,11 +6,14 @@ import {
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { JwtService } from "@nestjs/jwt";
+import { Reflector } from "@nestjs/core";
 import { PrismaService } from "../../database/prisma.service";
 import { AccountStatus } from "../../generated/prisma/client";
 import type { SafeAdminResponse } from "../types/admin-auth-response.type";
 import type { AdminAuthRequest } from "../types/admin-auth-request.type";
 import type { AdminAccessTokenPayload } from "../types/admin-token-payload.type";
+import { ALLOW_PASSWORD_CHANGE_REQUIRED_METADATA } from "../decorators/allow-password-change-required.decorator";
+import { ForbiddenException } from "@nestjs/common";
 
 @Injectable()
 export class AdminAccessTokenGuard implements CanActivate {
@@ -18,6 +21,7 @@ export class AdminAccessTokenGuard implements CanActivate {
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
+    private readonly reflector: Reflector,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -44,6 +48,8 @@ export class AdminAccessTokenGuard implements CanActivate {
             status: true,
             createdAt: true,
             lastLoginAt: true,
+            mustChangePassword: true,
+            deletedAt: true,
           },
         },
       },
@@ -54,9 +60,24 @@ export class AdminAccessTokenGuard implements CanActivate {
       session.adminId !== payload.sub ||
       session.revokedAt !== null ||
       session.expiresAt <= new Date() ||
-      session.admin.status !== AccountStatus.ACTIVE
+      session.admin.status !== AccountStatus.ACTIVE ||
+      session.admin.deletedAt !== null
     ) {
       throw new UnauthorizedException("Unauthorized.");
+    }
+
+    const allowPasswordChangeRequired =
+      this.reflector.getAllAndOverride<boolean>(
+        ALLOW_PASSWORD_CHANGE_REQUIRED_METADATA,
+        [context.getHandler(), context.getClass()],
+      ) ?? false;
+    if (session.admin.mustChangePassword && !allowPasswordChangeRequired) {
+      throw new ForbiddenException({
+        statusCode: 403,
+        message: "Password change is required before continuing.",
+        error: "Forbidden",
+        code: "ADMIN_PASSWORD_CHANGE_REQUIRED",
+      });
     }
 
     await this.touchSession(session.id, session.lastUsedAt);
@@ -134,6 +155,7 @@ export class AdminAccessTokenGuard implements CanActivate {
       status: admin.status,
       createdAt: admin.createdAt,
       lastLoginAt: admin.lastLoginAt,
+      mustChangePassword: admin.mustChangePassword,
     };
   }
 }

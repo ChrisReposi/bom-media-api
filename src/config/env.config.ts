@@ -22,6 +22,9 @@ export interface ApiEnvironmentConfig {
   trustProxyEnabled: boolean;
   trustProxyHops: number;
   trustProxyCloudflareOnly: boolean;
+  trustedProxyCidrs: string[];
+  adminAccountManagementEnabled: boolean;
+  adminTemporaryPasswordTtlHours: number;
   memoryCache: {
     enabled: boolean;
     maxEntries: number;
@@ -158,6 +161,17 @@ export const apiConfig = registerAs("api", (): ApiEnvironmentConfig => {
     trustProxyCloudflareOnly: parseBoolean(
       process.env.TRUST_PROXY_CLOUDFLARE_ONLY,
       false,
+    ),
+    trustedProxyCidrs: parseOrigins(process.env.TRUSTED_PROXY_CIDRS),
+    adminAccountManagementEnabled: parseBoolean(
+      process.env.ADMIN_ACCOUNT_MANAGEMENT_ENABLED,
+      !isProduction,
+    ),
+    adminTemporaryPasswordTtlHours: parseBoundedInteger(
+      process.env.ADMIN_TEMP_PASSWORD_TTL_HOURS,
+      24,
+      1,
+      168,
     ),
     memoryCache: {
       enabled: parseBoolean(process.env.MEMORY_CACHE_ENABLED, true),

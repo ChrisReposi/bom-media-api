@@ -18,6 +18,8 @@ import {
   ApiTags,
 } from "@nestjs/swagger";
 import type { Request, Response } from "express";
+import type { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import type { ApiEnvironmentConfig } from "../config/env.config";
 import {
   getClientIpFromRequest,
@@ -160,6 +162,7 @@ export class PublicController {
     @Param("token") token: string,
     @Param("videoId") videoId: string,
     @Query("host") host: string,
+    @Query("grant") grant: string | undefined,
     @Req() request: Request,
     @Res() response: Response,
   ): Promise<void> {
@@ -169,6 +172,8 @@ export class PublicController {
       host,
       token,
       videoId,
+      ...(grant === undefined ? {} : { grant }),
+      headOnly: request.method === "HEAD",
       rangeHeader: request.headers.range,
     });
 
@@ -187,6 +192,11 @@ export class PublicController {
 
     if (binary.contentRange !== null) {
       response.setHeader("Content-Range", binary.contentRange);
+    }
+
+    if (request.method === "HEAD") {
+      response.end();
+      return;
     }
 
     response.send(binary.data ?? Buffer.alloc(0));
@@ -209,6 +219,7 @@ export class PublicController {
     @Param("token") token: string,
     @Param("videoId") videoId: string,
     @Query("host") host: string,
+    @Query("grant") grant: string | undefined,
     @Req() request: Request,
     @Res() response: Response,
   ): Promise<void> {
@@ -218,6 +229,7 @@ export class PublicController {
       host,
       token,
       videoId,
+      ...(grant === undefined ? {} : { grant }),
       rangeHeader: request.headers.range,
     });
 
@@ -238,7 +250,11 @@ export class PublicController {
       response.setHeader("Content-Range", result.contentRange);
     }
 
-    pipeStreamToResponse(result.stream, response);
+    await pipeStreamToResponse(
+      result.stream,
+      response,
+      request.method === "HEAD",
+    );
   }
 
   @Get("watch/:token/videos/:videoId/thumbnail")
@@ -258,6 +274,8 @@ export class PublicController {
     @Param("token") token: string,
     @Param("videoId") videoId: string,
     @Query("host") host: string,
+    @Query("grant") grant: string | undefined,
+    @Req() request: Request,
     @Res() response: Response,
   ): Promise<void> {
     setNoStoreHeaders(response);
@@ -266,12 +284,17 @@ export class PublicController {
       host,
       token,
       videoId,
+      ...(grant === undefined ? {} : { grant }),
     });
 
     response.status(HttpStatus.OK);
     response.setHeader("Content-Type", result.mimeType);
     response.setHeader("Content-Length", String(result.contentLength));
-    pipeStreamToResponse(result.stream, response);
+    await pipeStreamToResponse(
+      result.stream,
+      response,
+      request.method === "HEAD",
+    );
   }
 
   private extractClientIp(request: Request): string | undefined {
@@ -281,6 +304,7 @@ export class PublicController {
     return getClientIpFromRequest(request, {
       trustProxyEnabled: apiEnvironment.trustProxyEnabled,
       trustProxyCloudflareOnly: apiEnvironment.trustProxyCloudflareOnly,
+      trustedProxyCidrs: apiEnvironment.trustedProxyCidrs,
     });
   }
 }
@@ -297,24 +321,35 @@ function setNoStoreHeaders(response: Response): void {
   response.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
 }
 
-function pipeStreamToResponse(
+async function pipeStreamToResponse(
   stream: NodeJS.ReadableStream | null,
   response: Response,
-): void {
+  headOnly: boolean,
+): Promise<void> {
   if (stream === null) {
     response.end();
     return;
   }
 
-  let completed = false;
-  response.on("finish", () => {
-    completed = true;
-  });
-  response.on("close", () => {
-    if (!completed) {
-      (stream as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
-    }
-  });
+  const readable = stream as Readable;
+  if (headOnly) {
+    readable.destroy();
+    response.end();
+    return;
+  }
 
-  stream.pipe(response);
+  try {
+    await pipeline(readable, response);
+  } catch (error) {
+    if (
+      response.destroyed ||
+      (typeof error === "object" &&
+        error !== null &&
+        (error as { code?: unknown }).code === "ERR_STREAM_PREMATURE_CLOSE")
+    ) {
+      readable.destroy();
+      return;
+    }
+    throw error;
+  }
 }

@@ -1,7 +1,7 @@
 import "reflect-metadata";
 import assert from "node:assert/strict";
 import { beforeEach, describe, it } from "node:test";
-import { UnauthorizedException } from "@nestjs/common";
+import { ForbiddenException, UnauthorizedException } from "@nestjs/common";
 import type { ExecutionContext } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import { JwtService } from "@nestjs/jwt";
@@ -17,6 +17,8 @@ import {
   AuditStatus,
 } from "../src/generated/prisma/client";
 import { AdminAuthService } from "../src/admin-auth/admin-auth.service";
+import { AdminCredentialService } from "../src/admin-auth/admin-credential.service";
+import { ALLOW_PASSWORD_CHANGE_REQUIRED_METADATA } from "../src/admin-auth/decorators/allow-password-change-required.decorator";
 import { AdminAccessTokenGuard } from "../src/admin-auth/guards/admin-access-token.guard";
 import { apiConfig } from "../src/config/env.config";
 import { validateEnv } from "../src/config/env.validation";
@@ -30,6 +32,9 @@ type AdminRecord = {
   status: AccountStatus;
   createdAt: Date;
   lastLoginAt: Date | null;
+  mustChangePassword: boolean;
+  temporaryPasswordExpiresAt: Date | null;
+  deletedAt: Date | null;
 };
 
 type SessionRecord = {
@@ -63,6 +68,19 @@ type AuditRecord = {
   status: AuditStatus;
   metadataJson?: unknown;
 };
+
+const PRODUCTION_ENV_BASE = {
+  NODE_ENV: "production",
+  APP_ENV: "production",
+  ADMIN_WEB_ORIGIN: "https://admin.example.com",
+  DATABASE_URL: "mysql://user:pass@localhost:3306/db",
+  JWT_ACCESS_SECRET: "secret",
+  REFRESH_TOKEN_PEPPER: "pepper",
+  SHARE_TOKEN_PEPPER: "share-pepper",
+  PUBLIC_MEDIA_GRANT_SECRET: "test-public-media-grant-secret-at-least-32-bytes",
+  ACCESS_LOG_IP_PEPPER: "ip-pepper",
+  ADMIN_CHANGE_PASSWORD_SECRET: "change-secret",
+} as const;
 
 class FakeConfigService {
   private readonly values = new Map<string, string>([
@@ -100,6 +118,8 @@ class FakePrismaService {
 
   private nextSession = 1;
   private nextRefresh = 1;
+  failTransactions = false;
+  private serialTransactionQueue: Promise<void> = Promise.resolve();
 
   adminUser = {
     count: async (): Promise<number> => this.admins.size,
@@ -134,10 +154,26 @@ class FakePrismaService {
 
       return updated;
     },
-    create: async (args: { data: AdminRecord }): Promise<AdminRecord> => {
-      this.admins.set(args.data.id, args.data);
+    create: async (args: {
+      data: Pick<AdminRecord, "username" | "passwordHash" | "role" | "status"> &
+        Partial<AdminRecord>;
+    }): Promise<AdminRecord> => {
+      const admin: AdminRecord = {
+        id: args.data.id ?? `admin-${this.admins.size + 1}`,
+        createdAt: args.data.createdAt ?? new Date(),
+        lastLoginAt: args.data.lastLoginAt ?? null,
+        mustChangePassword: args.data.mustChangePassword ?? false,
+        temporaryPasswordExpiresAt:
+          args.data.temporaryPasswordExpiresAt ?? null,
+        deletedAt: args.data.deletedAt ?? null,
+        username: args.data.username,
+        passwordHash: args.data.passwordHash,
+        role: args.data.role,
+        status: args.data.status,
+      };
+      this.admins.set(admin.id, admin);
 
-      return args.data;
+      return admin;
     },
   };
 
@@ -289,12 +325,21 @@ class FakePrismaService {
       return updated;
     },
     updateMany: async (args: {
-      where: { tokenHash?: string; adminId?: string; revokedAt?: null };
+      where: {
+        id?: string;
+        tokenHash?: string;
+        adminId?: string;
+        sessionId?: string;
+        revokedAt?: null;
+      };
       data: Partial<RefreshTokenRecord>;
     }): Promise<{ count: number }> => {
       let count = 0;
 
       for (const token of this.refreshTokens.values()) {
+        if (args.where.id !== undefined && token.id !== args.where.id) {
+          continue;
+        }
         if (
           args.where.tokenHash !== undefined &&
           token.tokenHash !== args.where.tokenHash
@@ -304,6 +349,12 @@ class FakePrismaService {
         if (
           args.where.adminId !== undefined &&
           token.adminId !== args.where.adminId
+        ) {
+          continue;
+        }
+        if (
+          args.where.sessionId !== undefined &&
+          token.sessionId !== args.where.sessionId
         ) {
           continue;
         }
@@ -330,7 +381,28 @@ class FakePrismaService {
     },
   };
 
-  async $transaction<T>(callback: (tx: this) => Promise<T>): Promise<T> {
+  async $transaction<T>(
+    callback: (tx: this) => Promise<T>,
+    options?: { isolationLevel?: string },
+  ): Promise<T> {
+    if (this.failTransactions) {
+      throw new Error("database unavailable");
+    }
+
+    if (options?.isolationLevel === "Serializable") {
+      const previous = this.serialTransactionQueue;
+      let release: (() => void) | undefined;
+      this.serialTransactionQueue = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await previous;
+      try {
+        return await callback(this);
+      } finally {
+        release?.();
+      }
+    }
+
     return callback(this);
   }
 }
@@ -348,11 +420,13 @@ describe("admin auth hardening", () => {
       prisma as never,
       config as never,
       new JwtService(),
+      new AdminCredentialService(),
     );
     guard = new AdminAccessTokenGuard(
       new JwtService(),
       config as never,
       prisma as never,
+      new Reflector(),
     );
 
     prisma.admins.set("admin-1", {
@@ -363,6 +437,9 @@ describe("admin auth hardening", () => {
       status: AccountStatus.ACTIVE,
       createdAt: new Date("2026-01-01T00:00:00.000Z"),
       lastLoginAt: null,
+      mustChangePassword: false,
+      temporaryPasswordExpiresAt: null,
+      deletedAt: null,
     });
   });
 
@@ -383,6 +460,34 @@ describe("admin auth hardening", () => {
     );
   });
 
+  it("creates only one initial OWNER under concurrent bootstrap requests", async () => {
+    prisma.admins.clear();
+
+    const outcomes = await Promise.allSettled([
+      service.register({
+        username: "owner-one",
+        password: "Strong-password-123!",
+        secretCode: "test-register-secret",
+      }),
+      service.register({
+        username: "owner-two",
+        password: "Strong-password-456!",
+        secretCode: "test-register-secret",
+      }),
+    ]);
+
+    assert.equal(
+      outcomes.filter((outcome) => outcome.status === "fulfilled").length,
+      1,
+    );
+    assert.equal(
+      outcomes.filter((outcome) => outcome.status === "rejected").length,
+      1,
+    );
+    assert.equal(prisma.admins.size, 1);
+    assert.equal(Array.from(prisma.admins.values())[0]?.role, AdminRole.OWNER);
+  });
+
   it("rejects invalid credentials", async () => {
     await assert.rejects(
       service.login({ username: "admin", password: "wrong-password" }),
@@ -391,6 +496,98 @@ describe("admin auth hardening", () => {
     assert.ok(
       prisma.audits.some((audit) => audit.action === "ADMIN_LOGIN_FAILURE"),
     );
+  });
+
+  it("keeps disabled and missing admin login failures generic", async () => {
+    const admin = prisma.admins.get("admin-1");
+    assert.ok(admin);
+    admin.status = AccountStatus.DISABLED;
+
+    await assert.rejects(
+      service.login({ username: "admin", password: "old-password" }),
+      (error: unknown) =>
+        error instanceof UnauthorizedException &&
+        error.message === "Invalid username or password.",
+    );
+    await assert.rejects(
+      service.login({ username: "missing", password: "old-password" }),
+      (error: unknown) =>
+        error instanceof UnauthorizedException &&
+        error.message === "Invalid username or password.",
+    );
+  });
+
+  it("reveals temporary-password expiry only after valid credentials", async () => {
+    const admin = prisma.admins.get("admin-1");
+    assert.ok(admin);
+    admin.mustChangePassword = true;
+    admin.temporaryPasswordExpiresAt = new Date(Date.now() - 1000);
+
+    await assert.rejects(
+      service.login({ username: "admin", password: "wrong-password" }),
+      UnauthorizedException,
+    );
+    await assert.rejects(
+      service.login({ username: "admin", password: "old-password" }),
+      (error: unknown) =>
+        error instanceof ForbiddenException &&
+        (error.getResponse() as { code?: string }).code ===
+          "ADMIN_TEMP_PASSWORD_EXPIRED",
+    );
+    assert.equal(prisma.sessions.size, 0);
+  });
+
+  it("blocks business routes until a temporary password is changed", async () => {
+    const admin = prisma.admins.get("admin-1");
+    assert.ok(admin);
+    admin.mustChangePassword = true;
+    admin.temporaryPasswordExpiresAt = new Date(Date.now() + 60_000);
+    const login = await service.login({
+      username: "admin",
+      password: "old-password",
+    });
+    assert.equal(login.admin.mustChangePassword, true);
+
+    await assert.rejects(
+      guard.canActivate(createAuthContext(login.tokens.accessToken)),
+      (error: unknown) =>
+        error instanceof ForbiddenException &&
+        (error.getResponse() as { code?: string }).code ===
+          "ADMIN_PASSWORD_CHANGE_REQUIRED",
+    );
+
+    const allowedHandler = (): void => undefined;
+    Reflect.defineMetadata(
+      ALLOW_PASSWORD_CHANGE_REQUIRED_METADATA,
+      true,
+      allowedHandler,
+    );
+    assert.equal(
+      await guard.canActivate(
+        createAuthContext(login.tokens.accessToken, allowedHandler),
+      ),
+      true,
+    );
+  });
+
+  it("rechecks account state inside the login transaction", async () => {
+    const originalFindUnique = prisma.adminUser.findUnique;
+    prisma.adminUser.findUnique = async (args) => {
+      const result = await originalFindUnique(args);
+      if (args.where.id === "admin-1") {
+        const current = prisma.admins.get("admin-1");
+        assert.ok(current);
+        current.status = AccountStatus.DISABLED;
+      }
+      return result;
+    };
+
+    await assert.rejects(
+      service.login({ username: "admin", password: "old-password" }),
+      UnauthorizedException,
+    );
+    assert.equal(prisma.sessions.size, 0);
+    assert.equal(prisma.refreshTokens.size, 0);
   });
 
   it("rotates refresh tokens and revokes session on replay", async () => {
@@ -424,13 +621,84 @@ describe("admin auth hardening", () => {
     );
   });
 
+  it("allows only one concurrent refresh claim and revokes the token family", async () => {
+    const login = await service.login({
+      username: "admin",
+      password: "old-password",
+    });
+
+    const outcomes = await Promise.allSettled([
+      service.refresh({ refreshToken: login.tokens.refreshToken }),
+      service.refresh({ refreshToken: login.tokens.refreshToken }),
+    ]);
+
+    assert.equal(
+      outcomes.filter((outcome) => outcome.status === "fulfilled").length,
+      1,
+    );
+    assert.equal(
+      outcomes.filter((outcome) => outcome.status === "rejected").length,
+      1,
+    );
+    assert.equal(
+      Array.from(prisma.sessions.values())[0]?.revokedReason,
+      "REFRESH_REPLAY",
+    );
+    assert.equal(
+      Array.from(prisma.refreshTokens.values()).every(
+        (token) => token.revokedAt !== null,
+      ),
+      true,
+    );
+  });
+
+  it("rechecks disabled account state inside refresh rotation", async () => {
+    const login = await service.login({
+      username: "admin",
+      password: "old-password",
+    });
+    const originalTransaction = prisma.$transaction.bind(prisma);
+    let disableOnNextTransaction = true;
+    prisma.$transaction = async (callback, options) => {
+      if (disableOnNextTransaction) {
+        disableOnNextTransaction = false;
+        const current = prisma.admins.get("admin-1");
+        assert.ok(current);
+        current.status = AccountStatus.DISABLED;
+      }
+      return originalTransaction(callback, options);
+    };
+
+    await assert.rejects(
+      service.refresh({ refreshToken: login.tokens.refreshToken }),
+      UnauthorizedException,
+    );
+    assert.equal(prisma.refreshTokens.size, 1);
+    assert.equal(
+      [...prisma.refreshTokens.values()].every(
+        (token) => token.revokedAt !== null,
+      ),
+      true,
+    );
+    assert.equal(
+      [...prisma.sessions.values()][0]?.revokedReason,
+      "ACCOUNT_STATE_CHANGED",
+    );
+  });
+
   it("logout revokes the current session and makes access token fail", async () => {
     const login = await service.login({
       username: "admin",
       password: "old-password",
     });
 
-    await service.logout({ refreshToken: login.tokens.refreshToken });
+    const sessionId = Array.from(prisma.sessions.keys())[0];
+    assert.ok(sessionId);
+    await service.logout(
+      { refreshToken: login.tokens.refreshToken },
+      "admin-1",
+      sessionId,
+    );
 
     const session = Array.from(prisma.sessions.values())[0];
     assert.equal(session.revokedReason, "LOGOUT");
@@ -438,6 +706,29 @@ describe("admin auth hardening", () => {
     await assert.rejects(
       guard.canActivate(createAuthContext(login.tokens.accessToken)),
       UnauthorizedException,
+    );
+  });
+
+  it("does not report logout success when the revocation transaction fails", async () => {
+    const login = await service.login({
+      username: "admin",
+      password: "old-password",
+    });
+    const sessionId = Array.from(prisma.sessions.keys())[0];
+    assert.ok(sessionId);
+    prisma.failTransactions = true;
+
+    await assert.rejects(
+      service.logout(
+        { refreshToken: login.tokens.refreshToken },
+        "admin-1",
+        sessionId,
+      ),
+      /database unavailable/,
+    );
+    assert.equal(prisma.sessions.get(sessionId)?.revokedAt, null);
+    assert.ok(
+      prisma.audits.some((audit) => audit.action === "ADMIN_LOGOUT_FAILURE"),
     );
   });
 
@@ -469,31 +760,17 @@ describe("production docs gate", () => {
 
     try {
       validateEnv({
-        NODE_ENV: "production",
-        APP_ENV: "production",
+        ...PRODUCTION_ENV_BASE,
         API_INTERNAL_DOCS_ENABLED: "true",
         API_DOCS_ALLOW_IN_PRODUCTION: "false",
-        DATABASE_URL: "mysql://user:pass@localhost:3306/db",
-        JWT_ACCESS_SECRET: "secret",
-        REFRESH_TOKEN_PEPPER: "pepper",
-        SHARE_TOKEN_PEPPER: "share-pepper",
-        ACCESS_LOG_IP_PEPPER: "ip-pepper",
-        ADMIN_CHANGE_PASSWORD_SECRET: "change-secret",
         VIDEO_DB_STORAGE_ENABLED: "false",
       });
       assert.equal(apiConfig().docsEnabled, false);
 
       validateEnv({
-        NODE_ENV: "production",
-        APP_ENV: "production",
+        ...PRODUCTION_ENV_BASE,
         API_INTERNAL_DOCS_ENABLED: "true",
         API_DOCS_ALLOW_IN_PRODUCTION: "true",
-        DATABASE_URL: "mysql://user:pass@localhost:3306/db",
-        JWT_ACCESS_SECRET: "secret",
-        REFRESH_TOKEN_PEPPER: "pepper",
-        SHARE_TOKEN_PEPPER: "share-pepper",
-        ACCESS_LOG_IP_PEPPER: "ip-pepper",
-        ADMIN_CHANGE_PASSWORD_SECRET: "change-secret",
         VIDEO_DB_STORAGE_ENABLED: "false",
       });
       assert.equal(apiConfig().docsEnabled, true);
@@ -525,8 +802,7 @@ describe("public media throttle config", () => {
       assert.equal(config.throttles.publicWatch.limit, 60);
       assert.equal(config.throttles.publicMedia.limit, 1200);
       assert.ok(
-        config.throttles.publicMedia.limit >
-          config.throttles.publicWatch.limit,
+        config.throttles.publicMedia.limit > config.throttles.publicWatch.limit,
       );
     } finally {
       process.env = previousEnv;
@@ -538,28 +814,14 @@ describe("production DB_BLOB guard", () => {
   it("rejects production DB storage without explicit emergency override", () => {
     assert.throws(() =>
       validateEnv({
-        NODE_ENV: "production",
-        APP_ENV: "production",
-        DATABASE_URL: "mysql://user:pass@localhost:3306/db",
-        JWT_ACCESS_SECRET: "secret",
-        REFRESH_TOKEN_PEPPER: "pepper",
-        SHARE_TOKEN_PEPPER: "share-pepper",
-        ACCESS_LOG_IP_PEPPER: "ip-pepper",
-        ADMIN_CHANGE_PASSWORD_SECRET: "change-secret",
+        ...PRODUCTION_ENV_BASE,
         VIDEO_DB_STORAGE_ENABLED: "true",
       }),
     );
 
     assert.doesNotThrow(() =>
       validateEnv({
-        NODE_ENV: "production",
-        APP_ENV: "production",
-        DATABASE_URL: "mysql://user:pass@localhost:3306/db",
-        JWT_ACCESS_SECRET: "secret",
-        REFRESH_TOKEN_PEPPER: "pepper",
-        SHARE_TOKEN_PEPPER: "share-pepper",
-        ACCESS_LOG_IP_PEPPER: "ip-pepper",
-        ADMIN_CHANGE_PASSWORD_SECRET: "change-secret",
+        ...PRODUCTION_ENV_BASE,
         VIDEO_DB_STORAGE_ENABLED: "true",
         VIDEO_DB_STORAGE_ALLOW_PRODUCTION_OVERRIDE: "true",
       }),
@@ -600,8 +862,14 @@ describe("throttling", () => {
   });
 });
 
-function createAuthContext(accessToken: string): ExecutionContext {
+function createAuthContext(
+  accessToken: string,
+  handler: () => void = () => undefined,
+): ExecutionContext {
+  class TestController {}
   return {
+    getHandler: () => handler,
+    getClass: () => TestController,
     switchToHttp() {
       return {
         getRequest() {

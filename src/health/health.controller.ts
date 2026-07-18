@@ -2,7 +2,7 @@ import { Controller, Get } from "@nestjs/common";
 import { ApiOkResponse, ApiTags } from "@nestjs/swagger";
 import { SkipThrottle } from "@nestjs/throttler";
 import { HealthService } from "./health.service";
-import type { HealthResponse } from "./health.service";
+import type { HealthResponse, ReadinessResponse } from "./health.service";
 
 @ApiTags("health")
 @SkipThrottle()
@@ -23,5 +23,11 @@ export class HealthController {
   })
   getHealth(): HealthResponse {
     return this.healthService.getHealth();
+  }
+
+  @Get("ready")
+  @ApiOkResponse({ description: "Database and private storage are ready." })
+  getReadiness(): Promise<ReadinessResponse> {
+    return this.healthService.getReadiness();
   }
 }

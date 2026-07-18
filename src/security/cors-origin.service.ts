@@ -62,9 +62,11 @@ export class CorsOriginService {
 
       return allowedHosts.has(parsedOrigin.host);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
       this.logger.warn(
-        `Dynamic CORS DB domain lookup failed; denying DB-backed origin. ${message}`,
+        {
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        },
+        "Dynamic CORS DB domain lookup failed; denying DB-backed origin.",
       );
 
       return false;
@@ -88,10 +90,13 @@ export class CorsOriginService {
       }
     }
 
-    origins.add(`http://localhost:${apiEnvironment.port}`);
-    origins.add(`http://127.0.0.1:${apiEnvironment.port}`);
+    if (!apiEnvironment.isProduction) {
+      origins.add(`http://localhost:${apiEnvironment.port}`);
+      origins.add(`http://127.0.0.1:${apiEnvironment.port}`);
+    }
 
     if (
+      !apiEnvironment.isProduction &&
       apiEnvironment.host !== "0.0.0.0" &&
       apiEnvironment.host !== "::" &&
       apiEnvironment.host.trim() !== ""

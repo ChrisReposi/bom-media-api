@@ -1,15 +1,15 @@
 import {
-  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
   InternalServerErrorException,
   Logger,
+  NotFoundException,
   UnauthorizedException,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { JwtService } from "@nestjs/jwt";
-import { compare, hash } from "bcryptjs";
+import { hashSync } from "bcryptjs";
 import {
   createHash,
   randomBytes,
@@ -26,10 +26,10 @@ import type { Prisma } from "../generated/prisma/client";
 import {
   AccountStatus,
   AdminRole,
-  type AdminSession,
   AuditStatus,
 } from "../generated/prisma/client";
 import type { ChangeAdminPasswordDto } from "./dto/change-admin-password.dto";
+import type { ChangeOwnAdminPasswordDto } from "./dto/change-own-admin-password.dto";
 import type { LoginAdminDto } from "./dto/login-admin.dto";
 import type { LogoutAdminDto } from "./dto/logout-admin.dto";
 import type { RefreshAdminTokenDto } from "./dto/refresh-admin-token.dto";
@@ -43,8 +43,11 @@ import type {
   RefreshAdminTokenResponse,
   RegisterAdminResponse,
   SafeAdminResponse,
+  AdminOwnSessionListResponse,
+  RevokeOwnAdminSessionResponse,
 } from "./types/admin-auth-response.type";
 import type { AdminAccessTokenPayload } from "./types/admin-token-payload.type";
+import { AdminCredentialService } from "./admin-credential.service";
 
 type AdminAuthRecord = {
   id: string;
@@ -53,6 +56,9 @@ type AdminAuthRecord = {
   status: AccountStatus;
   createdAt: Date;
   lastLoginAt: Date | null;
+  mustChangePassword: boolean;
+  temporaryPasswordExpiresAt: Date | null;
+  deletedAt: Date | null;
 };
 
 type AdminAuthAuditAction =
@@ -64,13 +70,18 @@ type AdminAuthAuditAction =
   | "ADMIN_LOGOUT_SUCCESS"
   | "ADMIN_LOGOUT_FAILURE"
   | "ADMIN_PASSWORD_CHANGE_SUCCESS"
-  | "ADMIN_PASSWORD_CHANGE_FAILURE";
+  | "ADMIN_PASSWORD_CHANGE_FAILURE"
+  | "ADMIN_SESSION_REVOKE_SUCCESS";
 
 type InternalAdminTokenResponse = AdminTokenResponse & {
   sessionId: string;
 };
 
 const PASSWORD_HASH_ROUNDS = 12;
+const DUMMY_PASSWORD_HASH = hashSync(
+  "bom-media-invalid-admin-password",
+  PASSWORD_HASH_ROUNDS,
+);
 
 @Injectable()
 export class AdminAuthService {
@@ -80,6 +91,7 @@ export class AdminAuthService {
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
     private readonly jwtService: JwtService,
+    private readonly credentials: AdminCredentialService,
   ) {}
 
   async register(dto: RegisterAdminDto): Promise<RegisterAdminResponse> {
@@ -91,23 +103,9 @@ export class AdminAuthService {
       throw new ForbiddenException("Admin registration is not allowed.");
     }
 
-    const existingAdminCount = await this.prisma.adminUser.count();
-    if (existingAdminCount > 0) {
-      throw new ConflictException("An admin account already exists.");
-    }
-
-    const username = this.normalizeUsername(dto.username);
-    const passwordHash = await hash(dto.password, PASSWORD_HASH_ROUNDS);
-
-    const admin = await this.prisma.adminUser.create({
-      data: {
-        username,
-        passwordHash,
-        role: AdminRole.OWNER,
-        status: AccountStatus.ACTIVE,
-      },
-      select: this.safeAdminSelect(),
-    });
+    const username = this.credentials.normalizeUsername(dto.username);
+    const passwordHash = await this.credentials.hashPassword(dto.password);
+    const admin = await this.createInitialOwner({ username, passwordHash });
 
     return {
       message: "Admin registered successfully.",
@@ -119,7 +117,7 @@ export class AdminAuthService {
     dto: LoginAdminDto,
     requestMeta?: RequestSecurityMeta,
   ): Promise<LoginAdminResponse> {
-    const username = this.normalizeUsername(dto.username);
+    const username = this.credentials.normalizeUsername(dto.username);
     const admin = await this.prisma.adminUser.findUnique({
       where: { username },
       select: {
@@ -128,7 +126,17 @@ export class AdminAuthService {
       },
     });
 
-    if (admin === null || admin.status !== AccountStatus.ACTIVE) {
+    const passwordMatches = await this.credentials.comparePassword(
+      dto.password,
+      admin?.passwordHash ?? DUMMY_PASSWORD_HASH,
+    );
+
+    if (
+      admin === null ||
+      admin.status !== AccountStatus.ACTIVE ||
+      admin.deletedAt !== null ||
+      !passwordMatches
+    ) {
       await this.writeAuthAudit({
         adminId: admin?.id ?? null,
         action: "ADMIN_LOGIN_FAILURE",
@@ -142,28 +150,23 @@ export class AdminAuthService {
       throw new UnauthorizedException("Invalid username or password.");
     }
 
-    const passwordMatches = await compare(dto.password, admin.passwordHash);
-    if (!passwordMatches) {
-      await this.writeAuthAudit({
-        adminId: admin.id,
-        action: "ADMIN_LOGIN_FAILURE",
-        status: AuditStatus.FAIL,
-        requestMeta,
-        metadata: {
-          reason: "INVALID_CREDENTIALS",
-          username,
-        },
+    if (
+      admin.mustChangePassword &&
+      admin.temporaryPasswordExpiresAt !== null &&
+      admin.temporaryPasswordExpiresAt <= new Date()
+    ) {
+      throw new ForbiddenException({
+        statusCode: 403,
+        message: "Temporary password has expired.",
+        error: "Forbidden",
+        code: "ADMIN_TEMP_PASSWORD_EXPIRED",
       });
-      throw new UnauthorizedException("Invalid username or password.");
     }
 
-    const updatedAdmin = await this.prisma.adminUser.update({
-      where: { id: admin.id },
-      data: { lastLoginAt: new Date() },
-      select: this.safeAdminSelect(),
-    });
-
-    const tokens = await this.buildTokenResponse(updatedAdmin, requestMeta);
+    const { admin: updatedAdmin, tokens } = await this.createLoginTokenResponse(
+      admin,
+      requestMeta,
+    );
 
     await this.writeAuthAudit({
       adminId: updatedAdmin.id,
@@ -210,7 +213,10 @@ export class AdminAuthService {
     }
 
     if (existingToken.revokedAt !== null) {
-      await this.revokeSessionForRefreshReplay(existingToken.sessionId);
+      await this.revokeSessionForRefreshReplay(
+        existingToken.adminId,
+        existingToken.sessionId,
+      );
       await this.writeAuthAudit({
         adminId: existingToken.adminId,
         action: "ADMIN_REFRESH_REPLAY",
@@ -230,7 +236,8 @@ export class AdminAuthService {
       existingToken.session.revokedAt !== null ||
       existingToken.session.expiresAt <= now ||
       existingToken.expiresAt <= now ||
-      existingToken.admin.status !== AccountStatus.ACTIVE
+      existingToken.admin.status !== AccountStatus.ACTIVE ||
+      existingToken.admin.deletedAt !== null
     ) {
       await this.writeAuthAudit({
         adminId: existingToken.adminId,
@@ -250,42 +257,108 @@ export class AdminAuthService {
     const newTokenHash = this.hashRefreshToken(rawRefreshToken);
     const expiresAt = this.getRefreshTokenExpiresAt(now);
 
-    await this.prisma.$transaction(async (tx) => {
-      await tx.adminRefreshToken.update({
-        where: { id: existingToken.id },
-        data: { revokedAt: now },
-      });
+    const rotation = await this.prisma.$transaction(
+      async (tx) => {
+        const claimed = await tx.adminRefreshToken.updateMany({
+          where: {
+            id: existingToken.id,
+            adminId: existingToken.adminId,
+            sessionId: session.id,
+            revokedAt: null,
+          },
+          data: { revokedAt: now },
+        });
+        if (claimed.count !== 1) {
+          return { status: "replay" as const, admin: null };
+        }
 
-      await tx.adminSession.update({
-        where: { id: session.id },
-        data: {
-          lastUsedAt: now,
-          expiresAt,
+        const [currentAdmin, currentSession] = await Promise.all([
+          tx.adminUser.findUnique({
+            where: { id: existingToken.adminId },
+            select: this.safeAdminSelect(),
+          }),
+          tx.adminSession.findUnique({ where: { id: session.id } }),
+        ]);
+        if (
+          currentAdmin === null ||
+          currentAdmin.status !== AccountStatus.ACTIVE ||
+          currentAdmin.deletedAt !== null ||
+          currentSession === null ||
+          currentSession.adminId !== existingToken.adminId ||
+          currentSession.revokedAt !== null ||
+          currentSession.expiresAt <= now
+        ) {
+          await tx.adminRefreshToken.updateMany({
+            where: {
+              adminId: existingToken.adminId,
+              sessionId: session.id,
+              revokedAt: null,
+            },
+            data: { revokedAt: now },
+          });
+          await tx.adminSession.updateMany({
+            where: {
+              id: session.id,
+              adminId: existingToken.adminId,
+              revokedAt: null,
+            },
+            data: { revokedAt: now, revokedReason: "ACCOUNT_STATE_CHANGED" },
+          });
+          return { status: "invalid" as const, admin: null };
+        }
+
+        await tx.adminSession.updateMany({
+          where: {
+            id: session.id,
+            adminId: existingToken.adminId,
+            revokedAt: null,
+          },
+          data: { lastUsedAt: now, expiresAt },
+        });
+        await tx.adminRefreshToken.create({
+          data: {
+            adminId: currentAdmin.id,
+            sessionId: session.id,
+            tokenHash: newTokenHash,
+            expiresAt,
+          },
+        });
+        return { status: "rotated" as const, admin: currentAdmin };
+      },
+      { isolationLevel: "Serializable" },
+    );
+
+    if (rotation.status === "replay") {
+      await this.revokeSessionForRefreshReplay(
+        existingToken.adminId,
+        existingToken.sessionId,
+      );
+      await this.writeAuthAudit({
+        adminId: existingToken.adminId,
+        action: "ADMIN_REFRESH_REPLAY",
+        status: AuditStatus.FAIL,
+        requestMeta,
+        metadata: {
+          reason: "CONCURRENT_REFRESH_REPLAY",
+          sessionId: existingToken.sessionId,
         },
       });
+      throw new UnauthorizedException("Invalid or expired refresh token.");
+    }
 
-      await tx.adminRefreshToken.create({
-        data: {
-          adminId: existingToken.admin.id,
-          sessionId: session.id,
-          tokenHash: newTokenHash,
-          expiresAt,
-        },
-      });
-    });
+    if (rotation.status === "invalid" || rotation.admin === null) {
+      throw new UnauthorizedException("Invalid or expired refresh token.");
+    }
 
     const tokens: AdminTokenResponse = {
-      accessToken: await this.createAccessToken(
-        existingToken.admin,
-        session.id,
-      ),
+      accessToken: await this.createAccessToken(rotation.admin, session.id),
       refreshToken: rawRefreshToken,
       tokenType: "Bearer",
       expiresIn: this.getAccessTokenExpiresInSeconds(),
     };
 
     await this.writeAuthAudit({
-      adminId: existingToken.admin.id,
+      adminId: rotation.admin.id,
       action: "ADMIN_REFRESH_SUCCESS",
       status: AuditStatus.SUCCESS,
       requestMeta,
@@ -296,23 +369,18 @@ export class AdminAuthService {
 
     return {
       message: "Admin session refreshed successfully.",
-      admin: this.toSafeAdmin(existingToken.admin),
+      admin: this.toSafeAdmin(rotation.admin),
       tokens,
     };
   }
 
   async logout(
     dto: LogoutAdminDto,
+    adminId: string,
+    sessionId: string,
     requestMeta?: RequestSecurityMeta,
   ): Promise<LogoutAdminResponse> {
-    const tokenHash = this.hashRefreshToken(dto.refreshToken);
-    const existingToken = await this.prisma.adminRefreshToken.findUnique({
-      where: { tokenHash },
-      select: {
-        adminId: true,
-        sessionId: true,
-      },
-    });
+    void dto.refreshToken;
 
     try {
       const revokedAt = new Date();
@@ -320,7 +388,8 @@ export class AdminAuthService {
       await this.prisma.$transaction(async (tx) => {
         await tx.adminRefreshToken.updateMany({
           where: {
-            tokenHash,
+            adminId,
+            sessionId,
             revokedAt: null,
           },
           data: {
@@ -328,40 +397,33 @@ export class AdminAuthService {
           },
         });
 
-        if (existingToken?.sessionId !== null && existingToken?.sessionId) {
-          await tx.adminSession.updateMany({
-            where: {
-              id: existingToken.sessionId,
-              revokedAt: null,
-            },
-            data: {
-              revokedAt,
-              revokedReason: "LOGOUT",
-            },
-          });
-        }
+        await tx.adminSession.updateMany({
+          where: { id: sessionId, adminId, revokedAt: null },
+          data: { revokedAt, revokedReason: "LOGOUT" },
+        });
       });
 
       await this.writeAuthAudit({
-        adminId: existingToken?.adminId ?? null,
+        adminId,
         action: "ADMIN_LOGOUT_SUCCESS",
         status: AuditStatus.SUCCESS,
         requestMeta,
         metadata: {
-          sessionId: existingToken?.sessionId ?? null,
+          sessionId,
         },
       });
     } catch (error) {
       await this.writeAuthAudit({
-        adminId: existingToken?.adminId ?? null,
+        adminId,
         action: "ADMIN_LOGOUT_FAILURE",
         status: AuditStatus.FAIL,
         requestMeta,
         metadata: {
-          sessionId: existingToken?.sessionId ?? null,
+          sessionId,
           errorName: error instanceof Error ? error.name : "UnknownError",
         },
       });
+      throw error;
     }
 
     return {
@@ -374,6 +436,47 @@ export class AdminAuthService {
     dto: ChangeAdminPasswordDto,
     requestMeta?: RequestSecurityMeta,
   ): Promise<ChangeAdminPasswordResponse> {
+    if (!this.isChangePasswordSecretValid(dto.secretCode)) {
+      await this.writeAuthAudit({
+        adminId,
+        action: "ADMIN_PASSWORD_CHANGE_FAILURE",
+        status: AuditStatus.FAIL,
+        requestMeta,
+        metadata: { reason: "VERIFICATION_FAILED" },
+      });
+      throw new UnauthorizedException("Password change is not allowed.");
+    }
+
+    return this.changeOwnPasswordInternal(
+      adminId,
+      dto.oldPassword,
+      dto.newPassword,
+      requestMeta,
+      false,
+    );
+  }
+
+  async changeOwnPassword(
+    adminId: string,
+    dto: ChangeOwnAdminPasswordDto,
+    requestMeta?: RequestSecurityMeta,
+  ): Promise<ChangeAdminPasswordResponse> {
+    return this.changeOwnPasswordInternal(
+      adminId,
+      dto.currentPassword,
+      dto.newPassword,
+      requestMeta,
+      true,
+    );
+  }
+
+  private async changeOwnPasswordInternal(
+    adminId: string,
+    currentPassword: string,
+    newPassword: string,
+    requestMeta?: RequestSecurityMeta,
+    useStableCurrentPasswordError = false,
+  ): Promise<ChangeAdminPasswordResponse> {
     const admin = await this.prisma.adminUser.findUnique({
       where: { id: adminId },
       select: {
@@ -382,7 +485,11 @@ export class AdminAuthService {
       },
     });
 
-    if (admin === null || admin.status !== AccountStatus.ACTIVE) {
+    if (
+      admin === null ||
+      admin.status !== AccountStatus.ACTIVE ||
+      admin.deletedAt !== null
+    ) {
       await this.writeAuthAudit({
         adminId,
         action: "ADMIN_PASSWORD_CHANGE_FAILURE",
@@ -393,12 +500,11 @@ export class AdminAuthService {
       throw new UnauthorizedException("Unauthorized.");
     }
 
-    const oldPasswordMatches = await compare(
-      dto.oldPassword,
+    const oldPasswordMatches = await this.credentials.comparePassword(
+      currentPassword,
       admin.passwordHash,
     );
-    const secretMatches = this.isChangePasswordSecretValid(dto.secretCode);
-    if (!oldPasswordMatches || !secretMatches) {
+    if (!oldPasswordMatches) {
       await this.writeAuthAudit({
         adminId: admin.id,
         action: "ADMIN_PASSWORD_CHANGE_FAILURE",
@@ -406,63 +512,151 @@ export class AdminAuthService {
         requestMeta,
         metadata: { reason: "VERIFICATION_FAILED" },
       });
+      if (useStableCurrentPasswordError) {
+        throw new ForbiddenException({
+          statusCode: 403,
+          message: "Current password is invalid.",
+          error: "Forbidden",
+          code: "ADMIN_CURRENT_PASSWORD_INVALID",
+        });
+      }
       throw new UnauthorizedException("Password change is not allowed.");
     }
 
-    if (dto.newPassword === dto.oldPassword) {
-      await this.writeAuthAudit({
-        adminId: admin.id,
-        action: "ADMIN_PASSWORD_CHANGE_FAILURE",
-        status: AuditStatus.FAIL,
-        requestMeta,
-        metadata: { reason: "PASSWORD_REUSED" },
-      });
-      throw new BadRequestException(
-        "New password must differ from old password.",
-      );
-    }
-
-    const passwordHash = await hash(dto.newPassword, PASSWORD_HASH_ROUNDS);
+    this.credentials.validateNewPassword({
+      username: admin.username,
+      currentPassword,
+      newPassword,
+    });
+    const passwordHash = await this.credentials.hashPassword(newPassword);
     const revokedAt = new Date();
 
-    await this.prisma.$transaction(async (tx) => {
-      await tx.adminUser.update({
-        where: { id: admin.id },
-        data: { passwordHash },
-      });
+    await this.prisma.$transaction(
+      async (tx) => {
+        const current = await tx.adminUser.findUnique({
+          where: { id: admin.id },
+          select: { passwordHash: true, status: true, deletedAt: true },
+        });
+        if (
+          current === null ||
+          current.passwordHash !== admin.passwordHash ||
+          current.status !== AccountStatus.ACTIVE ||
+          current.deletedAt !== null
+        ) {
+          throw new UnauthorizedException("Unauthorized.");
+        }
 
-      await tx.adminRefreshToken.updateMany({
-        where: {
-          adminId: admin.id,
-          revokedAt: null,
-        },
-        data: { revokedAt },
-      });
+        await tx.adminUser.update({
+          where: { id: admin.id },
+          data: {
+            passwordHash,
+            mustChangePassword: false,
+            passwordChangedAt: revokedAt,
+            temporaryPasswordExpiresAt: null,
+          },
+        });
 
-      await tx.adminSession.updateMany({
-        where: {
-          adminId: admin.id,
-          revokedAt: null,
-        },
-        data: {
-          revokedAt,
-          revokedReason: "PASSWORD_CHANGE",
-        },
-      });
-    });
+        await tx.adminRefreshToken.updateMany({
+          where: { adminId: admin.id, revokedAt: null },
+          data: { revokedAt },
+        });
 
-    await this.writeAuthAudit({
-      adminId: admin.id,
-      action: "ADMIN_PASSWORD_CHANGE_SUCCESS",
-      status: AuditStatus.SUCCESS,
-      requestMeta,
-      metadata: {
-        sessionsRevokedAt: revokedAt.toISOString(),
+        const revokedSessions = await tx.adminSession.updateMany({
+          where: { adminId: admin.id, revokedAt: null },
+          data: { revokedAt, revokedReason: "PASSWORD_CHANGE" },
+        });
+        await tx.adminAuditLog.create({
+          data: {
+            adminId: admin.id,
+            action: "ADMIN_PASSWORD_CHANGE_SUCCESS",
+            module: "admin-auth",
+            entityType: "AdminUser",
+            entityId: admin.id,
+            status: AuditStatus.SUCCESS,
+            ipHash: this.getIpHash(requestMeta),
+            userAgent: truncateRequestValue(requestMeta?.userAgent, 1024),
+            metadataJson: this.toJsonInput({
+              revokedSessionCount: revokedSessions.count,
+            }),
+          },
+        });
       },
-    });
+      { isolationLevel: "Serializable" },
+    );
 
     return {
       message: "Password changed successfully. Please login again.",
+    };
+  }
+
+  async listOwnSessions(
+    adminId: string,
+    currentSessionId: string,
+  ): Promise<AdminOwnSessionListResponse> {
+    const now = new Date();
+    const sessions = await this.prisma.adminSession.findMany({
+      where: { adminId, revokedAt: null, expiresAt: { gt: now } },
+      orderBy: [{ lastUsedAt: "desc" }, { createdAt: "desc" }],
+      select: {
+        id: true,
+        createdAt: true,
+        lastUsedAt: true,
+        expiresAt: true,
+      },
+    });
+    return {
+      items: sessions.map((session) => ({
+        ...session,
+        isCurrent: session.id === currentSessionId,
+      })),
+    };
+  }
+
+  async revokeOwnSession(
+    adminId: string,
+    currentSessionId: string,
+    sessionId: string,
+  ): Promise<RevokeOwnAdminSessionResponse> {
+    const revokedAt = new Date();
+    const result = await this.prisma.$transaction(async (tx) => {
+      const target = await tx.adminSession.findFirst({
+        where: { id: sessionId, adminId },
+        select: { id: true },
+      });
+      if (target === null) {
+        throw new NotFoundException({
+          statusCode: 404,
+          message: "Session not found.",
+          error: "Not Found",
+          code: "ADMIN_SESSION_NOT_FOUND",
+        });
+      }
+      await tx.adminRefreshToken.updateMany({
+        where: { adminId, sessionId, revokedAt: null },
+        data: { revokedAt },
+      });
+      await tx.adminSession.updateMany({
+        where: { id: sessionId, adminId, revokedAt: null },
+        data: { revokedAt, revokedReason: "SELF_REVOKE" },
+      });
+      await tx.adminAuditLog.create({
+        data: {
+          adminId,
+          action: "ADMIN_SESSION_REVOKE_SUCCESS",
+          module: "admin-auth",
+          entityType: "AdminSession",
+          entityId: sessionId,
+          status: AuditStatus.SUCCESS,
+          metadataJson: this.toJsonInput({
+            currentSession: sessionId === currentSessionId,
+          }),
+        },
+      });
+      return sessionId === currentSessionId;
+    });
+    return {
+      message: "Session revoked successfully.",
+      currentSessionRevoked: result,
     };
   }
 
@@ -472,7 +666,11 @@ export class AdminAuthService {
       select: this.safeAdminSelect(),
     });
 
-    if (admin === null || admin.status !== AccountStatus.ACTIVE) {
+    if (
+      admin === null ||
+      admin.status !== AccountStatus.ACTIVE ||
+      admin.deletedAt !== null
+    ) {
       throw new UnauthorizedException("Unauthorized.");
     }
 
@@ -485,10 +683,53 @@ export class AdminAuthService {
     const value = this.configService.get<string>("ADMIN_REGISTER_ENABLED");
 
     if (value === undefined || value.trim() === "") {
-      return true;
+      return false;
     }
 
     return value.toLowerCase() !== "false" && value !== "0";
+  }
+
+  private async createInitialOwner(params: {
+    username: string;
+    passwordHash: string;
+  }): Promise<AdminAuthRecord> {
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        return await this.prisma.$transaction(
+          async (tx) => {
+            if ((await tx.adminUser.count()) > 0) {
+              throw new ConflictException("An admin account already exists.");
+            }
+
+            return tx.adminUser.create({
+              data: {
+                username: params.username,
+                passwordHash: params.passwordHash,
+                role: AdminRole.OWNER,
+                status: AccountStatus.ACTIVE,
+              },
+              select: this.safeAdminSelect(),
+            });
+          },
+          { isolationLevel: "Serializable" },
+        );
+      } catch (error) {
+        if (this.isPrismaWriteConflict(error) && attempt < 3) {
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw new ConflictException("An admin account already exists.");
+  }
+
+  private isPrismaWriteConflict(error: unknown): boolean {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      (error as { code?: unknown }).code === "P2034"
+    );
   }
 
   private isSecretCodeValid(secretCode: string): boolean {
@@ -529,29 +770,119 @@ export class AdminAuthService {
     return createHash("sha256").update(value).digest();
   }
 
-  private async buildTokenResponse(
-    admin: AdminAuthRecord,
+  private async createLoginTokenResponse(
+    initialAdmin: AdminAuthRecord & { passwordHash: string },
     requestMeta?: RequestSecurityMeta,
-  ): Promise<InternalAdminTokenResponse> {
+  ): Promise<{ admin: AdminAuthRecord; tokens: InternalAdminTokenResponse }> {
     const now = new Date();
     const expiresAt = this.getRefreshTokenExpiresAt(now);
-    const session = await this.createAdminSession({
-      adminId: admin.id,
-      expiresAt,
-      requestMeta,
-    });
+    const sessionId = randomUUID();
+    const rawRefreshToken = this.generateRawRefreshToken();
+    const tokenHash = this.hashRefreshToken(rawRefreshToken);
+
+    const admin = await this.prisma.$transaction(
+      async (tx) => {
+        const current = await tx.adminUser.findUnique({
+          where: { id: initialAdmin.id },
+          select: {
+            ...this.safeAdminSelect(),
+            passwordHash: true,
+          },
+        });
+        if (
+          current === null ||
+          current.passwordHash !== initialAdmin.passwordHash ||
+          current.status !== AccountStatus.ACTIVE ||
+          current.deletedAt !== null
+        ) {
+          return null;
+        }
+        if (
+          current.mustChangePassword &&
+          current.temporaryPasswordExpiresAt !== null &&
+          current.temporaryPasswordExpiresAt <= now
+        ) {
+          throw new ForbiddenException({
+            statusCode: 403,
+            message: "Temporary password has expired.",
+            error: "Forbidden",
+            code: "ADMIN_TEMP_PASSWORD_EXPIRED",
+          });
+        }
+
+        const updated = await tx.adminUser.update({
+          where: { id: current.id },
+          data: { lastLoginAt: now },
+          select: this.safeAdminSelect(),
+        });
+        await tx.adminSession.create({
+          data: {
+            id: sessionId,
+            adminId: current.id,
+            expiresAt,
+            lastUsedAt: now,
+            ipHash: this.getIpHash(requestMeta),
+            userAgentHash: this.getUserAgentHash(requestMeta),
+            userAgent: truncateRequestValue(requestMeta?.userAgent, 512),
+          },
+        });
+        await tx.adminRefreshToken.create({
+          data: {
+            adminId: current.id,
+            sessionId,
+            tokenHash,
+            expiresAt,
+          },
+        });
+        return updated;
+      },
+      { isolationLevel: "Serializable" },
+    );
+
+    if (admin === null) {
+      throw new UnauthorizedException("Invalid username or password.");
+    }
+
+    let accessToken: string;
+    try {
+      accessToken = await this.createAccessToken(admin, sessionId);
+    } catch (error) {
+      await this.revokeSessionByOwner(
+        admin.id,
+        sessionId,
+        "TOKEN_SIGN_FAILURE",
+      );
+      throw error;
+    }
 
     return {
-      accessToken: await this.createAccessToken(admin, session.id),
-      refreshToken: await this.createRefreshToken(
-        admin.id,
-        session.id,
-        expiresAt,
-      ),
-      tokenType: "Bearer",
-      expiresIn: this.getAccessTokenExpiresInSeconds(),
-      sessionId: session.id,
+      admin,
+      tokens: {
+        accessToken,
+        refreshToken: rawRefreshToken,
+        tokenType: "Bearer",
+        expiresIn: this.getAccessTokenExpiresInSeconds(),
+        sessionId,
+      },
     };
+  }
+
+  private async revokeSessionByOwner(
+    adminId: string,
+    sessionId: string,
+    reason: string,
+  ): Promise<void> {
+    const revokedAt = new Date();
+    await this.prisma.$transaction([
+      this.prisma.adminRefreshToken.updateMany({
+        where: { adminId, sessionId, revokedAt: null },
+        data: { revokedAt },
+      }),
+      this.prisma.adminSession.updateMany({
+        where: { id: sessionId, adminId, revokedAt: null },
+        data: { revokedAt, revokedReason: reason },
+      }),
+    ]);
   }
 
   private async createAccessToken(
@@ -570,42 +901,6 @@ export class AdminAuthService {
     return this.jwtService.signAsync(payload, {
       secret: this.configService.getOrThrow<string>("JWT_ACCESS_SECRET"),
       expiresIn: this.getAccessTokenExpiresInSeconds(),
-    });
-  }
-
-  private async createRefreshToken(
-    adminId: string,
-    sessionId: string,
-    expiresAt: Date,
-  ): Promise<string> {
-    const rawRefreshToken = this.generateRawRefreshToken();
-
-    await this.prisma.adminRefreshToken.create({
-      data: {
-        adminId,
-        sessionId,
-        tokenHash: this.hashRefreshToken(rawRefreshToken),
-        expiresAt,
-      },
-    });
-
-    return rawRefreshToken;
-  }
-
-  private async createAdminSession(params: {
-    adminId: string;
-    expiresAt: Date;
-    requestMeta?: RequestSecurityMeta | undefined;
-  }): Promise<AdminSession> {
-    return this.prisma.adminSession.create({
-      data: {
-        adminId: params.adminId,
-        expiresAt: params.expiresAt,
-        lastUsedAt: new Date(),
-        ipHash: this.getIpHash(params.requestMeta),
-        userAgentHash: this.getUserAgentHash(params.requestMeta),
-        userAgent: truncateRequestValue(params.requestMeta?.userAgent, 512),
-      },
     });
   }
 
@@ -680,10 +975,6 @@ export class AdminAuthService {
     };
   }
 
-  private normalizeUsername(username: string): string {
-    return username.trim().toLowerCase();
-  }
-
   private safeAdminSelect() {
     return {
       id: true,
@@ -692,6 +983,9 @@ export class AdminAuthService {
       status: true,
       createdAt: true,
       lastLoginAt: true,
+      mustChangePassword: true,
+      temporaryPasswordExpiresAt: true,
+      deletedAt: true,
     } as const;
   }
 
@@ -703,25 +997,28 @@ export class AdminAuthService {
       status: admin.status,
       createdAt: admin.createdAt,
       lastLoginAt: admin.lastLoginAt,
+      mustChangePassword: admin.mustChangePassword,
     };
   }
 
   private async revokeSessionForRefreshReplay(
+    adminId: string,
     sessionId: string | null,
   ): Promise<void> {
     if (sessionId === null) {
       return;
     }
 
-    await this.prisma.adminSession.updateMany({
-      where: {
-        id: sessionId,
-        revokedAt: null,
-      },
-      data: {
-        revokedAt: new Date(),
-        revokedReason: "REFRESH_REPLAY",
-      },
+    const revokedAt = new Date();
+    await this.prisma.$transaction(async (tx) => {
+      await tx.adminRefreshToken.updateMany({
+        where: { adminId, sessionId, revokedAt: null },
+        data: { revokedAt },
+      });
+      await tx.adminSession.updateMany({
+        where: { id: sessionId, adminId, revokedAt: null },
+        data: { revokedAt, revokedReason: "REFRESH_REPLAY" },
+      });
     });
   }
 

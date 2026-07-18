@@ -17,6 +17,7 @@ export function buildThrottlerOptions(
   const proxyOptions = {
     trustProxyEnabled: apiEnvironment.trustProxyEnabled,
     trustProxyCloudflareOnly: apiEnvironment.trustProxyCloudflareOnly,
+    trustedProxyCidrs: apiEnvironment.trustedProxyCidrs,
   };
 
   return {

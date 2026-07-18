@@ -107,21 +107,27 @@ enum AuditStatus {
 }
 
 model AdminUser {
-  id           String        @id @default(cuid())
-  username     String        @unique @db.VarChar(32)
-  passwordHash String        @db.VarChar(255)
-  role         AdminRole     @default(STAFF)
-  status       AccountStatus @default(ACTIVE)
-  lastLoginAt  DateTime?
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
+  id                         String        @id @default(cuid())
+  username                   String        @unique @db.VarChar(32)
+  passwordHash               String        @db.VarChar(255)
+  role                       AdminRole     @default(STAFF)
+  status                     AccountStatus @default(ACTIVE)
+  mustChangePassword         Boolean       @default(false)
+  passwordChangedAt          DateTime?
+  temporaryPasswordExpiresAt DateTime?
+  deletedAt                  DateTime?
+  lastLoginAt                DateTime?
+  createdAt                  DateTime      @default(now())
+  updatedAt                  DateTime      @updatedAt
 
-  refreshTokens AdminRefreshToken[]
-  sessions      AdminSession[]
-  auditLogs     AdminAuditLog[]
+  refreshTokens  AdminRefreshToken[]
+  sessions       AdminSession[]
+  auditLogs      AdminAuditLog[]
   uploadSessions VideoUploadSession[]
 
   @@index([status])
+  @@index([deletedAt, createdAt])
+  @@index([deletedAt, status, role, createdAt])
 }
 
 model AdminSession {
@@ -143,6 +149,7 @@ model AdminSession {
   @@index([adminId])
   @@index([expiresAt])
   @@index([revokedAt])
+  @@index([adminId, revokedAt, expiresAt])
 }
 
 model AdminRefreshToken {
@@ -161,6 +168,7 @@ model AdminRefreshToken {
   @@index([adminId])
   @@index([sessionId])
   @@index([expiresAt])
+  @@index([adminId, revokedAt, expiresAt])
 }
 
 model VideoAsset {
@@ -188,14 +196,14 @@ model VideoAsset {
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
 
-  websiteVideos   WebsiteVideo[]
-  shareLinkVideos ShareLinkVideo[]
-  binaryAsset     VideoBinaryAsset?
-  localFileAsset  VideoLocalFileAsset?
+  websiteVideos       WebsiteVideo[]
+  shareLinkVideos     ShareLinkVideo[]
+  binaryAsset         VideoBinaryAsset?
+  localFileAsset      VideoLocalFileAsset?
   localThumbnailAsset VideoLocalThumbnailAsset?
-  uploadSessions  VideoUploadSession[]
-  viewGrowthBuckets VideoViewGrowthBucket[]
-  viewGrowthEvents  VideoViewGrowthEvent[]
+  uploadSessions      VideoUploadSession[]
+  viewGrowthBuckets   VideoViewGrowthBucket[]
+  viewGrowthEvents    VideoViewGrowthEvent[]
 
   @@index([status])
   @@index([status, createdAt])
@@ -279,14 +287,16 @@ model VideoUploadSession {
   createdAt        DateTime                 @default(now())
   updatedAt        DateTime                 @updatedAt
 
-  admin  AdminUser   @relation(fields: [adminId], references: [id], onDelete: Cascade)
-  video  VideoAsset? @relation(fields: [videoId], references: [id], onDelete: SetNull)
+  admin  AdminUser                 @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  video  VideoAsset?               @relation(fields: [videoId], references: [id], onDelete: SetNull)
   chunks VideoUploadSessionChunk[]
 
   @@index([adminId])
   @@index([videoId])
   @@index([status])
   @@index([expiresAt])
+  @@index([status, expiresAt])
+  @@index([status, createdAt])
 }
 
 model VideoUploadSessionChunk {
@@ -359,6 +369,8 @@ model Website {
 
   @@index([status])
   @@index([domainGroupId])
+  @@index([createdAt])
+  @@index([status, createdAt])
 }
 
 model DomainGroup {
@@ -374,6 +386,7 @@ model DomainGroup {
   domains  WebsiteDomain[]
 
   @@index([status])
+  @@index([status, key])
 }
 
 model WebsiteDomain {
@@ -392,6 +405,7 @@ model WebsiteDomain {
   @@index([websiteId])
   @@index([domainGroupId])
   @@index([status])
+  @@index([status, domain])
 }
 
 model ThemeConfig {
@@ -455,6 +469,7 @@ model ShareLink {
   @@index([status])
   @@index([websiteId, status])
   @@index([expiresAt])
+  @@index([websiteId, createdAt])
 }
 
 model ShareLinkVideo {

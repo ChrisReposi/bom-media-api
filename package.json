@@ -17,6 +17,8 @@
     "test": "tsx --import ./test/test-env.ts --test test/*.test.ts",
     "audit:share-link-assignments": "tsx scripts/audit/share-link-assignment-audit.ts",
     "audit:admin-accounts": "tsx scripts/audit/admin-account-audit.ts",
+    "audit:canonical-share-links": "cross-env APP_ENV=local DOTENV_CONFIG_PATH=.env.local tsx scripts/audit/canonical-share-link-audit.ts",
+    "remediate:local:adopt-canonical": "cross-env APP_ENV=local DOTENV_CONFIG_PATH=.env.local tsx scripts/remediate/adopt-canonical-share-link.ts",
     "cleanup:admin-sessions": "tsx scripts/operations/cleanup-admin-sessions.ts",
     "remediate:local:website-video": "cross-env APP_ENV=local DOTENV_CONFIG_PATH=.env.local tsx scripts/remediate/assign-local-website-video.ts",
     "smoke:local:share-link-assignment": "cross-env APP_ENV=local DOTENV_CONFIG_PATH=.env.local tsx scripts/smoke/share-link-assignment-local-smoke.ts",

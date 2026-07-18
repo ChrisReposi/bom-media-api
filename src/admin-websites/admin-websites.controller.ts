@@ -24,6 +24,8 @@ import {
   ApiUnauthorizedResponse,
 } from "@nestjs/swagger";
 import { CurrentAdmin } from "../admin-auth/decorators/current-admin.decorator";
+import { CanonicalShareLinkService } from "./canonical-share-link.service";
+import { CanonicalShareLinkResponse } from "./types/canonical-share-link-response.type";
 import {
   AdminReadRoles,
   AdminWriteRoles,
@@ -80,7 +82,10 @@ import {
 @ThrottleProfile(THROTTLE_PROFILES.admin)
 @Controller("admin")
 export class AdminWebsitesController {
-  constructor(private readonly websitesService: AdminWebsitesService) {}
+  constructor(
+    private readonly websitesService: AdminWebsitesService,
+    private readonly canonicalShareLinkService: CanonicalShareLinkService,
+  ) {}
 
   @Get("domain-groups")
   @AdminReadRoles()
@@ -499,6 +504,50 @@ export class AdminWebsitesController {
     @CurrentAdmin() admin: SafeAdminResponse,
   ): Promise<CreateShareLinkResponse> {
     return this.websitesService.createShareLink(websiteId, dto, admin.id);
+  }
+
+  @Get("websites/:websiteId/videos/:videoId/canonical-share-link")
+  @AdminReadRoles()
+  @ApiOperation({
+    summary: "Get canonical share link for a website+video pair",
+    description:
+      "Read-only. Returns the stable canonical URL; never creates or rotates.",
+  })
+  @ApiOkResponse({ type: CanonicalShareLinkResponse })
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  getCanonicalShareLink(
+    @Param("websiteId") websiteId: string,
+    @Param("videoId") videoId: string,
+  ): Promise<CanonicalShareLinkResponse> {
+    return this.canonicalShareLinkService.getCanonical(websiteId, videoId);
+  }
+
+  @Post("websites/:websiteId/videos/:videoId/canonical-share-link")
+  @AdminWriteRoles()
+  @ApiOperation({
+    summary: "Create-or-get canonical share link (idempotent)",
+    description:
+      "Same website+video always returns the same alias and byte-for-byte the same publicUrl. No expiry, maxViews, caller alias, or caller token are accepted. rawToken is returned only on first creation.",
+  })
+  @ApiCreatedResponse({ type: CanonicalShareLinkResponse })
+  @ApiBadRequestResponse()
+  @ApiConflictResponse({
+    description:
+      "Stable codes: CANONICAL_LINK_REVOKED, CANONICAL_LINK_INACTIVE, CANONICAL_DOMAIN_UNAVAILABLE, CANONICAL_EVIDENCE_DRIFT, CANONICAL_VIDEO_NOT_SHAREABLE.",
+  })
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  createCanonicalShareLink(
+    @Param("websiteId") websiteId: string,
+    @Param("videoId") videoId: string,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<CanonicalShareLinkResponse> {
+    return this.canonicalShareLinkService.createOrGetCanonical(
+      websiteId,
+      videoId,
+      admin.id,
+    );
   }
 
   @Post("share-links/:shareLinkId/revoke")

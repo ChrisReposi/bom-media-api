@@ -204,6 +204,7 @@ model VideoAsset {
   uploadSessions      VideoUploadSession[]
   viewGrowthBuckets   VideoViewGrowthBucket[]
   viewGrowthEvents    VideoViewGrowthEvent[]
+  canonicalShareLinks CanonicalVideoShareLink[]
 
   @@index([status])
   @@index([status, createdAt])
@@ -366,6 +367,7 @@ model Website {
   websiteVideos WebsiteVideo[]
   shareLinks    ShareLink[]
   accessLogs    AccessLog[]
+  canonicalVideoShareLinks CanonicalVideoShareLink[]
 
   @@index([status])
   @@index([domainGroupId])
@@ -401,6 +403,7 @@ model WebsiteDomain {
 
   website     Website?     @relation(fields: [websiteId], references: [id], onDelete: SetNull)
   domainGroup DomainGroup? @relation(fields: [domainGroupId], references: [id], onDelete: SetNull)
+  canonicalVideoShareLinks CanonicalVideoShareLink[]
 
   @@index([websiteId])
   @@index([domainGroupId])
@@ -464,6 +467,7 @@ model ShareLink {
   website         Website          @relation(fields: [websiteId], references: [id], onDelete: Cascade)
   shareLinkVideos ShareLinkVideo[]
   accessLogs      AccessLog[]
+  canonicalVideoShareLink CanonicalVideoShareLink?
 
   @@index([websiteId])
   @@index([status])
@@ -486,6 +490,33 @@ model ShareLinkVideo {
   @@index([shareLinkId])
   @@index([videoId])
   @@index([shareLinkId, sortOrder])
+}
+
+// One immutable canonical mapping per website+video pair for DMCA/provenance
+// records. The host/protocol are snapshotted at creation so the canonical URL
+// never follows whichever domain is primary later. Video and domain use
+// Restrict so purge/delete cannot silently orphan an evidence URL.
+model CanonicalVideoShareLink {
+  id                    String   @id @default(cuid())
+  websiteId             String
+  videoId               String
+  shareLinkId           String   @unique
+  canonicalDomainId     String
+  canonicalHostSnapshot String   @db.VarChar(253)
+  canonicalProtocol     String   @db.VarChar(8)
+  evidenceFingerprint   String?  @db.VarChar(128)
+  evidenceSnapshotJson  Json?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  website         Website       @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  video           VideoAsset    @relation(fields: [videoId], references: [id], onDelete: Restrict)
+  shareLink       ShareLink     @relation(fields: [shareLinkId], references: [id], onDelete: Cascade)
+  canonicalDomain WebsiteDomain @relation(fields: [canonicalDomainId], references: [id], onDelete: Restrict)
+
+  @@unique([websiteId, videoId])
+  @@index([canonicalDomainId])
+  @@index([videoId])
 }
 
 model AccessLog {

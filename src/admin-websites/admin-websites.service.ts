@@ -79,6 +79,7 @@ import {
 } from "./utils/normalize-domain.util";
 import { CorsOriginService } from "../security/cors-origin.service";
 import { isShortAdminWebsiteSearch } from "./utils/admin-website-search.util";
+import { isShareLinkTokenOrAliasCollision } from "./utils/share-link-errors.util";
 import {
   buildPublicShareUrl,
   generateShareAlias,
@@ -471,6 +472,11 @@ export class AdminWebsitesService {
       const domain = this.parseDomain(dto.domain);
       this.ensureLocalhostDomainAllowed(domain);
       await this.ensureDomainAvailable(domain, existingDomain.id);
+      if (domain !== existingDomain.domain) {
+        // A host rename would break canonical URL resolution for recorded
+        // provenance links, which resolve by exact host.
+        await this.ensureDomainHasNoCanonicalLinks(existingDomain.id);
+      }
       data.domain = domain;
     }
 
@@ -635,6 +641,8 @@ export class AdminWebsitesService {
     if (existingDomain.websiteId === null) {
       return this.toAdminDomainResponse(existingDomain);
     }
+
+    await this.ensureDomainHasNoCanonicalLinks(domainId);
 
     const previousWebsiteId = existingDomain.websiteId;
     const domainRecord = await this.prisma.websiteDomain.update({
@@ -965,6 +973,11 @@ export class AdminWebsitesService {
       const domain = this.parseDomain(dto.domain);
       this.ensureLocalhostDomainAllowed(domain);
       await this.ensureDomainAvailable(domain, existingDomain.id);
+      if (domain !== existingDomain.domain) {
+        // A host rename would break canonical URL resolution for recorded
+        // provenance links, which resolve by exact host.
+        await this.ensureDomainHasNoCanonicalLinks(existingDomain.id);
+      }
       data.domain = domain;
     }
 
@@ -1751,6 +1764,21 @@ export class AdminWebsitesService {
     this.invalidatePublicAccessCaches();
   }
 
+  private async ensureDomainHasNoCanonicalLinks(
+    domainId: string,
+  ): Promise<void> {
+    const canonicalCount = await this.prisma.canonicalVideoShareLink.count({
+      where: { canonicalDomainId: domainId },
+    });
+    if (canonicalCount > 0) {
+      throw new ConflictException({
+        message:
+          "This domain anchors canonical share links used for provenance records. Resolve those canonical links before changing the domain.",
+        code: "DOMAIN_HAS_ACTIVE_CANONICAL_LINKS",
+      });
+    }
+  }
+
   private invalidatePublicAccessCaches(): void {
     this.memoryCache?.deleteByPrefix("public:watch:");
     this.memoryCache?.deleteByPrefix("media:metadata:");
@@ -2402,7 +2430,7 @@ export class AdminWebsitesService {
     await this.validateShareLinkVideoEligibility(tx, websiteId, videoIds);
   }
 
-  private async validateShareLinkVideoEligibility(
+  async validateShareLinkVideoEligibility(
     client: ShareLinkValidationClient,
     websiteId: string,
     requestedVideoIds: string[],
@@ -2592,9 +2620,7 @@ export class AdminWebsitesService {
     return primaryDomain?.domain ?? null;
   }
 
-  private getConfiguredPublicSiteProtocol(
-    domain: string | null,
-  ): string | undefined {
+  getConfiguredPublicSiteProtocol(domain: string | null): string | undefined {
     if (domain !== null && this.isLocalhostDomain(domain)) {
       return (
         this.configService.get<string>("PUBLIC_SHARE_LOCAL_PROTOCOL")?.trim() ||
@@ -2828,7 +2854,7 @@ export class AdminWebsitesService {
     };
   }
 
-  private toShareLinkResponse(
+  toShareLinkResponse(
     shareLink: ShareLinkWithVideos,
     publicUrl: string | null,
   ): AdminShareLinkResponse {
@@ -2854,25 +2880,8 @@ export class AdminWebsitesService {
     };
   }
 
-  private isShareLinkTokenOrAliasCollision(error: unknown): boolean {
-    if (
-      !(error instanceof Prisma.PrismaClientKnownRequestError) ||
-      error.code !== "P2002"
-    ) {
-      return false;
-    }
-
-    const target = (error.meta as { target?: unknown } | undefined)?.target;
-
-    if (Array.isArray(target)) {
-      return target.some((field) => field === "alias" || field === "tokenHash");
-    }
-
-    if (typeof target === "string") {
-      return target.includes("alias") || target.includes("tokenHash");
-    }
-
-    return false;
+  isShareLinkTokenOrAliasCollision(error: unknown): boolean {
+    return isShareLinkTokenOrAliasCollision(error);
   }
 
   private isRetryableAssignmentConflict(error: unknown): boolean {

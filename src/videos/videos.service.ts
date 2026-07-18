@@ -1682,6 +1682,20 @@ export class VideosService {
       );
     }
 
+    // Purging a video that anchors a canonical provenance URL would orphan a
+    // recorded DMCA source link (the FK is Restrict, so the delete would fail
+    // at the database anyway) — surface a stable, actionable conflict first.
+    const canonicalCount = await this.prisma.canonicalVideoShareLink.count({
+      where: { videoId: id },
+    });
+    if (canonicalCount > 0) {
+      throw new ConflictException({
+        message:
+          "This video anchors a canonical share link used for provenance records. Owner must resolve the canonical mapping before purging.",
+        code: "VIDEO_HAS_CANONICAL_SHARE_LINK",
+      });
+    }
+
     const deleteRemoteAsset = dto.deleteRemoteAsset ?? false;
     const purgeResult = await this.prisma.$transaction(async (transaction) => {
       const video = await transaction.videoAsset.findUnique({

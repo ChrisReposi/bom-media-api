@@ -18,6 +18,11 @@ export class HealthController {
         status: "ok",
         service: "api",
         timestamp: "2026-05-29T00:00:00.000Z",
+        release: {
+          version: "2026.07.18",
+          commit: "210b9af",
+          builtAt: "2026-07-18T00:00:00.000Z",
+        },
       },
     },
   })

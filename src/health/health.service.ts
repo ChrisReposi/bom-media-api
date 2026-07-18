@@ -10,6 +10,16 @@ export interface HealthResponse {
   status: "ok";
   service: "api";
   timestamp: string;
+  /**
+   * Build/deploy-time release identity. Present only when the operator
+   * injected APP_RELEASE_VERSION / APP_BUILD_SHA / APP_BUILD_TIME; never
+   * derived from .git at runtime and never required for readiness.
+   */
+  release?: {
+    version?: string;
+    commit?: string;
+    builtAt?: string;
+  };
 }
 
 export interface ReadinessResponse extends HealthResponse {
@@ -35,6 +45,29 @@ export class HealthService {
       status: "ok",
       service: "api",
       timestamp: new Date().toISOString(),
+      ...this.buildReleaseField(),
+    };
+  }
+
+  private buildReleaseField(): Pick<HealthResponse, "release"> {
+    let release: ApiEnvironmentConfig["release"] | undefined;
+    try {
+      release =
+        this.configService.getOrThrow<ApiEnvironmentConfig>("api").release;
+    } catch {
+      return {};
+    }
+
+    if (!release?.version && !release?.commit && !release?.builtAt) {
+      return {};
+    }
+
+    return {
+      release: {
+        ...(release.version ? { version: release.version } : {}),
+        ...(release.commit ? { commit: release.commit } : {}),
+        ...(release.builtAt ? { builtAt: release.builtAt } : {}),
+      },
     };
   }
 

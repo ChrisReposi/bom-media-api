@@ -836,5 +836,48 @@ export function validateEnv(
   }
   validated.LOCAL_THUMBNAIL_UPLOAD_MAX_MB = String(localThumbnailUploadMaxMb);
 
+  // Optional release identity, injected at build/deploy time (never read from
+  // .git at runtime). Absent values are always allowed — including in
+  // production — so a deploy without them cannot fail readiness; present
+  // values are validated strictly so a malformed injection fails at boot.
+  if (typeof config.APP_RELEASE_VERSION === "string") {
+    const releaseVersion = config.APP_RELEASE_VERSION.trim();
+    if (releaseVersion.length > 64) {
+      throw new Error("APP_RELEASE_VERSION must be 64 characters or fewer");
+    }
+    if (releaseVersion.length > 0) {
+      process.env.APP_RELEASE_VERSION = releaseVersion;
+      validated.APP_RELEASE_VERSION = releaseVersion;
+    }
+  }
+  if (typeof config.APP_BUILD_SHA === "string") {
+    const buildSha = config.APP_BUILD_SHA.trim();
+    if (buildSha.length > 0 && !/^[0-9a-f]{7,40}$/i.test(buildSha)) {
+      throw new Error(
+        "APP_BUILD_SHA must be a 7-40 character hexadecimal commit SHA",
+      );
+    }
+    if (buildSha.length > 0) {
+      process.env.APP_BUILD_SHA = buildSha;
+      validated.APP_BUILD_SHA = buildSha;
+    }
+  }
+  if (typeof config.APP_BUILD_TIME === "string") {
+    const buildTime = config.APP_BUILD_TIME.trim();
+    if (buildTime.length > 0) {
+      const parsedBuildTime = new Date(buildTime);
+      if (
+        Number.isNaN(parsedBuildTime.getTime()) ||
+        parsedBuildTime.toISOString() !== buildTime
+      ) {
+        throw new Error(
+          "APP_BUILD_TIME must be an ISO 8601 UTC timestamp such as 2026-07-18T00:00:00.000Z",
+        );
+      }
+      process.env.APP_BUILD_TIME = buildTime;
+      validated.APP_BUILD_TIME = buildTime;
+    }
+  }
+
   return validated;
 }

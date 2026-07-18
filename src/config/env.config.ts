@@ -69,6 +69,11 @@ export interface ApiEnvironmentConfig {
     staleUploadMaxAgeHours: number;
     thumbnailUploadMaxMb: number;
   };
+  release: {
+    version: string | null;
+    commit: string | null;
+    builtAt: string | null;
+  };
 }
 
 export type ThrottleProfileConfig = {
@@ -355,5 +360,15 @@ export const apiConfig = registerAs("api", (): ApiEnvironmentConfig => {
         10,
       ),
     },
+    release: {
+      version: readOptionalTrimmedEnv(process.env.APP_RELEASE_VERSION),
+      commit: readOptionalTrimmedEnv(process.env.APP_BUILD_SHA),
+      builtAt: readOptionalTrimmedEnv(process.env.APP_BUILD_TIME),
+    },
   };
 });
+
+function readOptionalTrimmedEnv(value: string | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}

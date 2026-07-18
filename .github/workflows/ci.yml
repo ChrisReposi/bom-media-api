@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Config-validation placeholder only. The unit suite preloads
+      # test/test-env.ts and never opens a connection to this URL; no job in
+      # this workflow starts a database.
+      DATABASE_URL: mysql://test_user:test_password@127.0.0.1:3307/video_share_cms_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Prisma generate
+        run: yarn prisma generate
+
+      - name: Prisma validate
+        run: yarn prisma validate
+
+      - name: Typecheck
+        run: yarn typecheck
+
+      - name: Lint
+        run: yarn lint
+
+      - name: Test
+        run: yarn test
+
+      - name: Format check
+        run: yarn format:check
+
+      - name: Build
+        run: yarn build
+
+      - name: Whitespace check
+        run: git diff --check

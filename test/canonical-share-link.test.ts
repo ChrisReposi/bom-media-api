@@ -1,5 +1,6 @@
 import "reflect-metadata";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import { ConflictException, NotFoundException } from "@nestjs/common";
 import {
@@ -624,6 +625,33 @@ describe("canonical create-or-get", () => {
 // ---------------------------------------------------------------------------
 // Collision util + audit core
 // ---------------------------------------------------------------------------
+
+describe("canonical delete-policy schema contract", () => {
+  it("keeps every CanonicalVideoShareLink relation on onDelete: Restrict", () => {
+    // Canonical provenance must never disappear via a cascade; the database
+    // is the final boundary (proven live: DELETE on each parent → MySQL 1451
+    // while a mapping exists). This contract pins the schema so a future
+    // relation edit cannot silently reintroduce Cascade.
+    const schema = readFileSync(
+      new URL("../prisma/schema.prisma", import.meta.url),
+      "utf8",
+    );
+    const modelMatch = schema.match(
+      /model CanonicalVideoShareLink \{[\s\S]*?\n\}/,
+    );
+    assert.ok(modelMatch, "CanonicalVideoShareLink model missing");
+    const relationLines = modelMatch[0]
+      .split("\n")
+      .filter((line) => line.includes("@relation(fields:"));
+    assert.equal(relationLines.length, 4);
+    for (const line of relationLines) {
+      assert.ok(
+        line.includes("onDelete: Restrict"),
+        `relation must be Restrict: ${line.trim()}`,
+      );
+    }
+  });
+});
 
 describe("share-link collision util", () => {
   it("matches only alias/tokenHash P2002 violations", () => {

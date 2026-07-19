@@ -79,6 +79,17 @@ and writes the audit row in the same transaction. There is no bulk mode.
 - Migration `20260718113156_canonical_video_share_links` is additive
   (CREATE TABLE + FKs). Legacy ShareLink rows are untouched; nothing is
   auto-marked canonical.
+- Corrective migration `restrict_canonical_record_deletes` switches the
+  Website and ShareLink foreign keys from Cascade to **Restrict**, making the
+  final delete policy all-Restrict on all four relations. Rationale: canonical
+  provenance must never disappear via a cascade — the database is the final
+  boundary even against future code paths or direct SQL. The normal lifecycle
+  (website disable, share-link revoke, video disable) is status-only and
+  unaffected; deleting any parent of a canonical mapping now fails (MySQL
+  1451) until the mapping is removed deliberately first. Verified live: all
+  four parent DELETEs blocked; revoke allowed with the mapping retained.
 - Production: `yarn db:migrate:deploy` after backup, then restart. Rollback =
-  redeploy the previous API build; the table is ignored by the old build. Do
-  not drop the table while any canonical URL is in a filing.
+  redeploy the previous API build; the table is ignored by the old build and
+  the Restrict FKs are backward-compatible (the old build never hard-deletes
+  these parents). Do not drop the table while any canonical URL is in a
+  filing.

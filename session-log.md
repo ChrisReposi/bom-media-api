@@ -12,6 +12,24 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-19 — Gate 1: canonical delete policy hardened to all-Restrict
+
+### Changed
+
+- Pre-push audit found the app has no website/shareLink/domain hard-delete (both `@Delete` routes are status-only disables; revoke is status-only; the only physical delete is video purge, already guarded), but the Website/ShareLink FKs on `CanonicalVideoShareLink` were Cascade — a direct-SQL or future code path could silently erase provenance. Final policy: **onDelete: Restrict on all four relations**; corrective migration `restrict_canonical_record_deletes` (drops and re-adds the two FKs with RESTRICT; no data/table/column changes). Schema-contract test pins all four relations to Restrict.
+
+### Verified
+
+- Live MySQL: with a fully verified throwaway fixture set (website/video/domain/link/mapping), DELETE on each of the four parents fails with MySQL 1451 and the row survives; share-link revoke succeeds with the canonical mapping retained; deliberate dependency-order cleanup works. Suites: generate/validate/status (18 migrations, up to date), typecheck, lint 0 errors, **tests 153/153**, build, format, diff-check.
+
+### Incident (dev database, caused and disclosed by this session)
+
+- An earlier Gate-1 proof attempt ran the four DELETE statements against real dev entities after a fixture INSERT batch had silently failed (stderr suppressed) — the FKs were not yet protecting those rows and one dev website plus one dev video were cascade-deleted. Impact was limited to the local docker dev DB. Recovery: 5 ACTIVE assignments re-created via the assignment API on the remaining website; the deleted website/video rows are not recoverable (no dump existed). Process correction applied: proofs now use throwaway rows only, every fixture insert is count-verified before any destructive statement, and stderr is never suppressed.
+
+### Pending
+
+- Gates 2 (rawToken), 3 (DB_BLOB checksum), 4 (public parser) — not part of this task. Production migrate-deploy remains operator work.
+
 ## 2026-07-18 — Canonical website-video share links (feature branch)
 
 ### Goal

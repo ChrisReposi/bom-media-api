@@ -494,8 +494,11 @@ model ShareLinkVideo {
 
 // One immutable canonical mapping per website+video pair for DMCA/provenance
 // records. The host/protocol are snapshotted at creation so the canonical URL
-// never follows whichever domain is primary later. Video and domain use
-// Restrict so purge/delete cannot silently orphan an evidence URL.
+// never follows whichever domain is primary later. All four relations use
+// Restrict: canonical provenance must never disappear via a cascade — any
+// hard delete (app, script, or SQL console) must remove the mapping
+// deliberately first. Website/share-link lifecycle is disable/revoke
+// (status-only), which is unaffected.
 model CanonicalVideoShareLink {
   id                    String   @id @default(cuid())
   websiteId             String
@@ -509,9 +512,9 @@ model CanonicalVideoShareLink {
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
 
-  website         Website       @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  website         Website       @relation(fields: [websiteId], references: [id], onDelete: Restrict)
   video           VideoAsset    @relation(fields: [videoId], references: [id], onDelete: Restrict)
-  shareLink       ShareLink     @relation(fields: [shareLinkId], references: [id], onDelete: Cascade)
+  shareLink       ShareLink     @relation(fields: [shareLinkId], references: [id], onDelete: Restrict)
   canonicalDomain WebsiteDomain @relation(fields: [canonicalDomainId], references: [id], onDelete: Restrict)
 
   @@unique([websiteId, videoId])

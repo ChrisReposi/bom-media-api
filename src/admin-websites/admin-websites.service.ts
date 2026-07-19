@@ -33,6 +33,9 @@ import {
 import { hashShareToken } from "../public/utils/share-token.util";
 import type { ActivateWebsiteDomainDto } from "./dto/activate-website-domain.dto";
 import type { AssignWebsiteVideosDto } from "./dto/assign-website-videos.dto";
+import type { ListWebsiteVideoAssignmentOptionsQueryDto } from "./dto/list-website-video-assignment-options-query.dto";
+import type { UpdateWebsiteVideoAssignmentsDto } from "./dto/update-website-video-assignments.dto";
+import { WEBSITE_VIDEO_ASSIGNMENT_BATCH_MAX_IDS } from "./dto/update-website-video-assignments.dto";
 import type { ClaimCurrentWebsiteDomainDto } from "./dto/claim-current-website-domain.dto";
 import type { AssignDomainToWebsiteDto } from "./dto/assign-domain-to-website.dto";
 import type { CreateDomainDto } from "./dto/create-domain.dto";
@@ -43,6 +46,11 @@ import type { CreateWebsiteDto } from "./dto/create-website.dto";
 import type { ListDomainsQueryDto } from "./dto/list-domains-query.dto";
 import type { ListDomainGroupsQueryDto } from "./dto/list-domain-groups-query.dto";
 import type { ListWebsitesQueryDto } from "./dto/list-websites-query.dto";
+import type {
+  ListWebsiteVideosQueryDto,
+  WebsiteVideoSortField,
+  WebsiteVideoSortOrder,
+} from "./dto/list-website-videos-query.dto";
 import type { UpdateDomainDto } from "./dto/update-domain.dto";
 import type { UpdateDomainGroupDto } from "./dto/update-domain-group.dto";
 import type { UpdateWebsiteDomainDto } from "./dto/update-website-domain.dto";
@@ -54,6 +62,7 @@ import {
   AdminDomainGroupListResponse,
   AdminDomainGroupResponse,
   AdminWebsiteAssignedVideoResponse,
+  AdminWebsiteVideoAssignmentOptionsResponse,
   AdminWebsiteDetailResponse,
   AdminWebsiteDomainResponse,
   AdminWebsiteListResponse,
@@ -61,6 +70,7 @@ import {
   AssignWebsiteVideosResponse,
   DisableDomainGroupResponse,
   DisableWebsiteResponse,
+  UpdateWebsiteVideoAssignmentsResponse,
 } from "./types/admin-website-response.type";
 import type {
   AdminShareLinkListResponse,
@@ -73,11 +83,17 @@ import {
   normalizeWebsiteSlug,
 } from "./utils/normalize-domain.util";
 import { CorsOriginService } from "../security/cors-origin.service";
+import { isShortAdminWebsiteSearch } from "./utils/admin-website-search.util";
+import { isShareLinkTokenOrAliasCollision } from "./utils/share-link-errors.util";
 import {
   buildPublicShareUrl,
   generateShareAlias,
   generateShareToken,
 } from "./utils/share-url.util";
+import {
+  escapeAdminVideoSearchLike,
+  isShortAdminVideoSearch,
+} from "../videos/utils/video-search.util";
 
 const SHARE_LINK_ALIAS_CREATE_MAX_ATTEMPTS = 5;
 
@@ -89,10 +105,6 @@ type WebsiteWithRelations = Website & {
 type DomainWithRelations = WebsiteDomain & {
   website: Pick<Website, "id" | "name" | "slug" | "status"> | null;
   domainGroup: DomainGroup | null;
-};
-
-type WebsiteVideoWithVideo = WebsiteVideo & {
-  video: VideoAsset;
 };
 
 type ShareLinkWithVideos = ShareLink & {
@@ -108,10 +120,35 @@ type VideoLocalFileAssetMetadata = Pick<
   "mimeType" | "sizeBytes"
 >;
 
+type AdminVideoLocalAssetMetadata = Pick<
+  VideoLocalFileAsset,
+  "mimeType" | "sizeBytes" | "checksumSha256" | "originalFilename"
+>;
+
+type VideoWithAdminMediaMetadata = VideoAsset & {
+  binaryAsset?: VideoBinaryAssetMetadata | null;
+  localFileAsset?: AdminVideoLocalAssetMetadata | null;
+  localThumbnailAsset?: AdminVideoLocalAssetMetadata | null;
+};
+
+type WebsiteVideoWithVideo = WebsiteVideo & {
+  video: VideoWithAdminMediaMetadata;
+};
+
+type VideoAssignmentOptionRecord = VideoWithAdminMediaMetadata & {
+  websiteVideos: Array<Pick<WebsiteVideo, "id" | "status">>;
+};
+
 type VideoWithBinaryAssetMetadata = VideoAsset & {
   binaryAsset?: VideoBinaryAssetMetadata | null;
   localFileAsset?: VideoLocalFileAssetMetadata | null;
 };
+
+type ShareLinkCandidateVideo = VideoWithBinaryAssetMetadata & {
+  websiteVideos: Array<Pick<WebsiteVideo, "websiteId" | "status">>;
+};
+
+type ShareLinkValidationClient = Pick<Prisma.TransactionClient, "videoAsset">;
 
 type AuditAction =
   | "DOMAIN_CREATE"
@@ -133,6 +170,8 @@ type AuditAction =
   | "WEBSITE_DOMAIN_ACTIVATE"
   | "WEBSITE_DOMAIN_CLAIM_CURRENT"
   | "WEBSITE_VIDEOS_ASSIGN"
+  | "WEBSITE_VIDEO_ASSIGN"
+  | "WEBSITE_VIDEO_ASSIGNMENTS_UPDATE"
   | "SHARE_LINK_CREATE"
   | "SHARE_LINK_REVOKE";
 
@@ -175,6 +214,9 @@ export class AdminWebsitesService {
     const page = query.page ?? 1;
     const limit = query.limit ?? 100;
     const skip = (page - 1) * limit;
+    if (isShortAdminWebsiteSearch(query.search)) {
+      return { items: [], meta: { page, limit, total: 0, totalPages: 0 } };
+    }
     const where: DomainGroupWhereInput = {};
 
     if (query.status !== undefined) {
@@ -337,6 +379,9 @@ export class AdminWebsitesService {
     const page = query.page ?? 1;
     const limit = query.limit ?? 50;
     const skip = (page - 1) * limit;
+    if (isShortAdminWebsiteSearch(query.search)) {
+      return { items: [], meta: { page, limit, total: 0, totalPages: 0 } };
+    }
     const where = this.buildDomainWhere(query);
 
     const [items, total] = await this.prisma.$transaction([
@@ -437,6 +482,11 @@ export class AdminWebsitesService {
       const domain = this.parseDomain(dto.domain);
       this.ensureLocalhostDomainAllowed(domain);
       await this.ensureDomainAvailable(domain, existingDomain.id);
+      if (domain !== existingDomain.domain) {
+        // A host rename would break canonical URL resolution for recorded
+        // provenance links, which resolve by exact host.
+        await this.ensureDomainHasNoCanonicalLinks(existingDomain.id);
+      }
       data.domain = domain;
     }
 
@@ -602,6 +652,8 @@ export class AdminWebsitesService {
       return this.toAdminDomainResponse(existingDomain);
     }
 
+    await this.ensureDomainHasNoCanonicalLinks(domainId);
+
     const previousWebsiteId = existingDomain.websiteId;
     const domainRecord = await this.prisma.websiteDomain.update({
       where: { id: domainId },
@@ -640,6 +692,9 @@ export class AdminWebsitesService {
   ): Promise<AdminWebsiteListResponse> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
+    if (isShortAdminWebsiteSearch(query.search)) {
+      return { items: [], meta: { page, limit, total: 0, totalPages: 0 } };
+    }
     const cacheKey = this.buildAdminWebsitesListCacheKey(query, page, limit);
     const loader = () => this.loadWebsitesFromDatabase(query, page, limit);
 
@@ -928,6 +983,11 @@ export class AdminWebsitesService {
       const domain = this.parseDomain(dto.domain);
       this.ensureLocalhostDomainAllowed(domain);
       await this.ensureDomainAvailable(domain, existingDomain.id);
+      if (domain !== existingDomain.domain) {
+        // A host rename would break canonical URL resolution for recorded
+        // provenance links, which resolve by exact host.
+        await this.ensureDomainHasNoCanonicalLinks(existingDomain.id);
+      }
       data.domain = domain;
     }
 
@@ -1159,19 +1219,213 @@ export class AdminWebsitesService {
 
   async listAssignedVideos(
     websiteId: string,
+    query: ListWebsiteVideosQueryDto = {},
   ): Promise<AssignWebsiteVideosResponse> {
     await this.ensureWebsiteExists(websiteId);
 
-    const assignments = await this.prisma.websiteVideo.findMany({
-      where: { websiteId },
-      include: { video: true },
-      orderBy: { sortOrder: "asc" },
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 50;
+    const eligibleWhere = this.buildWebsiteVideoListWhere(websiteId, {
+      assignmentStatus: AssignmentStatus.ACTIVE,
+      eligibleForShareLink: true,
     });
+
+    if (isShortAdminVideoSearch(query.search ?? "")) {
+      const [activeAssignmentTotal, eligibleAssignmentTotal] =
+        await this.prisma.$transaction([
+          this.prisma.websiteVideo.count({
+            where: { websiteId, status: AssignmentStatus.ACTIVE },
+          }),
+          this.prisma.websiteVideo.count({ where: eligibleWhere }),
+        ]);
+
+      return {
+        items: [],
+        meta: {
+          page,
+          limit,
+          total: 0,
+          totalPages: 0,
+          activeAssignmentTotal,
+          eligibleAssignmentTotal,
+        },
+      };
+    }
+
+    const where = this.buildWebsiteVideoListWhere(websiteId, query);
+    const [total, activeAssignmentTotal, eligibleAssignmentTotal, assignments] =
+      await this.prisma.$transaction([
+        this.prisma.websiteVideo.count({ where }),
+        this.prisma.websiteVideo.count({
+          where: { websiteId, status: AssignmentStatus.ACTIVE },
+        }),
+        this.prisma.websiteVideo.count({ where: eligibleWhere }),
+        this.prisma.websiteVideo.findMany({
+          where,
+          include: {
+            video: {
+              include: {
+                binaryAsset: { select: { mimeType: true, sizeBytes: true } },
+                localFileAsset: {
+                  select: {
+                    mimeType: true,
+                    sizeBytes: true,
+                    checksumSha256: true,
+                    originalFilename: true,
+                  },
+                },
+                localThumbnailAsset: {
+                  select: {
+                    mimeType: true,
+                    sizeBytes: true,
+                    checksumSha256: true,
+                    originalFilename: true,
+                  },
+                },
+              },
+            },
+          },
+          orderBy: this.buildWebsiteVideoOrderBy(
+            query.sortBy ?? "sortOrder",
+            query.sortOrder ?? "asc",
+          ),
+          skip: (page - 1) * limit,
+          take: limit,
+        }),
+      ]);
 
     return {
       items: assignments.map((assignment) =>
         this.toAssignedVideoResponse(assignment),
       ),
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages: total === 0 ? 0 : Math.ceil(total / limit),
+        activeAssignmentTotal,
+        eligibleAssignmentTotal,
+      },
+    };
+  }
+
+  async listVideoAssignmentOptions(
+    websiteId: string,
+    query: ListWebsiteVideoAssignmentOptionsQueryDto = {},
+  ): Promise<AdminWebsiteVideoAssignmentOptionsResponse> {
+    await this.ensureWebsiteExists(websiteId);
+
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 24;
+    const activeAssignmentWhere: Prisma.WebsiteVideoWhereInput = {
+      websiteId,
+      status: AssignmentStatus.ACTIVE,
+    };
+    const eligibleCandidateWhere =
+      this.buildEligibleAssignmentCandidateWhere(websiteId);
+
+    if (isShortAdminVideoSearch(query.search ?? "")) {
+      const [activeAssignments, eligibleCandidateTotal] =
+        await this.prisma.$transaction([
+          this.prisma.websiteVideo.findMany({
+            where: activeAssignmentWhere,
+            orderBy: [{ sortOrder: "asc" }, { videoId: "asc" }],
+            select: { videoId: true },
+          }),
+          this.prisma.videoAsset.count({ where: eligibleCandidateWhere }),
+        ]);
+
+      return {
+        items: [],
+        meta: {
+          page,
+          limit,
+          total: 0,
+          totalPages: 0,
+          activeAssignmentTotal: activeAssignments.length,
+          eligibleCandidateTotal,
+          activeAssignedVideoIds: activeAssignments.map(
+            (assignment) => assignment.videoId,
+          ),
+        },
+      };
+    }
+
+    const optionWhere = this.buildVideoAssignmentOptionWhere(websiteId, query);
+    const [total, activeAssignments, eligibleCandidateTotal, videos] =
+      await this.prisma.$transaction([
+        this.prisma.videoAsset.count({ where: optionWhere }),
+        this.prisma.websiteVideo.findMany({
+          where: activeAssignmentWhere,
+          orderBy: [{ sortOrder: "asc" }, { videoId: "asc" }],
+          select: { videoId: true },
+        }),
+        this.prisma.videoAsset.count({ where: eligibleCandidateWhere }),
+        this.prisma.videoAsset.findMany({
+          where: optionWhere,
+          include: {
+            websiteVideos: {
+              where: { websiteId },
+              select: { id: true, status: true },
+              take: 1,
+            },
+            binaryAsset: { select: { mimeType: true, sizeBytes: true } },
+            localFileAsset: {
+              select: {
+                mimeType: true,
+                sizeBytes: true,
+                checksumSha256: true,
+                originalFilename: true,
+              },
+            },
+            localThumbnailAsset: {
+              select: {
+                mimeType: true,
+                sizeBytes: true,
+                checksumSha256: true,
+                originalFilename: true,
+              },
+            },
+          },
+          orderBy: [
+            { [query.sortBy ?? "createdAt"]: query.sortOrder ?? "desc" },
+            { id: "asc" },
+          ],
+          skip: (page - 1) * limit,
+          take: limit,
+        }),
+      ]);
+
+    return {
+      items: (videos as VideoAssignmentOptionRecord[]).map((video) => {
+        const assignmentStatus = video.websiteVideos[0]?.status ?? null;
+        const isAssigned = assignmentStatus === AssignmentStatus.ACTIVE;
+        const isEligible = this.isPublicPlayableVideo(video);
+
+        return {
+          video: this.toAdminVideoResponse(video),
+          isAssigned,
+          assignmentStatus,
+          canAssign: !isAssigned && isEligible,
+          canUnassign: isAssigned,
+          blockedReason: isEligible
+            ? null
+            : video.status !== VideoStatus.READY
+              ? "VIDEO_NOT_READY"
+              : "VIDEO_NOT_PLAYABLE",
+        };
+      }),
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages: total === 0 ? 0 : Math.ceil(total / limit),
+        activeAssignmentTotal: activeAssignments.length,
+        eligibleCandidateTotal,
+        activeAssignedVideoIds: activeAssignments.map(
+          (assignment) => assignment.videoId,
+        ),
+      },
     };
   }
 
@@ -1231,6 +1485,361 @@ export class AdminWebsitesService {
     };
   }
 
+  async updateVideoAssignments(
+    websiteId: string,
+    dto: UpdateWebsiteVideoAssignmentsDto,
+    adminId: string,
+  ): Promise<UpdateWebsiteVideoAssignmentsResponse> {
+    const assignVideoIds = this.normalizeAssignmentVideoIds(dto.assignVideoIds);
+    const unassignVideoIds = this.normalizeAssignmentVideoIds(
+      dto.unassignVideoIds,
+    );
+    const assignVideoIdSet = new Set(assignVideoIds);
+    const overlapVideoIds = unassignVideoIds.filter((videoId) =>
+      assignVideoIdSet.has(videoId),
+    );
+
+    if (overlapVideoIds.length > 0) {
+      throw new BadRequestException({
+        statusCode: 400,
+        message: "A video cannot be assigned and unassigned in one request.",
+        error: "Bad Request",
+        code: "WEBSITE_VIDEO_ASSIGNMENT_OVERLAP",
+        details: { invalidVideoIds: overlapVideoIds },
+      });
+    }
+
+    const allVideoIds = [...assignVideoIds, ...unassignVideoIds];
+    if (allVideoIds.length > WEBSITE_VIDEO_ASSIGNMENT_BATCH_MAX_IDS) {
+      throw new BadRequestException({
+        statusCode: 400,
+        message: `At most ${WEBSITE_VIDEO_ASSIGNMENT_BATCH_MAX_IDS} videos can be changed per request.`,
+        error: "Bad Request",
+        code: "WEBSITE_VIDEO_ASSIGNMENT_BATCH_TOO_LARGE",
+      });
+    }
+
+    const runUpdate = () =>
+      this.prisma.$transaction(
+        async (tx) => {
+          const website = await tx.website.findUnique({
+            where: { id: websiteId },
+            select: { id: true, status: true },
+          });
+          if (website === null) {
+            throw new NotFoundException("Website not found.");
+          }
+          if (website.status !== WebsiteStatus.ACTIVE) {
+            throw new BadRequestException("Website is not active.");
+          }
+
+          const videos = allVideoIds.length
+            ? ((await tx.videoAsset.findMany({
+                where: { id: { in: allVideoIds } },
+                include: {
+                  binaryAsset: { select: { mimeType: true, sizeBytes: true } },
+                  localFileAsset: {
+                    select: { mimeType: true, sizeBytes: true },
+                  },
+                },
+              })) as VideoWithBinaryAssetMetadata[])
+            : [];
+          const videosById = new Map(videos.map((video) => [video.id, video]));
+          const notFoundVideoIds = allVideoIds.filter(
+            (videoId) => !videosById.has(videoId),
+          );
+          if (notFoundVideoIds.length > 0) {
+            throw new BadRequestException({
+              statusCode: 400,
+              message: "One or more videos do not exist.",
+              error: "Bad Request",
+              code: "WEBSITE_VIDEO_ASSIGNMENT_VIDEO_NOT_FOUND",
+              details: { invalidVideoIds: notFoundVideoIds },
+            });
+          }
+
+          const ineligibleVideoIds = assignVideoIds.filter((videoId) => {
+            const video = videosById.get(videoId);
+            return video === undefined || !this.isPublicPlayableVideo(video);
+          });
+          if (ineligibleVideoIds.length > 0) {
+            throw new BadRequestException({
+              statusCode: 400,
+              message:
+                "One or more videos are not READY and playable for assignment.",
+              error: "Bad Request",
+              code: "VIDEO_NOT_ELIGIBLE_FOR_ASSIGNMENT",
+              details: { invalidVideoIds: ineligibleVideoIds },
+            });
+          }
+
+          const existingAssignments = allVideoIds.length
+            ? await tx.websiteVideo.findMany({
+                where: { websiteId, videoId: { in: allVideoIds } },
+                select: {
+                  id: true,
+                  videoId: true,
+                  status: true,
+                  sortOrder: true,
+                },
+              })
+            : [];
+          const assignmentsByVideoId = new Map(
+            existingAssignments.map((assignment) => [
+              assignment.videoId,
+              assignment,
+            ]),
+          );
+          const maxSortOrder = assignVideoIds.some(
+            (videoId) => !assignmentsByVideoId.has(videoId),
+          )
+            ? await tx.websiteVideo.aggregate({
+                where: { websiteId },
+                _max: { sortOrder: true },
+              })
+            : null;
+          let nextSortOrder = (maxSortOrder?._max.sortOrder ?? -1) + 1;
+          const assignedVideoIds: string[] = [];
+          const unassignedVideoIds: string[] = [];
+          const unchangedVideoIds: string[] = [];
+
+          for (const videoId of assignVideoIds) {
+            const existing = assignmentsByVideoId.get(videoId);
+            if (existing?.status === AssignmentStatus.ACTIVE) {
+              unchangedVideoIds.push(videoId);
+              continue;
+            }
+
+            await tx.websiteVideo.upsert({
+              where: { websiteId_videoId: { websiteId, videoId } },
+              update: { status: AssignmentStatus.ACTIVE },
+              create: {
+                websiteId,
+                videoId,
+                sortOrder: nextSortOrder,
+                status: AssignmentStatus.ACTIVE,
+              },
+            });
+            if (!existing) nextSortOrder += 1;
+            assignedVideoIds.push(videoId);
+          }
+
+          for (const videoId of unassignVideoIds) {
+            const existing = assignmentsByVideoId.get(videoId);
+            if (!existing || existing.status === AssignmentStatus.DISABLED) {
+              unchangedVideoIds.push(videoId);
+              continue;
+            }
+
+            await tx.websiteVideo.update({
+              where: { id: existing.id },
+              data: {
+                status: AssignmentStatus.DISABLED,
+                isFeatured: false,
+              },
+            });
+            unassignedVideoIds.push(videoId);
+          }
+
+          const activeAssignmentTotal = await tx.websiteVideo.count({
+            where: { websiteId, status: AssignmentStatus.ACTIVE },
+          });
+
+          await tx.adminAuditLog.create({
+            data: {
+              adminId,
+              action: "WEBSITE_VIDEO_ASSIGNMENTS_UPDATE",
+              module: "admin-websites",
+              entityType: "Website",
+              entityId: websiteId,
+              status: AuditStatus.SUCCESS,
+              metadataJson: this.toJsonInput({
+                requestedAssignCount: assignVideoIds.length,
+                requestedUnassignCount: unassignVideoIds.length,
+                assignedVideoIds,
+                unassignedVideoIds,
+                unchangedVideoIds,
+                activeAssignmentTotal,
+              }),
+            },
+          });
+
+          return {
+            assignedVideoIds,
+            unassignedVideoIds,
+            unchangedVideoIds,
+            activeAssignmentTotal,
+          };
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+
+    let result: Awaited<ReturnType<typeof runUpdate>> | undefined;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        result = await runUpdate();
+        break;
+      } catch (error) {
+        if (attempt === 3 || !this.isRetryableAssignmentConflict(error)) {
+          throw error;
+        }
+      }
+    }
+
+    if (result === undefined) {
+      throw new ConflictException(
+        "Website video assignments are busy. Please retry.",
+      );
+    }
+
+    this.invalidatePublicAccessCaches();
+    return result;
+  }
+
+  async assignSingleVideo(
+    websiteId: string,
+    requestedVideoId: string,
+    adminId: string,
+  ): Promise<AdminWebsiteAssignedVideoResponse> {
+    const videoId = requestedVideoId.trim();
+    if (!videoId) {
+      throw new BadRequestException("videoId is required.");
+    }
+
+    const runAssignment = () =>
+      this.prisma.$transaction(
+        async (tx) => {
+          const website = await tx.website.findUnique({
+            where: { id: websiteId },
+            select: { id: true, status: true },
+          });
+          if (website === null) {
+            throw new NotFoundException("Website not found.");
+          }
+          if (website.status !== WebsiteStatus.ACTIVE) {
+            throw new BadRequestException("Website is not active.");
+          }
+
+          const video = await tx.videoAsset.findUnique({
+            where: { id: videoId },
+            include: {
+              binaryAsset: { select: { mimeType: true, sizeBytes: true } },
+              localFileAsset: {
+                select: {
+                  mimeType: true,
+                  sizeBytes: true,
+                  checksumSha256: true,
+                  originalFilename: true,
+                },
+              },
+              localThumbnailAsset: {
+                select: {
+                  mimeType: true,
+                  sizeBytes: true,
+                  checksumSha256: true,
+                  originalFilename: true,
+                },
+              },
+            },
+          });
+          if (video === null) {
+            throw new NotFoundException("Video not found.");
+          }
+          if (!this.isPublicPlayableVideo(video)) {
+            throw new BadRequestException({
+              statusCode: 400,
+              message: "Video must be READY and playable before assignment.",
+              error: "Bad Request",
+              code: "VIDEO_NOT_ELIGIBLE_FOR_ASSIGNMENT",
+            });
+          }
+
+          const existingAssignment = await tx.websiteVideo.findUnique({
+            where: { websiteId_videoId: { websiteId, videoId } },
+            select: { sortOrder: true, status: true },
+          });
+          const maxSortOrder = existingAssignment
+            ? null
+            : await tx.websiteVideo.aggregate({
+                where: { websiteId },
+                _max: { sortOrder: true },
+              });
+
+          const nextAssignment = await tx.websiteVideo.upsert({
+            where: { websiteId_videoId: { websiteId, videoId } },
+            update: { status: AssignmentStatus.ACTIVE },
+            create: {
+              websiteId,
+              videoId,
+              sortOrder: (maxSortOrder?._max.sortOrder ?? -1) + 1,
+              status: AssignmentStatus.ACTIVE,
+            },
+            include: {
+              video: {
+                include: {
+                  binaryAsset: { select: { mimeType: true, sizeBytes: true } },
+                  localFileAsset: {
+                    select: {
+                      mimeType: true,
+                      sizeBytes: true,
+                      checksumSha256: true,
+                      originalFilename: true,
+                    },
+                  },
+                  localThumbnailAsset: {
+                    select: {
+                      mimeType: true,
+                      sizeBytes: true,
+                      checksumSha256: true,
+                      originalFilename: true,
+                    },
+                  },
+                },
+              },
+            },
+          });
+
+          await tx.adminAuditLog.create({
+            data: {
+              adminId,
+              action: "WEBSITE_VIDEO_ASSIGN",
+              module: "admin-websites",
+              entityType: "WebsiteVideo",
+              entityId: nextAssignment.id,
+              status: AuditStatus.SUCCESS,
+              metadataJson: this.toJsonInput({
+                websiteId,
+                videoId,
+                previousStatus: existingAssignment?.status ?? "MISSING",
+              }),
+            },
+          });
+
+          return nextAssignment;
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+
+    let assignment: Awaited<ReturnType<typeof runAssignment>> | undefined;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        assignment = await runAssignment();
+        break;
+      } catch (error) {
+        if (attempt === 3 || !this.isRetryableAssignmentConflict(error)) {
+          throw error;
+        }
+      }
+    }
+
+    if (assignment === undefined) {
+      throw new ConflictException("Website video assignment is busy. Retry.");
+    }
+
+    this.invalidatePublicAccessCaches();
+    return this.toAssignedVideoResponse(assignment);
+  }
+
   async listShareLinks(websiteId: string): Promise<AdminShareLinkListResponse> {
     await this.ensureWebsiteExists(websiteId);
 
@@ -1281,16 +1890,11 @@ export class AdminWebsitesService {
         throw new BadRequestException("No playable videos selected.");
       }
 
-      stage = "load-playable-videos";
-      const videos = await this.getReadyPlayableVideosByIds(selectedVideoIds);
-
-      stage = "validate-playable-videos";
-      this.ensureAllRequestedVideosFound(
+      stage = "validate-video-eligibility";
+      await this.validateShareLinkVideoEligibility(
+        this.prisma,
+        websiteId,
         selectedVideoIds,
-        videos,
-        (videoId) => {
-          return `Video ${videoId} is not READY, not playable, or does not exist. READY direct/upload, embed, DB_BLOB videos with binary data, and LOCAL_FILE videos with local file data can be attached to a share link.`;
-        },
       );
 
       stage = "validate-share-link-options";
@@ -1333,40 +1937,51 @@ export class AdminWebsitesService {
         });
 
         try {
-          shareLink = await this.prisma.$transaction(async (tx) => {
-            const createdShareLink = await tx.shareLink.create({
-              data: {
+          shareLink = await this.prisma.$transaction(
+            async (tx) => {
+              await this.ensureShareLinkCreationScope(
+                tx,
                 websiteId,
-                tokenHash,
-                alias,
-                label,
-                expiresAt,
-                maxViews,
-                currentViews: 0,
-                status: ShareLinkStatus.ACTIVE,
-              },
-            });
+                selectedVideoIds,
+              );
 
-            for (const [index, videoId] of selectedVideoIds.entries()) {
-              await tx.shareLinkVideo.create({
+              const createdShareLink = await tx.shareLink.create({
                 data: {
-                  shareLinkId: createdShareLink.id,
-                  videoId,
-                  sortOrder: index,
+                  websiteId,
+                  tokenHash,
+                  alias,
+                  label,
+                  expiresAt,
+                  maxViews,
+                  currentViews: 0,
+                  status: ShareLinkStatus.ACTIVE,
                 },
               });
-            }
 
-            return tx.shareLink.findUniqueOrThrow({
-              where: { id: createdShareLink.id },
-              include: {
-                shareLinkVideos: {
-                  include: { video: true },
-                  orderBy: { sortOrder: "asc" },
+              for (const [index, videoId] of selectedVideoIds.entries()) {
+                await tx.shareLinkVideo.create({
+                  data: {
+                    shareLinkId: createdShareLink.id,
+                    videoId,
+                    sortOrder: index,
+                  },
+                });
+              }
+
+              return tx.shareLink.findUniqueOrThrow({
+                where: { id: createdShareLink.id },
+                include: {
+                  shareLinkVideos: {
+                    include: { video: true },
+                    orderBy: { sortOrder: "asc" },
+                  },
                 },
-              },
-            });
-          });
+              });
+            },
+            {
+              isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+            },
+          );
           break;
         } catch (error) {
           if (
@@ -1408,10 +2023,8 @@ export class AdminWebsitesService {
         {
           stage,
           websiteId,
-          videoIds: dto.videoIds ?? null,
+          videoCount: dto.videoIds?.length ?? 0,
           errorName: error instanceof Error ? error.name : "UnknownError",
-          errorMessage: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
         },
         "Create share link failed.",
       );
@@ -1490,6 +2103,21 @@ export class AdminWebsitesService {
   private invalidateWebsiteCaches(): void {
     this.memoryCache?.deleteByPrefix("admin:websites:");
     this.invalidatePublicAccessCaches();
+  }
+
+  private async ensureDomainHasNoCanonicalLinks(
+    domainId: string,
+  ): Promise<void> {
+    const canonicalCount = await this.prisma.canonicalVideoShareLink.count({
+      where: { canonicalDomainId: domainId },
+    });
+    if (canonicalCount > 0) {
+      throw new ConflictException({
+        message:
+          "This domain anchors canonical share links used for provenance records. Resolve those canonical links before changing the domain.",
+        code: "DOMAIN_HAS_ACTIVE_CANONICAL_LINKS",
+      });
+    }
   }
 
   private invalidatePublicAccessCaches(): void {
@@ -2012,6 +2640,154 @@ export class AdminWebsitesService {
     return domain;
   }
 
+  private buildWebsiteVideoListWhere(
+    websiteId: string,
+    query: Pick<
+      ListWebsiteVideosQueryDto,
+      | "search"
+      | "filterKey"
+      | "status"
+      | "provider"
+      | "sourceType"
+      | "assignmentStatus"
+      | "eligibleForShareLink"
+    >,
+  ): Prisma.WebsiteVideoWhereInput {
+    const videoWhere: Prisma.VideoAssetWhereInput = {};
+
+    if (query.search) {
+      const literalSearch = escapeAdminVideoSearchLike(query.search);
+      videoWhere.OR = [
+        { title: { contains: literalSearch } },
+        { slug: { contains: literalSearch } },
+      ];
+    }
+
+    if (query.filterKey) {
+      videoWhere.filterKey = query.filterKey;
+    }
+
+    if (query.provider) {
+      videoWhere.provider = query.provider;
+    }
+
+    if (query.sourceType) {
+      videoWhere.sourceType = query.sourceType;
+    }
+
+    if (query.eligibleForShareLink) {
+      videoWhere.status = VideoStatus.READY;
+      videoWhere.AND = [this.getPlayableVideoWhereInput()];
+    } else if (query.status) {
+      videoWhere.status = query.status;
+    }
+
+    return {
+      websiteId,
+      ...(query.eligibleForShareLink
+        ? { status: AssignmentStatus.ACTIVE }
+        : query.assignmentStatus
+          ? { status: query.assignmentStatus }
+          : {}),
+      ...(Object.keys(videoWhere).length > 0
+        ? { video: { is: videoWhere } }
+        : {}),
+    };
+  }
+
+  private buildVideoAssignmentOptionWhere(
+    websiteId: string,
+    query: ListWebsiteVideoAssignmentOptionsQueryDto,
+  ): Prisma.VideoAssetWhereInput {
+    const and: Prisma.VideoAssetWhereInput[] = [];
+
+    if (query.search) {
+      const literalSearch = escapeAdminVideoSearchLike(query.search);
+      and.push({
+        OR: [
+          { title: { contains: literalSearch } },
+          { slug: { contains: literalSearch } },
+        ],
+      });
+    }
+    if (query.filterKey) and.push({ filterKey: query.filterKey });
+    if (query.sourceType) and.push({ sourceType: query.sourceType });
+
+    and.push({
+      OR: [
+        {
+          websiteVideos: {
+            some: { websiteId, status: AssignmentStatus.ACTIVE },
+          },
+        },
+        {
+          status: VideoStatus.READY,
+          AND: [this.getPlayableVideoWhereInput()],
+        },
+      ],
+    });
+
+    return { AND: and };
+  }
+
+  private buildEligibleAssignmentCandidateWhere(
+    websiteId: string,
+  ): Prisma.VideoAssetWhereInput {
+    return {
+      status: VideoStatus.READY,
+      AND: [this.getPlayableVideoWhereInput()],
+      websiteVideos: {
+        none: { websiteId, status: AssignmentStatus.ACTIVE },
+      },
+    };
+  }
+
+  private getPlayableVideoWhereInput(): Prisma.VideoAssetWhereInput {
+    return {
+      OR: [
+        {
+          sourceType: {
+            in: [VideoSourceType.UPLOAD, VideoSourceType.DIRECT_URL],
+          },
+          playbackUrl: { not: "" },
+        },
+        {
+          sourceType: VideoSourceType.EMBED,
+          embedUrl: { not: "" },
+        },
+        {
+          sourceType: VideoSourceType.DB_BLOB,
+          binaryAsset: {
+            is: {
+              mimeType: { startsWith: "video/" },
+              sizeBytes: { gt: 0 },
+            },
+          },
+        },
+        {
+          sourceType: VideoSourceType.LOCAL_FILE,
+          localFileAsset: {
+            is: {
+              mimeType: { startsWith: "video/" },
+              sizeBytes: { gt: 0 },
+            },
+          },
+        },
+      ],
+    };
+  }
+
+  private buildWebsiteVideoOrderBy(
+    sortBy: WebsiteVideoSortField,
+    sortOrder: WebsiteVideoSortOrder,
+  ): Prisma.WebsiteVideoOrderByWithRelationInput {
+    if (sortBy === "sortOrder") {
+      return { sortOrder };
+    }
+
+    return { video: { [sortBy]: sortOrder } };
+  }
+
   private async getReadyVideosByIds(videoIds: string[]): Promise<VideoAsset[]> {
     if (videoIds.length === 0) {
       return [];
@@ -2025,35 +2801,96 @@ export class AdminWebsitesService {
     });
   }
 
-  private async getReadyPlayableVideosByIds(
+  private async ensureShareLinkCreationScope(
+    tx: Prisma.TransactionClient,
+    websiteId: string,
     videoIds: string[],
-  ): Promise<VideoWithBinaryAssetMetadata[]> {
-    if (videoIds.length === 0) {
-      return [];
-    }
-
-    const videos = await this.prisma.videoAsset.findMany({
-      where: {
-        id: { in: videoIds },
-        status: VideoStatus.READY,
-      },
-      include: {
-        binaryAsset: {
-          select: {
-            mimeType: true,
-            sizeBytes: true,
-          },
-        },
-        localFileAsset: {
-          select: {
-            mimeType: true,
-            sizeBytes: true,
-          },
-        },
-      },
+  ): Promise<void> {
+    const website = await tx.website.findUnique({
+      where: { id: websiteId },
+      select: { status: true },
     });
 
-    return videos.filter((video) => this.isPublicPlayableVideo(video));
+    if (website?.status !== WebsiteStatus.ACTIVE) {
+      throw new BadRequestException("Website is not active.");
+    }
+
+    await this.validateShareLinkVideoEligibility(tx, websiteId, videoIds);
+  }
+
+  async validateShareLinkVideoEligibility(
+    client: ShareLinkValidationClient,
+    websiteId: string,
+    requestedVideoIds: string[],
+  ): Promise<void> {
+    const videos = (await client.videoAsset.findMany({
+      where: { id: { in: requestedVideoIds } },
+      include: {
+        binaryAsset: { select: { mimeType: true, sizeBytes: true } },
+        localFileAsset: { select: { mimeType: true, sizeBytes: true } },
+        websiteVideos: {
+          where: { websiteId },
+          select: { websiteId: true, status: true },
+        },
+      },
+    })) as ShareLinkCandidateVideo[];
+    const videosById = new Map(videos.map((video) => [video.id, video]));
+    const notFoundVideoIds: string[] = [];
+    const notReadyVideoIds: string[] = [];
+    const notPlayableVideoIds: string[] = [];
+    const missingAssignmentVideoIds: string[] = [];
+    const inactiveAssignmentVideoIds: string[] = [];
+
+    for (const videoId of requestedVideoIds) {
+      const video = videosById.get(videoId);
+
+      if (!video) {
+        notFoundVideoIds.push(videoId);
+        continue;
+      }
+
+      if (video.status !== VideoStatus.READY) {
+        notReadyVideoIds.push(videoId);
+      } else if (!this.isPublicPlayableVideo(video)) {
+        notPlayableVideoIds.push(videoId);
+      }
+
+      const assignment = video.websiteVideos[0];
+      if (!assignment) {
+        missingAssignmentVideoIds.push(videoId);
+      } else if (assignment.status !== AssignmentStatus.ACTIVE) {
+        inactiveAssignmentVideoIds.push(videoId);
+      }
+    }
+
+    const invalidVideoIds = requestedVideoIds.filter(
+      (videoId) =>
+        notFoundVideoIds.includes(videoId) ||
+        notReadyVideoIds.includes(videoId) ||
+        notPlayableVideoIds.includes(videoId) ||
+        missingAssignmentVideoIds.includes(videoId) ||
+        inactiveAssignmentVideoIds.includes(videoId),
+    );
+
+    if (invalidVideoIds.length === 0) {
+      return;
+    }
+
+    throw new BadRequestException({
+      statusCode: 400,
+      message:
+        "One or more videos are not actively assigned and eligible for this website.",
+      error: "Bad Request",
+      code: "VIDEO_NOT_ACTIVE_FOR_WEBSITE",
+      details: {
+        invalidVideoIds,
+        notFoundVideoIds,
+        notReadyVideoIds,
+        notPlayableVideoIds,
+        missingAssignmentVideoIds,
+        inactiveAssignmentVideoIds,
+      },
+    });
   }
 
   private isPublicPlayableVideo(video: VideoWithBinaryAssetMetadata): boolean {
@@ -2151,6 +2988,14 @@ export class AdminWebsitesService {
     );
   }
 
+  private normalizeAssignmentVideoIds(videoIds: string[]): string[] {
+    return Array.from(
+      new Set(
+        videoIds.map((videoId) => videoId.trim()).filter((videoId) => videoId),
+      ),
+    );
+  }
+
   private async getPreferredActiveDomain(
     websiteId: string,
   ): Promise<string | null> {
@@ -2171,9 +3016,7 @@ export class AdminWebsitesService {
     return primaryDomain?.domain ?? null;
   }
 
-  private getConfiguredPublicSiteProtocol(
-    domain: string | null,
-  ): string | undefined {
+  getConfiguredPublicSiteProtocol(domain: string | null): string | undefined {
     if (domain !== null && this.isLocalhostDomain(domain)) {
       return (
         this.configService.get<string>("PUBLIC_SHARE_LOCAL_PROTOCOL")?.trim() ||
@@ -2327,6 +3170,8 @@ export class AdminWebsitesService {
   private toAssignedVideoResponse(
     assignment: WebsiteVideoWithVideo,
   ): AdminWebsiteAssignedVideoResponse {
+    const video = assignment.video;
+
     return {
       id: assignment.id,
       websiteId: assignment.websiteId,
@@ -2334,14 +3179,84 @@ export class AdminWebsitesService {
       sortOrder: assignment.sortOrder,
       isFeatured: assignment.isFeatured,
       status: assignment.status,
-      videoTitle: assignment.video.title,
-      videoStatus: assignment.video.status,
-      thumbnailUrl: assignment.video.thumbnailUrl,
-      playbackUrl: assignment.video.playbackUrl,
+      videoTitle: video.title,
+      videoStatus: video.status,
+      thumbnailUrl: video.thumbnailUrl,
+      playbackUrl: video.playbackUrl,
+      video: this.toAdminVideoResponse(video),
     };
   }
 
-  private toShareLinkResponse(
+  private toAdminVideoResponse(
+    video: VideoWithAdminMediaMetadata,
+  ): AdminWebsiteAssignedVideoResponse["video"] {
+    const binaryAsset = video.binaryAsset ?? null;
+    const localFileAsset = video.localFileAsset ?? null;
+    const localThumbnailAsset = video.localThumbnailAsset ?? null;
+
+    return {
+      id: video.id,
+      title: video.title,
+      slug: video.slug,
+      description: video.description,
+      provider: video.provider,
+      sourceType: video.sourceType,
+      providerAssetId: video.providerAssetId,
+      playbackId: video.playbackId,
+      playbackUrl: video.playbackUrl,
+      embedProvider: video.embedProvider,
+      embedUrl: video.embedUrl,
+      embedCloudName: video.embedCloudName,
+      embedPublicId: video.embedPublicId,
+      embedAllow: video.embedAllow,
+      thumbnailUrl:
+        localThumbnailAsset === null
+          ? video.thumbnailUrl
+          : `/api/v1/admin/videos/${encodeURIComponent(video.id)}/thumbnail`,
+      durationSeconds: video.durationSeconds,
+      viewCount: video.viewCount.toString(),
+      publishedAt: video.publishedAt,
+      status: video.status,
+      filterKey: video.filterKey,
+      metadataJson: video.metadataJson,
+      binaryAsset:
+        binaryAsset === null
+          ? null
+          : {
+              mimeType: binaryAsset.mimeType,
+              sizeBytes: binaryAsset.sizeBytes.toString(),
+            },
+      localFileAsset: this.toAdminLocalAssetResponse(localFileAsset),
+      localThumbnailAsset: this.toAdminLocalAssetResponse(localThumbnailAsset),
+      binaryPlaybackUrl:
+        binaryAsset === null
+          ? null
+          : `/api/v1/admin/videos/${encodeURIComponent(video.id)}/binary`,
+      localPlaybackUrl:
+        localFileAsset === null
+          ? null
+          : `/api/v1/admin/videos/${encodeURIComponent(video.id)}/local-file`,
+      createdAt: video.createdAt,
+      updatedAt: video.updatedAt,
+    };
+  }
+
+  private toAdminLocalAssetResponse(
+    asset: AdminVideoLocalAssetMetadata | null,
+  ) {
+    if (asset === null) {
+      return null;
+    }
+
+    return {
+      mimeType: asset.mimeType,
+      sizeBytes: asset.sizeBytes.toString(),
+      checksumSha256: asset.checksumSha256,
+      originalFilename: asset.originalFilename,
+    };
+  }
+
+  toShareLinkResponse(
     shareLink: ShareLinkWithVideos,
     publicUrl: string | null,
   ): AdminShareLinkResponse {
@@ -2367,25 +3282,15 @@ export class AdminWebsitesService {
     };
   }
 
-  private isShareLinkTokenOrAliasCollision(error: unknown): boolean {
-    if (
-      !(error instanceof Prisma.PrismaClientKnownRequestError) ||
-      error.code !== "P2002"
-    ) {
-      return false;
-    }
+  isShareLinkTokenOrAliasCollision(error: unknown): boolean {
+    return isShareLinkTokenOrAliasCollision(error);
+  }
 
-    const target = (error.meta as { target?: unknown } | undefined)?.target;
-
-    if (Array.isArray(target)) {
-      return target.some((field) => field === "alias" || field === "tokenHash");
-    }
-
-    if (typeof target === "string") {
-      return target.includes("alias") || target.includes("tokenHash");
-    }
-
-    return false;
+  private isRetryableAssignmentConflict(error: unknown): boolean {
+    return (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      (error.code === "P2002" || error.code === "P2034")
+    );
   }
 
   private async writeAudit(

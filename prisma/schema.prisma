@@ -107,21 +107,27 @@ enum AuditStatus {
 }
 
 model AdminUser {
-  id           String        @id @default(cuid())
-  username     String        @unique @db.VarChar(32)
-  passwordHash String        @db.VarChar(255)
-  role         AdminRole     @default(STAFF)
-  status       AccountStatus @default(ACTIVE)
-  lastLoginAt  DateTime?
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
+  id                         String        @id @default(cuid())
+  username                   String        @unique @db.VarChar(32)
+  passwordHash               String        @db.VarChar(255)
+  role                       AdminRole     @default(STAFF)
+  status                     AccountStatus @default(ACTIVE)
+  mustChangePassword         Boolean       @default(false)
+  passwordChangedAt          DateTime?
+  temporaryPasswordExpiresAt DateTime?
+  deletedAt                  DateTime?
+  lastLoginAt                DateTime?
+  createdAt                  DateTime      @default(now())
+  updatedAt                  DateTime      @updatedAt
 
-  refreshTokens AdminRefreshToken[]
-  sessions      AdminSession[]
-  auditLogs     AdminAuditLog[]
+  refreshTokens  AdminRefreshToken[]
+  sessions       AdminSession[]
+  auditLogs      AdminAuditLog[]
   uploadSessions VideoUploadSession[]
 
   @@index([status])
+  @@index([deletedAt, createdAt])
+  @@index([deletedAt, status, role, createdAt])
 }
 
 model AdminSession {
@@ -143,6 +149,7 @@ model AdminSession {
   @@index([adminId])
   @@index([expiresAt])
   @@index([revokedAt])
+  @@index([adminId, revokedAt, expiresAt])
 }
 
 model AdminRefreshToken {
@@ -161,6 +168,7 @@ model AdminRefreshToken {
   @@index([adminId])
   @@index([sessionId])
   @@index([expiresAt])
+  @@index([adminId, revokedAt, expiresAt])
 }
 
 model VideoAsset {
@@ -188,14 +196,15 @@ model VideoAsset {
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
 
-  websiteVideos   WebsiteVideo[]
-  shareLinkVideos ShareLinkVideo[]
-  binaryAsset     VideoBinaryAsset?
-  localFileAsset  VideoLocalFileAsset?
+  websiteVideos       WebsiteVideo[]
+  shareLinkVideos     ShareLinkVideo[]
+  binaryAsset         VideoBinaryAsset?
+  localFileAsset      VideoLocalFileAsset?
   localThumbnailAsset VideoLocalThumbnailAsset?
-  uploadSessions  VideoUploadSession[]
-  viewGrowthBuckets VideoViewGrowthBucket[]
-  viewGrowthEvents  VideoViewGrowthEvent[]
+  uploadSessions      VideoUploadSession[]
+  viewGrowthBuckets   VideoViewGrowthBucket[]
+  viewGrowthEvents    VideoViewGrowthEvent[]
+  canonicalShareLinks CanonicalVideoShareLink[]
 
   @@index([status])
   @@index([status, createdAt])
@@ -208,13 +217,14 @@ model VideoAsset {
 }
 
 model VideoBinaryAsset {
-  id        String   @id @default(cuid())
-  videoId   String   @unique
-  mimeType  String   @db.VarChar(120)
-  sizeBytes BigInt
-  data      Bytes    @db.LongBlob
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id             String   @id @default(cuid())
+  videoId        String   @unique
+  mimeType       String   @db.VarChar(120)
+  sizeBytes      BigInt
+  data           Bytes    @db.LongBlob
+  checksumSha256 String?  @db.Char(64)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
   video VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
 
@@ -279,14 +289,16 @@ model VideoUploadSession {
   createdAt        DateTime                 @default(now())
   updatedAt        DateTime                 @updatedAt
 
-  admin  AdminUser   @relation(fields: [adminId], references: [id], onDelete: Cascade)
-  video  VideoAsset? @relation(fields: [videoId], references: [id], onDelete: SetNull)
+  admin  AdminUser                 @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  video  VideoAsset?               @relation(fields: [videoId], references: [id], onDelete: SetNull)
   chunks VideoUploadSessionChunk[]
 
   @@index([adminId])
   @@index([videoId])
   @@index([status])
   @@index([expiresAt])
+  @@index([status, expiresAt])
+  @@index([status, createdAt])
 }
 
 model VideoUploadSessionChunk {
@@ -356,9 +368,12 @@ model Website {
   websiteVideos WebsiteVideo[]
   shareLinks    ShareLink[]
   accessLogs    AccessLog[]
+  canonicalVideoShareLinks CanonicalVideoShareLink[]
 
   @@index([status])
   @@index([domainGroupId])
+  @@index([createdAt])
+  @@index([status, createdAt])
 }
 
 model DomainGroup {
@@ -374,6 +389,7 @@ model DomainGroup {
   domains  WebsiteDomain[]
 
   @@index([status])
+  @@index([status, key])
 }
 
 model WebsiteDomain {
@@ -388,10 +404,12 @@ model WebsiteDomain {
 
   website     Website?     @relation(fields: [websiteId], references: [id], onDelete: SetNull)
   domainGroup DomainGroup? @relation(fields: [domainGroupId], references: [id], onDelete: SetNull)
+  canonicalVideoShareLinks CanonicalVideoShareLink[]
 
   @@index([websiteId])
   @@index([domainGroupId])
   @@index([status])
+  @@index([status, domain])
 }
 
 model ThemeConfig {
@@ -450,11 +468,13 @@ model ShareLink {
   website         Website          @relation(fields: [websiteId], references: [id], onDelete: Cascade)
   shareLinkVideos ShareLinkVideo[]
   accessLogs      AccessLog[]
+  canonicalVideoShareLink CanonicalVideoShareLink?
 
   @@index([websiteId])
   @@index([status])
   @@index([websiteId, status])
   @@index([expiresAt])
+  @@index([websiteId, createdAt])
 }
 
 model ShareLinkVideo {
@@ -471,6 +491,36 @@ model ShareLinkVideo {
   @@index([shareLinkId])
   @@index([videoId])
   @@index([shareLinkId, sortOrder])
+}
+
+// One immutable canonical mapping per website+video pair for DMCA/provenance
+// records. The host/protocol are snapshotted at creation so the canonical URL
+// never follows whichever domain is primary later. All four relations use
+// Restrict: canonical provenance must never disappear via a cascade — any
+// hard delete (app, script, or SQL console) must remove the mapping
+// deliberately first. Website/share-link lifecycle is disable/revoke
+// (status-only), which is unaffected.
+model CanonicalVideoShareLink {
+  id                    String   @id @default(cuid())
+  websiteId             String
+  videoId               String
+  shareLinkId           String   @unique
+  canonicalDomainId     String
+  canonicalHostSnapshot String   @db.VarChar(253)
+  canonicalProtocol     String   @db.VarChar(8)
+  evidenceFingerprint   String?  @db.VarChar(128)
+  evidenceSnapshotJson  Json?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  website         Website       @relation(fields: [websiteId], references: [id], onDelete: Restrict)
+  video           VideoAsset    @relation(fields: [videoId], references: [id], onDelete: Restrict)
+  shareLink       ShareLink     @relation(fields: [shareLinkId], references: [id], onDelete: Restrict)
+  canonicalDomain WebsiteDomain @relation(fields: [canonicalDomainId], references: [id], onDelete: Restrict)
+
+  @@unique([websiteId, videoId])
+  @@index([canonicalDomainId])
+  @@index([videoId])
 }
 
 model AccessLog {

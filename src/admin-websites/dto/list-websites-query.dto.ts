@@ -11,6 +11,10 @@ import {
   Min,
 } from "class-validator";
 import { WebsiteStatus } from "../../generated/prisma/client";
+import {
+  ADMIN_WEBSITE_SEARCH_MAX_LENGTH,
+  normalizeAdminWebsiteSearch,
+} from "../utils/admin-website-search.util";
 
 export class ListWebsitesQueryDto {
   @ApiPropertyOptional({ default: 1, minimum: 1 })
@@ -30,7 +34,9 @@ export class ListWebsitesQueryDto {
 
   @ApiPropertyOptional()
   @IsOptional()
+  @Transform(({ value }) => normalizeAdminWebsiteSearch(value))
   @IsString()
+  @MaxLength(ADMIN_WEBSITE_SEARCH_MAX_LENGTH)
   search?: string;
 
   @ApiPropertyOptional({ example: "gau-bong-demo.com", maxLength: 253 })

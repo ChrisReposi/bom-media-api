@@ -12,6 +12,476 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-19 — Atomic bulk website-video assignment management
+
+### Changed
+
+- Added paginated `GET /admin/websites/:websiteId/video-assignment-options`. It returns active assignments (including non-READY/non-playable rows that must remain removable), eligible unassigned candidates, per-item lifecycle flags, and the authoritative full `activeAssignedVideoIds` set without binary data.
+- Added OWNER/ADMIN-only `PATCH /admin/websites/:websiteId/video-assignments`. Disjoint assign/unassign deltas are normalized and bounded to 100 total IDs; every video is validated before mutation, DISABLED rows are reactivated, removals become DISABLED, and assignment writes plus bounded audit metadata commit in one Serializable transaction with limited conflict retry.
+- Unassignment does not delete or rotate canonical mappings. Existing canonical/public paths continue to require an ACTIVE website assignment. Legacy website-video GET/PUT/single-assign routes and share-link contracts remain unchanged; no Prisma schema or migration changed.
+- Added focused coverage for authoritative options/pagination, assigned-but-ineligible visibility, exact read/write roles, multi-assign/unassign/reactivation, idempotency, overlap/duplicate/missing validation, zero writes on invalid input, transactional audit and canonical-mapping preservation. Updated the assignment operations runbook.
+
+### Verified
+
+- Prisma generate/validate/status PASS; all 19 migrations are applied and the local schema is up to date. Typecheck, build, repository format check and `git diff --check` PASS.
+- Lint PASS with 0 errors and 92 existing/runtime-metadata `consistent-type-imports` warnings. Full API tests PASS: 179/179 across 49 suites.
+- No browser test, destructive database proof, Production access, push, merge or deploy occurred.
+
+### Pending
+
+- Run the Admin browser acceptance in staging for keyboard/focus behavior, large paginated candidate sets, same-session assignment races and canonical playback after disable/reactivate. Production remains unverified.
+
+## 2026-07-19 — Gate 3C-1: isolated MySQL/API proof for canonical DB_BLOB evidence
+
+### Changed
+
+- Added opt-in `test:integration:canonical-db-evidence`. It invokes the existing destructive database guard, additionally requires the exact local `video_share_cms_test` name and all 19 migrations, builds/starts the real compiled Nest API on a disposable port, and creates only unique run-scoped fixtures. A child-side datasource guard runs before AppModule initialization as defense in depth.
+- The harness exercises real HTTP login, multipart DB_BLOB upload, website assignment, canonical POST/GET, multipart binary replacement and generic legacy-link creation; the non-HTTP legacy adoption path invokes the existing compiled service and real eligibility query. `finally` cleanup removes only run-derived rows, restores aggregate counts, stops the child and verifies no proof-owned database connection remains.
+- Added three deterministic safety tests for dev-database/missing-confirmation refusal, mandatory run IDs, exact cleanup scope, guard ordering and absence of credential/checksum value logging. Updated the canonical runbook with the command, observed GET-after-drift contract and Gate 3C-2 boundary. No product API/schema/migration/Admin change.
+
+### Verified
+
+- Real MySQL/API proof PASS: initial upload persisted exact bytes/size/MIME and server SHA-256; canonical CREATED wrote exactly one ShareLink, ShareLinkVideo, mapping and success audit without `rawToken`/`tokenHash`; unchanged content returned REUSED with identical id/alias/public URL and GET `evidenceDrift=false`; equal-size/equal-MIME replacement changed checksum, POST returned 409 `CANONICAL_EVIDENCE_DRIFT`, GET retained the original canonical identity with `evidenceDrift=true`, and the stored snapshot was unchanged.
+- A separate legacy-null DB_BLOB graph returned 409 `CANONICAL_EVIDENCE_INCOMPLETE` with zero canonical/create-success writes. Existing-service adoption was also refused with zero mapping/adoption-success writes while the generic legacy link/relation remained intact.
+- Isolated test counts were zero before and after across website/domain/video/binary/assignment/link/relation/canonical/audit/admin/session/token tables; zero run leftovers and zero proof-owned connections. Count-only shared-dev snapshots before/after were identical (Website=1, WebsiteDomain=2, VideoAsset=26, VideoBinaryAsset=0, WebsiteVideo=5, ShareLink=0, ShareLinkVideo=0, CanonicalVideoShareLink=0, AdminAuditLog=471). Production was not accessed.
+- Full verification: Prisma generate/validate/status PASS (19 migrations, dev schema up to date); typecheck PASS; lint 0 errors/90 existing warnings; tests 173/173 across 47 suites; build, repository format check, focused proof-source format check and diff check PASS. Admin repo remained clean at `22bf65e`.
+
+### Pending
+
+- Gate 3C-2 must define an explicit bounded owner-approved remediation workflow for legacy null checksums. Gate 4 public parser, Production migration/backfill, browser testing, push, merge and deploy were not run.
+
+## 2026-07-19 — Gate 3B: DB_BLOB checksum integrated into canonical evidence
+
+### Changed
+
+- Canonical evidence now selects `VideoBinaryAsset.checksumSha256` with DB size/MIME through an explicit source-specific policy. The deterministic fingerprint includes the checksum, so equal-size/equal-MIME byte replacement produces `CANONICAL_EVIDENCE_DRIFT`; LOCAL_FILE and remote/provider/embed identity behavior remains source-specific.
+- Added `409 CANONICAL_EVIDENCE_INCOMPLETE`. A DB_BLOB with a null/malformed persisted checksum cannot create, adopt, reuse, or GET a canonical mapping; pre-release stored DB snapshots without a valid checksum are also refused rather than regenerated. Validation occurs before create/adoption mapping and success-audit writes. Size/MIME are not substituted and no blob is read for backfill.
+- Added focused DB snapshot, unchanged-content, equal-size replacement, legacy-null no-write, adoption no-write and DIRECT_URL regression tests. Updated Swagger conflict docs, runbook and adoption worksheet. No schema/migration/public-media contract/raw-token change.
+
+### Verified
+
+- Focused canonical suite: 26/26 pass. Full API suite: 170/170 pass across 46 suites. `db:local:generate`, `db:local:validate`, `db:local:status` (19 migrations, schema up to date), `typecheck`, `build`, repository `format:check`, focused test formatting and `git diff --check` pass. Lint remains 0 errors with the existing 90 `consistent-type-imports` warnings.
+- No Production access, development-data mutation, backfill, destructive FK proof, Gate 3C, Gate 4, browser test, push, merge or deploy occurred.
+
+### Pending
+
+- Gate 3C must provide the isolated guarded MySQL proof and any explicit bounded legacy remediation workflow. Gate 4 public parser audit remains separate.
+
+## 2026-07-19 — Gate 3A: persisted DB_BLOB SHA-256 checksums
+
+### Changed
+
+- Added nullable `VideoBinaryAsset.checksumSha256 CHAR(64)` and additive migration `20260719090000_add_video_binary_asset_checksum`; the migration contains one nullable `ADD COLUMN` only, with no blob scan, data rewrite, or backfill.
+- `uploadDatabaseVideo` and `replaceDatabaseVideoBinary` now compute lowercase SHA-256 from the exact Buffer read for persistence. New upload create and both replacement upsert branches write `data`, existing size/MIME metadata, and checksum together in the existing Prisma transaction.
+- Added the shared pure `computeSha256Hex` helper and four focused tests covering deterministic hashing/non-mutation, exact upload payload, equal-size/equal-MIME replacement drift, atomic nested payloads, nullable legacy schema, and checksum-free existing read/response contracts.
+- DB upload/replacement DTOs still accept no checksum. Admin/public media responses still expose only the existing DB binary MIME/size fields. Canonical fingerprint/drift consumption is intentionally deferred to Gate 3B.
+
+### Verified
+
+- Local standard migration workflow applied the additive migration; `db:local:generate`, `db:local:validate`, and `db:local:status` pass with 19 migrations and schema up to date. No Production access or backfill occurred.
+- Focused Gate 3A suite: 4/4 pass. Full API suite: 163/163 pass across 44 suites. `typecheck`, `build`, repository `format:check`, and `git diff --check` pass. Lint has 0 errors and the same 90 existing `consistent-type-imports` warnings.
+- Leakage scan proves no DB checksum request/public contract, no checksum-path console logging, and no regression of canonical `rawToken` removal. Admin repository remained untouched at `2f65eab`.
+
+### Pending
+
+- Gate 3B must explicitly select the persisted DB_BLOB checksum, define canonical behavior for legacy null rows, and integrate it into evidence fingerprint/drift tests. Gate 3C MySQL proof, Gate 4 public parser, Production migration/backfill, push/merge/deploy, and browser verification were not run.
+
+## 2026-07-19 — Gate 2: canonical raw-token exposure removed
+
+### Changed
+
+- Canonical CREATED, REUSED, adoption and GET responses no longer define or serialize `rawToken`; the Swagger response type and canonical POST description now document the alias-only contract. The creation attempt keeps a generated token only in local memory long enough to calculate the persisted `tokenHash`.
+- Generic review bundles (`POST /admin/websites/:websiteId/share-links`) retain their legacy one-time `rawToken` response. Public resolution remains alias-first with the legacy token-hash fallback unchanged; canonical URL/evidence behavior is unchanged.
+- Regression assertions prove canonical CREATED/REUSED/GET objects have no own `rawToken`/`tokenHash`, while the generic response still owns a non-empty `rawToken`; the existing short-alias public-watch test remains green. Canonical runbook updated. No schema or migration change.
+
+### Verified
+
+- Targeted API canonical/generic/public tests: 36/36 pass. Full suite: 159/159 pass.
+- `yarn db:local:generate`, `db:local:validate`, `db:local:status` (18 migrations, up to date), `typecheck`, `build`, `format:check`, and `git diff --check` pass. Lint: 0 errors, 90 pre-existing `consistent-type-imports` warnings.
+- Paired Admin mutation proof: temporarily reintroducing canonical `rawToken` made the intended contract test fail; the mutation was removed and the test returned green. Production was not accessed.
+
+### Pending
+
+- Gate 3 and Gate 4 were not started. Browser and deployed-artifact verification were not run in Gate 2.
+
+## 2026-07-19 — Gate 1.5: destructive database proofs isolated
+
+### Changed
+
+- Dedicated disposable database `video_share_cms_test` (same local Docker MySQL, full 18-migration chain via `DOTENV_CONFIG_PATH=.env.test yarn prisma migrate deploy`); tracked template `.env.test.example` (+ .gitignore whitelist), local `.env.test` stays ignored.
+- `scripts/safety/assert-destructive-test-database.ts`: reusable hard guard — requires APP_ENV test/local, repository-owned local host, database name ending `_test`/`_scratch`, and typed `ALLOW_DESTRUCTIVE_DB_TESTS=I_UNDERSTAND_THIS_DELETES_FIXTURES`; never prints credentials. 6 unit tests cover the allow/deny matrix incl. dev-DB-with-confirmation rejection and credential-leak checks.
+- `scripts/test/canonical-fk-proof.ts` + opt-in `yarn test:integration:canonical-fk` (not part of `yarn test`): guard → migration-completeness check → run-scoped Prisma fixtures count-verified before any destructive call → 4× parent-DELETE expecting P2003 with row-survival asserts → revoke-retention → dependency-order cleanup → zero-leftover check; non-zero exit on any deviation.
+- Root-cause addendum (PROVEN): `load-env` lets `.env` set `APP_ENV=local`, which then loads `.env.local` with override:true — an exported `DATABASE_URL` is silently replaced. Documented in `.env.test.example` and the runbook; the guard validates the effective URL so this class of mix-up now hard-stops.
+
+### Verified
+
+- Guard refusals live: no confirmation → exit 1; dev DB even with confirmation → exit 1.
+- Isolated proof on `video_share_cms_test`: 18 migrations verified, 6/6 fixtures, 4× P2003 blocks with survival, revoke retained mapping, zero leftovers, exit 0.
+- Read-only dev-DB audit before/after identical (W=1 D=2 V=26 WV=5 SL=0 SLV=0 C=0 AL=23); the five 2026-07-19 assignments are classified GATE1_RECOVERY_FIXTURE and untouched; the Gate-1 deleted website/video remain IRRECOVERABLE (not reconstructed). Admin repo untouched.
+- Suites: generate/validate/status, typecheck, lint 0 errors, **tests 159/159**, build, format, diff-check.
+
+### Pending
+
+- Gates 2/3/4 unchanged and not started.
+
+## 2026-07-19 — Gate 1: canonical delete policy hardened to all-Restrict
+
+### Changed
+
+- Pre-push audit found the app has no website/shareLink/domain hard-delete (both `@Delete` routes are status-only disables; revoke is status-only; the only physical delete is video purge, already guarded), but the Website/ShareLink FKs on `CanonicalVideoShareLink` were Cascade — a direct-SQL or future code path could silently erase provenance. Final policy: **onDelete: Restrict on all four relations**; corrective migration `restrict_canonical_record_deletes` (drops and re-adds the two FKs with RESTRICT; no data/table/column changes). Schema-contract test pins all four relations to Restrict.
+
+### Verified
+
+- Live MySQL: with a fully verified throwaway fixture set (website/video/domain/link/mapping), DELETE on each of the four parents fails with MySQL 1451 and the row survives; share-link revoke succeeds with the canonical mapping retained; deliberate dependency-order cleanup works. Suites: generate/validate/status (18 migrations, up to date), typecheck, lint 0 errors, **tests 153/153**, build, format, diff-check.
+
+### Incident (dev database, caused and disclosed by this session)
+
+- An earlier Gate-1 proof attempt ran the four DELETE statements against real dev entities after a fixture INSERT batch had silently failed (stderr suppressed) — the FKs were not yet protecting those rows and one dev website plus one dev video were cascade-deleted. Impact was limited to the local docker dev DB. Recovery: 5 ACTIVE assignments re-created via the assignment API on the remaining website; the deleted website/video rows are not recoverable (no dump existed). Process correction applied: proofs now use throwaway rows only, every fixture insert is count-verified before any destructive statement, and stderr is never suppressed.
+
+### Pending
+
+- Gates 2 (rawToken), 3 (DB_BLOB checksum), 4 (public parser) — not part of this task. Production migrate-deploy remains operator work.
+
+## 2026-07-18 — Canonical website-video share links (feature branch)
+
+### Goal
+
+- One stable canonical public URL per website+video pair for DMCA/provenance records: repeated create-or-get returns byte-for-byte the same URL; a different website or video always yields a different alias/URL; nothing is silently replaced.
+
+### Changed
+
+- Schema: additive `CanonicalVideoShareLink` (`@@unique(websiteId, videoId)`, unique `shareLinkId`, snapshotted host/protocol, evidence fingerprint/snapshot; video+domain FKs Restrict, website+shareLink Cascade). Migration `20260718113156_canonical_video_share_links` (applied local only).
+- `CanonicalShareLinkService`: idempotent create-or-get (Serializable tx, DB unique as arbiter, alias/token collision + P2034 retry, raced-loser reload → REUSED), read path with `evidenceDrift`, owner adoption operation (audit in-transaction), domain guard helper. Stable codes: CANONICAL*LINK*{REVOKED,INACTIVE}, CANONICAL_DOMAIN_UNAVAILABLE, CANONICAL_EVIDENCE_DRIFT, CANONICAL_VIDEO_NOT_SHAREABLE.
+- Endpoints: GET/POST `/admin/websites/:websiteId/videos/:videoId/canonical-share-link` (POST accepts no body — no expiry/maxViews/caller alias/token; rawToken only on CREATED).
+- Guards: purge blocked while canonical exists (`VIDEO_HAS_CANONICAL_SHARE_LINK`); domain host-rename and unassign blocked (`DOMAIN_HAS_ACTIVE_CANONICAL_LINKS`); disable/transfer transitively blocked; delete DB-Restricted.
+- **Latent bug fixed for all share-link retries:** with `@prisma/adapter-mariadb`, P2002 has no `meta.target` — the constraint arrives only in `meta.driverAdapterError.cause.constraint.index` (proven by probing MySQL 1062 through the live adapter). New `share-link-errors.util.ts` consults both shapes; the pre-existing alias-collision retry in `createShareLink` silently never matched adapter-shaped errors before this.
+- Tooling: read-only masked audit CLI (`audit:canonical-share-links`, `--counts-only`, never selects tokenHash) + local-only confirmation-gated adoption CLI (`remediate:local:adopt-canonical`). Docs: canonical runbook + owner adoption worksheet.
+
+### Verified (local MySQL 8, real HTTP)
+
+- 20 concurrent create-or-get on one pair → **1 CREATED + 19 REUSED, 0 errors**, one alias/URL/link id across all responses; DB exactly 1 canonical + 1 ShareLink + 1 ShareLinkVideo.
+- Conflict matrix live: title edit → POST 409 CANONICAL_EVIDENCE_DRIFT while GET returns drift=true with unchanged URL; title revert → REUSED same alias; purge → 409; domain unassign → 409; revoke → POST 409 with mapping preserved.
+- Adoption CLI adopted a legacy single-video link (GET then returns the same link id/alias); audit CLI classified 5 pairs.
+- Suites: typecheck, lint 0 errors, **tests 152/152** (18 canonical unit tests incl. both P2002 meta shapes; purge-guard regression), build, format. Fixtures fully cleaned (canonical rows + fixture ShareLinks cascade-deleted; dev titles restored via API).
+
+### Pending
+
+- Production migration/deploy and legacy adoption remain operator work (see canonical runbook). Rotation endpoint intentionally not implemented.
+
+## 2026-07-18 — Release packaging, CI, and release identity
+
+### Changed
+
+- Created branch `release/2026-07-18-production-hardening` and committed the audited working tree exactly per the persisted manifests (`~/Desktop/bom-media/release-manifests/2026-07-18/`): A1 (24 files, scoped video access + search hardening), A2 (51, auth/accounts/runtime security incl. the test-env fixture), A3 (11, operations docs). Every commit was staged with `git add --pathspec-from-file` and verified name-for-name against its manifest before committing.
+- Added `.github/workflows/ci.yml`: install → prisma generate/validate (placeholder DATABASE_URL, no DB connection) → typecheck → lint → test → format:check → build → `git diff --check`; concurrency cancel, pinned action majors, Node 22, Yarn only.
+- Added safe release identity: optional `APP_RELEASE_VERSION` / `APP_BUILD_SHA` / `APP_BUILD_TIME` (validated strictly when present, never required, never read from `.git` at runtime) surfaced as an additive `release` object on `/health` (and therefore `/health/ready`). New `test/release-identity.test.ts` (+6 tests). Env examples updated.
+- Added `docs/operations/production-release-runbook.md` — full operator pack with placeholders (backup, migrate deploy, restart, API/Admin smoke incl. the filterKey PATCH regression, atomic Admin upload, Cloudflare purge, rollback decision tree).
+
+### Verified
+
+- Post-commit and post-identity suites: typecheck, lint (0 errors), **tests 133/133**, build, format:check, `git diff --check` — clean tree after every commit.
+- Live probe: boot with injected metadata → `/health` returns `release {version, commit, builtAt}`; without metadata the legacy payload shape is unchanged.
+
+### Pending
+
+- Push/merge/deploy are intentionally left to the operator; production evidence remains NOT_VERIFIED until the runbook is executed.
+
+## 2026-07-18 — CreateVideo filterKey persistence incident
+
+### Incident
+
+- Admin enters `Key lọc video` in CreateVideoModal; create/upload succeeds but the new video has no `filterKey`; EditVideoModal can set it afterwards.
+
+### Proven Root Cause
+
+- The pre-fix working tree contained a partial-update bug; it is fixed in this entry's changes and the description below is of the pre-fix behavior.
+- **PROVEN (local E2E over real HTTP + MySQL 8):** `PATCH /admin/videos/:id` cleared `filterKey` to NULL whenever the request body omitted the field. Mechanism: validated DTOs are class instances whose declared fields are always own properties (`useDefineForClassFields`), so the service guard `Object.prototype.hasOwnProperty.call(dto, "filterKey")` was always true, and `normalizeNullableVideoFilterKey(undefined)` → null. Probe: `plainToInstance(UpdateVideoDto, { durationSeconds: 42 })` → `hasOwnProperty("filterKey") === true`.
+- The Admin client (`uploadLocalVideo`) fires exactly such a metadata-only PATCH (durationSeconds/thumbnailUrl from auto-analysis) right after every LOCAL_FILE completion — so the key stored by completion was erased one request later. Manual/embed creates have no post-create PATCH → unaffected. Edit works because it sends `filterKey` explicitly.
+- Why prior unit tests missed it: they invoked `updateVideo` with plain object literals (no `filterKey` own property); the real pipeline shape (`plainToInstance`) was never exercised.
+- Full wire proof before fix: LOCAL_FILE init(`SML`) → session metadata `"sml"` → chunk → complete → `VideoAsset.filterKey="sml"` (DB+response+detail+list+`?filterKey=sml`) → `PATCH {durationSeconds:42}` → **DB filterKey=NULL**.
+
+### Changed
+
+- `src/videos/videos.service.ts` (updateVideo): guard replaced with `dto.filterKey !== undefined`.
+- `src/videos/dto/update-video.dto.ts`: `@Transform` now maps the explicit clear signals (`null` / empty string) to `null` instead of collapsing them into `undefined`, so "omitted" and "clear" stay distinguishable end-to-end.
+- `test/admin-video-search.test.ts` (+2): metadata-only PATCH through `plainToInstance` keeps the key; clear-by-null / set-`SML`→`sml` / clear-by-blank through the validated pipeline.
+
+### Verified
+
+- After rebuild, same wire sequence: metadata-only PATCH keeps `"sml"` (DB + response); `filterKey:null` and `""` still clear; `all`/`unsafe$key` still 400.
+- Concurrent double-complete on one session: one 409 + one success, exactly one VideoAsset, `judge-judy` → `judge_judy`; idempotent re-complete returns the same video with the key; post-completion PATCH keeps it.
+- Suites: typecheck, lint (0 errors), **tests 127/127**, build, format:check, `db:local:*`, `git diff --check` — all pass. Fixtures purged via disable→purge; upload sessions cleaned.
+
+### Deployment Required
+
+- Deploy API build (includes this fix) → `yarn db:migrate:deploy` → restart; then Admin dist. The fix is server-side; stale Admin builds remain safe because the clearing happened in the API.
+
+### Pending
+
+- Production verification (Network tab: init request contains `filterKey`; post-completion PATCH no longer nulls it) — NOT_VERIFIED this session; local evidence only.
+
+## 2026-07-17 — Production admin-video search and filterKey incident
+
+### Incident
+
+- Production `GET /api/v1/admin/videos?...search=sml...` (VideosPage) and `...search=abc...` (Dashboard) return 500. Create Video reportedly accepts `filterKey` in the UI but the created video has none; PATCH later works.
+
+### Root Cause Matrix
+
+- Current source producing the 500 — **RULED_OUT.** Full local E2E through the real Nest stack (guard → ValidationPipe → DTO → service → memory cache → Prisma MariaDB adapter → MySQL 8.0.46 → response mapping → exception filter): 13/13 global search cases and 6/6 website-scoped cases returned HTTP 200, including `search=sml`, `search=abc`, quotes, backslash, Vietnamese, page 2, `filterKey` combinations. BigInt `viewCount` is serialized via `.toString()`; `mode: "insensitive"` never existed in committed code (only in doc prose).
+- Missing production migration (schema drift) — **POSSIBLE; mechanism PROVEN locally.** Simulated a production DB without `20260704034452_add_video_filter_key_and_safe_purge_flow`: with the current Prisma client, `videoAsset.count` still succeeds but every `findMany` fails with **P2022 “The column VideoAsset.filterKey does not exist”** → 500. Signature for operators: plain (no-search) list also 500s. `filterKey` entered the API only at HEAD commit `688a77f`, so any deployment of that build without `prisma migrate deploy` hits this.
+- Old API build + new Admin — **RULED_OUT for the observed symptoms.** ValidationPipe uses `forbidNonWhitelisted: true` at HEAD and in the working tree, so unknown DTO fields produce **400**, not 500, and a create carrying `filterKey` against an old API would fail loudly instead of silently dropping the key.
+- Stale/mixed Admin JS chunks — **POSSIBLE (fits Incident B exactly).** New API + a cached pre-`filterKey` `videoApi` chunk: the field renders, the payload never includes it, the whitelisted API accepts the create → video saved without `filterKey`. Matches “create succeeds, filterKey lost”.
+- Expensive unescaped LIKE scans under production load (timeout → 5xx) — **POSSIBLE, NOT_VERIFIED.** Wildcard leak (below) made `%%`-style searches full-table scans.
+- PRODUCTION_LOG_EVIDENCE / PRODUCTION_DB_SCHEMA / PRODUCTION_API_RELEASE — **NOT_VERIFIED** (no production access this session). Operator runbook below.
+
+### Proven Defect Fixed: LIKE wildcard leak
+
+- Prisma `contains` through `@prisma/adapter-mariadb` does **not** escape LIKE metacharacters. Verified over HTTP: `s%l` and `s_l` matched "sml"; `%%` and `__` matched the entire table. Correctness bug plus a full-scan cost amplifier.
+- Fix: `escapeAdminVideoSearchLike()` in `src/videos/utils/video-search.util.ts`, applied in `videos.service.ts` `buildVideoWhere` and `admin-websites.service.ts` `buildWebsiteVideoListWhere`. Cache keys and the short-search guard keep using the unescaped normalized value. Re-verified over HTTP after rebuild: wildcards now match literally (0 rows), `sml` still matches.
+
+### filterKey End-To-End (current source)
+
+- HTTP matrix against the local API: manual JSON (`"SML"` normalized → `sml`), embed JSON, manual-with-thumbnail multipart, LOCAL_FILE init (session `metadataJson.filterKey = "sml"` confirmed in DB), PATCH update, DB persisted values, `?filterKey=` list filtering, reserved `all` → 400. All create DTOs carry `filterKey` (thumbnail variants inherit from the base DTOs). Every fixture cleaned up afterward.
+
+### Changed
+
+- `src/videos/utils/video-search.util.ts` (+`escapeAdminVideoSearchLike`), `src/videos/videos.service.ts`, `src/admin-websites/admin-websites.service.ts`, `test/admin-video-search.test.ts` (+4 tests: escape unit cases and where-clause assertions).
+
+### Verified
+
+- `db:local:generate/validate/status` (16/16 migrations applied), typecheck, lint (0 errors; 86 pre-existing warnings), **tests 125/125**, build, format:check, `git diff --check` — all pass.
+
+### Deployment Required (operator, in order)
+
+1. Back up the production DB and record current release identifiers.
+2. Deploy the API build; run `yarn db:migrate:deploy`; **restart the Node process**; confirm `prisma migrate status` is clean.
+3. Smoke: plain list, `search=sml`, `search=s%l` (expect literal, not wildcard), create with `filterKey`.
+4. Then deploy Admin `dist` atomically and purge Cloudflare cache; verify `index.html` references the new hashed chunks (mixed old/new chunks reproduce Incident B).
+5. If 500s persist, grep API logs for `P2022` (schema drift) vs timeout/pool errors (load) — the matrix above maps each signature to its fix.
+
+### Rollback
+
+- Admin: restore the previous `dist` (static). API: previous build remains compatible — migrations are additive; do **not** drop columns during the incident window. No DB reset.
+
+## 2026-07-16 — OWNER account management, password lifecycle and session isolation
+
+### Goal And Verified Behavior
+
+- Add OWNER-only ADMIN/STAFF lifecycle management without physical account deletion, cross-account session revocation or reuse of the bootstrap/shared-password boundary.
+- Existing access tokens remain DB-session-bound. Login and refresh now recheck ACTIVE/non-deleted account state inside Serializable transactions; temporary-password expiry is revealed only after correct credentials. Forced accounts may access only `/me`, `change-own-password` and logout until the password is changed.
+
+### Implementation
+
+- Added one additive migration for `mustChangePassword`, password/temp/deletion timestamps and bounded account/session/token indexes. Existing accounts default to no forced change and no lifecycle timestamps; no existing role/password/session was backfilled or revoked.
+- Added `AdminAccountsModule` with explicit OWNER metadata on every route, a Production-default-off feature gate, current-OWNER password step-up, ADMIN/STAFF-only create/role policy, optimistic timestamp CAS, target-scoped revoke, temporary password reset, and logical delete that preserves account/audit/upload/session history. Create/reset responses are `no-store` and return the generated password once.
+- Added own-password and own-session endpoints. Password change hashes outside the transaction, rechecks the password snapshot, clears forced state, and revokes only that account. The deprecated shared-secret endpoint remains available but Admin Web no longer uses it.
+- Bootstrap/seed is initial-owner-only and never upserts, promotes or resets an existing account. Credential normalization/hash/password policy/temp generation is centralized.
+- Added read-only masked account audit and dry-run-by-default bounded session cleanup. Cleanup apply requires an exact environment confirmation and never deletes account/audit/active-session rows.
+- Added an operational rollout/rollback runbook and a local-only smoke that creates ADMIN/STAFF fixtures, performs 20 controlled logins without printing credentials, verifies target session isolation, then disables and logically deletes the fixtures.
+
+### Database And Local Evidence
+
+- `20260716130000_admin_account_management` was applied to the local MySQL database; all 16 migrations are up to date. Production was not accessed.
+- Local read-only audit after smoke: one active OWNER, no normalized username conflicts, no deleted ACTIVE account, and no active session/token/upload relation on deleted fixtures. Four smoke accounts are retained as logically deleted audit fixtures by design (two ADMIN, two STAFF across two smoke executions).
+- Final 20-login sample: p50 298.44 ms, p95 301.90 ms. Account list has a regression assertion for exactly two DB queries per page independent of page size; no percentage improvement is claimed.
+
+### Commands And Verification
+
+- `yarn install --frozen-lockfile`, Prisma generate/validate/status, typecheck, build, format check and `git diff --check`: passed.
+- `yarn test --runInBand`: 121/121 passed in 33 suites. New coverage includes OWNER-only route inventory, service role defense, duplicate-create race, temp expiry/forced guard, login/refresh disable races, fixed two-query list shape, target isolation and logical-delete upload blocking/history retention.
+- `yarn lint`: 0 errors and 86 `consistent-type-imports` warnings. Decorated DTO/Swagger/provider imports were deliberately retained at runtime; no blind import-type autofix was used.
+- Built API started successfully, mapped all account/auth routes, connected Prisma, returned health/readiness 200 and unauthenticated account/session 401, then the owned process was stopped. Nest continues to emit the existing wildcard-route auto-conversion warning.
+- `yarn audit --groups dependencies --level moderate` was UNVERIFIED because the Yarn registry audit endpoint returned HTTP 410. No npm/pnpm lockfile exists.
+
+### Known Limitations And Manual Actions
+
+- Production remains conditional: run the account audit with a read-only Production principal, review index lock risk, deploy migration with the feature flag off, and complete real OWNER/ADMIN/STAFF plus multi-device/browser staging acceptance before enabling it.
+- Hostinger/Cloudflare, backup/restore, existing legacy share-link decisions and deployed public artifacts remain separate gates. Rollback must keep forced-change enforcement for any forced account or disable/revoke it first.
+
+### Next Recommended Prompt
+
+- “Run a read-only Production account audit, review the additive migration/index lock risk, then stage OWNER create/reset/disable/delete, ADMIN/STAFF permissions and independent browser-session isolation with the feature flag still off in Production.”
+
+## 2026-07-16 — Website-scoped share-link video assignment incident
+
+### Goal
+
+- Fix the demonstrated Dashboard/API mismatch without weakening the invariant that a share-link video must have an ACTIVE same-site assignment and be READY/playable.
+
+### Root Cause And Local Data
+
+- Dashboard selected from global `GET /admin/videos`; its cache key and request lifecycle had no website/assignment scope, and switching websites retained selected IDs. The create service correctly rejected the exact incident video because its `WebsiteVideo` row was missing.
+- Read-only exact-pair audit found masked website `cmrhv25e` ACTIVE with one active domain and masked video `89c3f4a1` READY/playable LOCAL_FILE, no same-site or other-site assignment, and no pre-existing share-link reference.
+- Under the explicit incident instruction, the local-only guarded remediation called `AdminWebsitesService.assignSingleVideo`. The assignment is now ACTIVE and the audit event was written in the same Serializable transaction. Production was not accessed or mutated.
+- Full local audit still finds two unrelated ACTIVE legacy links with missing same-site assignments; both require owner review. The audit intentionally exits 2 while those cases remain.
+
+### Implementation
+
+- Extended existing `GET /admin/websites/:websiteId/videos` with validated pagination/search/filter/provider/source/status/sort/assignment/eligibility query parameters, nested safe video data and additive pagination/eligibility metadata.
+- Added idempotent `POST /admin/websites/:websiteId/videos/assign` for an explicit single-video create/reactivation. It validates ACTIVE website plus READY/playable video, retries bounded Prisma write/serialization conflicts, uses the unique pair, and writes audit in-transaction.
+- Share-link create now validates all IDs in one query, returns stable `VIDEO_NOT_ACTIVE_FOR_WEBSITE` details, preflights before work and rechecks website/assignment/video eligibility in a Serializable create transaction. Public watch continues to recheck the same-site assignment.
+- Expanded the read-only audit with exact-pair output and bounded legacy-compatibility counts/samples. Added a Production runbook; universal backfill is explicitly forbidden.
+- Added local-only, confirmation-gated remediation and smoke scripts. The smoke created a temporary link, verified valid watch, assignment removal generic-invalid, explicit restore recovery, and revoked the temporary link without printing its credential.
+
+### Commands And Verification
+
+- `yarn db:local:generate`, `yarn db:local:validate`, `yarn db:local:status`, `yarn typecheck`, `yarn build`, `yarn format:check`, focused Prettier and `git diff --check`: passed; 15 migrations are up to date and no migration was added for this incident.
+- `yarn lint`: 0 errors and 76 existing `consistent-type-imports` warnings.
+- `yarn test --runInBand`: 110/110 passed in 32 suites.
+- `yarn install --frozen-lockfile`: passed. `yarn audit --groups dependencies --level moderate` could not complete because the Yarn registry audit endpoint returned HTTP 410; dependencies were not changed by the incident fix.
+- Built artifact started successfully; health/readiness returned 200 and the new scoped list/assignment routes returned 401 without credentials. The owned process was stopped. Local application-service smoke passed as described above.
+
+### Known Limitations And Manual Actions
+
+- Production compatibility is unverified until an operator runs the audit with a read-only Production principal and owners decide each affected legacy case. Do not infer assignment intent from old share-link rows.
+- Staging must still verify the Admin Web with real roles, browser request cancellation, Hostinger/Cloudflare playback, backup/restore and large-file gates.
+
+### Next Recommended Prompt
+
+- “Run the share-link assignment audit against Production using a read-only principal, prepare masked owner decisions for every affected link, then stage the API before the website-scoped Admin Web; do not apply universal backfill.”
+
+## 2026-07-14 — Read-only share-link assignment remediation worksheet
+
+### Goal
+
+- Produce an owner-review worksheet and a reusable read-only audit for hardened same-website assignment policy without changing share links, assignments, videos, websites, domains or Production data.
+
+### Current Behavior And Findings
+
+- The local database contains two ACTIVE, unexpired links with one LOCAL_FILE video each. Both videos are READY and playable, their website and one domain are ACTIVE, but neither video has a same-site `WebsiteVideo` row or an assignment on another website.
+- Both active links therefore have zero READY, playable, ACTIVE-assigned videos under the hardened policy. Identifiers and aliases are masked in all worksheet/audit output; token and token-hash fields are not selected.
+- Production data was not queried. The worksheet recommends owner review only; no assignment was created/activated and no link was revoked.
+
+### Files Changed
+
+- Added `scripts/audit/share-link-assignment-audit.ts` and `scripts/audit/share-link-assignment-audit-core.ts` for bounded Prisma `findMany` reads, masked output, `--counts-only`, and exit code 2 when affected active links exist.
+- Added `test/share-link-assignment-audit.test.ts` for query-independent classification and masking behavior.
+- Added `docs/operations/share-link-assignment-remediation-worksheet.md` with the two masked local cases and non-executable remediation/compensation plans.
+- Added the `audit:share-link-assignments` Yarn script. No schema, migration or database data changed in this workstream.
+
+### Commands And Verification
+
+- `yarn audit:share-link-assignments --counts-only`: expected exit 2; inspected 2 links/2 rows, found 2 missing same-site assignments and 2 affected active links, with zero inactive/other-site/partial/non-playable/disabled-context cases.
+- `yarn typecheck`, `yarn build`, `yarn format:check`, `yarn db:local:validate`, focused Prettier and `git diff --check`: passed.
+- `yarn lint`: zero errors and 74 existing `consistent-type-imports` warnings.
+- `yarn test --runInBand`: 103/103 tests passed in 31 suites, including 2 new audit tests.
+- No npm/pnpm lockfile was present. No Production database command was run.
+
+### Known Limitations And Manual Actions
+
+- Owner must decide whether each missing assignment is legitimate, stale fixture data or grounds to revoke the link, then use a backed-up, audited and validated application-level remediation.
+- A Production operator must run the audit against an explicitly selected read-only Production connection; Hostinger/Cloudflare, 500MB upload and backup/restore acceptance remain separate gates.
+
+### Next Recommended Prompt
+
+- “With owner approval and a recorded backup, remediate only the approved masked share-link cases through audited application service operations, then rerun the read-only assignment audit and public-watch smoke checks.”
+
+## 2026-07-14 — Independent Production hardening verification
+
+### Goal
+
+- Independently verify the uncommitted hardening diff, dependency graph, local data compatibility, public/admin consumer compatibility, tests, and runtime before a GO/NO-GO decision.
+
+### Verification Findings
+
+- The hardening scope contained 54 paths before this review: 44 tracked modifications and 10 new files, all within backend config/source/tests/docs/migration scope. No old migration was changed or deleted, and no npm/pnpm lockfile or tracked build artifact was found.
+- Auth refresh CAS, session-family replay revocation, session-bound logout, Serializable bootstrap, assignment enforcement, generic public errors, limited media grants, proxy-peer validation, request redaction, readiness, dependency patches, and seven additive indexes were confirmed in live code.
+- Read-only local data audit found two active share links whose two video rows have no matching same-website assignment. Both links would be invalid under the new policy. No data was changed.
+- Local admin data contains one OWNER and no ADMIN/STAFF accounts. The Admin Web source recognizes roles but does not hide mutation controls for STAFF or purge for ADMIN.
+- The active public consumer source uses backend-returned playback/thumbnail URLs and preserves the media-grant query, but the actually deployed public artifact was not verified.
+- LOCAL_FILE static traversal/symlink checks pass, but OS-level TOCTOU remains a residual risk that depends on private-root ownership and permissions. Successful-media HEAD/client-abort behavior still requires staging verification.
+
+### Corrections Made After Initial NO-GO Matrix
+
+- Changed `AdminRolesGuard` to deny missing role metadata and added explicit read/write metadata to all 50 guarded admin resource routes; purge remains OWNER-only.
+- Added a route-inventory regression test so any future guarded admin route without explicit roles fails the suite.
+- Enforced strict canonical base64url alphabet, signature length, and payload re-encoding for public media grants; added a signed non-canonical payload regression test.
+
+### Commands And Results
+
+- Git scope/diff/check and lock/artifact scans: passed; no pre-existing migration was modified.
+- Read-only Prisma/SQL data audit: completed without printing token or secret values.
+- `yarn install --frozen-lockfile`: passed and reported already up to date.
+- `yarn audit --groups dependencies --level moderate`: zero vulnerabilities across 461 packages; the intentional Prisma CLI Hono resolution warning remains.
+- `yarn db:local:generate`, `yarn db:local:validate`, `yarn db:local:status`: passed; 15 migrations are up to date.
+- `yarn typecheck`, `yarn build`, `yarn format:check`, and `git diff --check`: passed.
+- `yarn lint`: zero errors and 74 `consistent-type-imports` warnings.
+- `yarn test --runInBand`: 101/101 tests passed in 30 suites.
+- Targeted tests passed for auth/RBAC/grants/errors, public assignment/generic responses, filesystem/upload/Range, and cache.
+- Built-artifact smoke on an isolated port: health/readiness 200, unauthenticated admin read/write 401, invalid public media HEAD 404, request token redacted in logs, then the owned process was stopped.
+
+### GO/NO-GO
+
+- Repository implementation is conditionally acceptable after the two corrections, but immediate Production deployment remains NO-GO until the two affected active links are deliberately remediated or accepted, Admin Web role controls are updated, deployed public artifacts are confirmed, and Hostinger/Cloudflare/large-file/backup acceptance is completed.
+
+### Next Recommended Prompt
+
+- “Prepare a read-only data-remediation worksheet for the two affected active share links, then update the Admin Web to hide all mutations for STAFF and purge for ADMIN; do not modify share-link assignments without owner approval.”
+
+## 2026-07-14 — Production hardening audit implementation
+
+### Goal
+
+- Implement the verified auth, public-watch, LOCAL_FILE, proxy, logging, readiness, dependency, search, and index hardening plan without changing route names, methods, API prefix, Swagger path, or existing response fields.
+
+### Current Behavior And Findings Addressed
+
+- Refresh rotation now claims the old token with transaction CAS; concurrent replay revokes the session/token family.
+- Logout is bound to the access-token `sid`, revokes the entire session, and propagates database failure instead of returning false success.
+- Bootstrap registration defaults off in Production and uses a bounded Serializable transaction retry; login uses a dummy bcrypt hash for missing/disabled accounts.
+- Database-backed RBAC makes STAFF read-only, ADMIN write-capable but unable to purge, and OWNER purge-capable.
+- Share links require ACTIVE website video assignments. Invalid public-watch reasons return the same `INVALID_LINK` response.
+- Max-view-limited watch responses issue HMAC grants bound to share link, video, host, purpose, and expiry; limited media rejects missing/tampered grants while the final admitted view can keep seeking.
+- Public media/watch/view paths re-check ACTIVE assignments. Request logs redact path token, query token/grant, and omit route params.
+- LOCAL_FILE rejects traversal and symlink escape, uses exclusive randomized chunk candidates, CAS upload states, atomic staging rename, recoverable merge failure, free-space reserve, MIME magic checks, safe stream abort/HEAD handling, and protected COMPLETING sessions.
+- Cloudinary video upload uses disk-backed temporary files instead of Multer memory storage.
+- Trusted proxy mode requires Production CIDRs; `CF-Connecting-IP` is accepted only from a matching immediate peer. Production CORS rejects local/insecure admin origin.
+- Remote metadata probing uses the exact Production host allowlist and re-checks DNS/public IP before each request.
+- Global request IDs, a generic 500 exception filter, and `/api/v1/health/ready` DB/storage readiness were added.
+- Multer/Nest/Swagger dependencies were patched; Yarn audit is now clean.
+
+### Files Changed
+
+- Runtime/config: `package.json`, `yarn.lock`, `.env.example`, `.env.local.example`, `src/main.ts`, `src/app.module.ts`, `src/config/**`, `src/common/**`, `src/security/**`, `src/health/**`.
+- Auth/RBAC: `src/admin-auth/**`, `src/admin-websites/**`.
+- Public access: `src/public/**`.
+- Video/storage: `src/videos/**`, `src/cloudinary/cloudinary.service.ts`.
+- Database: `prisma/schema.prisma`, `prisma/migrations/20260714050000_production_hardening_indexes/migration.sql`.
+- Tests: existing auth/public/storage/purge tests plus `test/security-hardening.test.ts`, `test/share-link-scope.test.ts`, and `test/upload-concurrency.test.ts`.
+- Docs: architecture, auth/env/security verification, Cloudflare, LOCAL_FILE, deployment runbooks, and this session log.
+
+### Migration
+
+- Added seven backward-compatible indexes for website/domain/share lists and split upload cleanup query shapes.
+- No columns were dropped/renamed, no data backfill was required, and the migration was applied to the local DB with `yarn db:local:deploy` without reset.
+- Local EXPLAIN selected the five list indexes. The tiny local upload-session table preferred its single-status index automatically; forced composite-index EXPLAIN confirmed range/index-only access for both cleanup indexes. Re-run unforced EXPLAIN on representative staging data.
+
+### Commands And Verification
+
+- Git safety checks and `git diff --check`: passed.
+- `yarn db:local:generate`, `yarn db:local:validate`, `yarn db:local:deploy`, `yarn db:local:status`: passed; 15 migrations applied/up to date.
+- `yarn typecheck`: passed.
+- `yarn lint`: passed with 74 intentional/pre-existing `consistent-type-imports` warnings and zero errors; runtime Nest decorator/DI imports were not auto-converted.
+- `yarn test --runInBand`: 98/98 tests passed in 30 suites.
+- `yarn build`: passed; Prisma Client 7.8.0 generated.
+- `yarn format:check`: passed.
+- `yarn audit --groups dependencies --level moderate`: zero vulnerabilities across 461 packages; Yarn reports the intentional Hono resolution mismatch warning.
+- Lock scan: no `package-lock.json` or `pnpm-lock.yaml`.
+- Runtime smoke: Nest modules/routes/Prisma initialized; `/api/v1/health` and `/api/v1/health/ready` returned 200, hostile Origin received no allow-origin header, 404 shape remained compatible, and graceful shutdown completed.
+
+### Known Limitations And Manual Actions
+
+- Production remains conditionally ready until actual Hostinger storage permissions/location, proxy CIDRs/direct-origin restriction, Cloudflare Range/abort/cache behavior, 500MB upload/resume/cancel/complete, synchronized DB/filesystem backup and restore, WAF/rate limits, and Production smoke are verified.
+- The cache and throttler remain process-local and are not suitable for consistent multi-instance enforcement.
+- Crash after DB purge commit but before physical cleanup can leave an audited orphan for operator cleanup; database reset is not an acceptable recovery.
+- DNS rebinding risk is reduced by exact allowlist plus repeated public-IP checks, but representative Production network testing is still required.
+- No representative large Production dataset benchmark was available; no performance percentage is claimed.
+
+### Next Recommended Prompt
+
+- “Use the Production deployment checklist to perform a staging acceptance run: configure real proxy CIDRs and private Hostinger storage, test 500MB upload/resume/cancel/complete, limited-grant playback with rapid Cloudflare seeking/abort, synchronized backup/restore, and capture evidence without exposing secrets.”
+
 ## 2026-07-04 — Continue Video filterKey safe purge verification
 
 ### Continued From

@@ -22,6 +22,9 @@ export interface ApiEnvironmentConfig {
   trustProxyEnabled: boolean;
   trustProxyHops: number;
   trustProxyCloudflareOnly: boolean;
+  trustedProxyCidrs: string[];
+  adminAccountManagementEnabled: boolean;
+  adminTemporaryPasswordTtlHours: number;
   memoryCache: {
     enabled: boolean;
     maxEntries: number;
@@ -65,6 +68,11 @@ export interface ApiEnvironmentConfig {
     minFreeSpaceMb: number;
     staleUploadMaxAgeHours: number;
     thumbnailUploadMaxMb: number;
+  };
+  release: {
+    version: string | null;
+    commit: string | null;
+    builtAt: string | null;
   };
 }
 
@@ -158,6 +166,17 @@ export const apiConfig = registerAs("api", (): ApiEnvironmentConfig => {
     trustProxyCloudflareOnly: parseBoolean(
       process.env.TRUST_PROXY_CLOUDFLARE_ONLY,
       false,
+    ),
+    trustedProxyCidrs: parseOrigins(process.env.TRUSTED_PROXY_CIDRS),
+    adminAccountManagementEnabled: parseBoolean(
+      process.env.ADMIN_ACCOUNT_MANAGEMENT_ENABLED,
+      !isProduction,
+    ),
+    adminTemporaryPasswordTtlHours: parseBoundedInteger(
+      process.env.ADMIN_TEMP_PASSWORD_TTL_HOURS,
+      24,
+      1,
+      168,
     ),
     memoryCache: {
       enabled: parseBoolean(process.env.MEMORY_CACHE_ENABLED, true),
@@ -341,5 +360,15 @@ export const apiConfig = registerAs("api", (): ApiEnvironmentConfig => {
         10,
       ),
     },
+    release: {
+      version: readOptionalTrimmedEnv(process.env.APP_RELEASE_VERSION),
+      commit: readOptionalTrimmedEnv(process.env.APP_BUILD_SHA),
+      builtAt: readOptionalTrimmedEnv(process.env.APP_BUILD_TIME),
+    },
   };
 });
+
+function readOptionalTrimmedEnv(value: string | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}

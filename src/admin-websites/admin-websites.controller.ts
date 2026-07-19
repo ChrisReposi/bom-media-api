@@ -24,7 +24,14 @@ import {
   ApiUnauthorizedResponse,
 } from "@nestjs/swagger";
 import { CurrentAdmin } from "../admin-auth/decorators/current-admin.decorator";
+import { CanonicalShareLinkService } from "./canonical-share-link.service";
+import { CanonicalShareLinkResponse } from "./types/canonical-share-link-response.type";
+import {
+  AdminReadRoles,
+  AdminWriteRoles,
+} from "../admin-auth/decorators/admin-roles.decorator";
 import { AdminAccessTokenGuard } from "../admin-auth/guards/admin-access-token.guard";
+import { AdminRolesGuard } from "../admin-auth/guards/admin-roles.guard";
 import type { SafeAdminResponse } from "../admin-auth/types/admin-auth-response.type";
 import {
   THROTTLE_PROFILES,
@@ -34,6 +41,7 @@ import { AdminWebsitesService } from "./admin-websites.service";
 import { ActivateWebsiteDomainDto } from "./dto/activate-website-domain.dto";
 import { AssignDomainToWebsiteDto } from "./dto/assign-domain-to-website.dto";
 import { AssignWebsiteVideosDto } from "./dto/assign-website-videos.dto";
+import { AssignSingleWebsiteVideoDto } from "./dto/assign-single-website-video.dto";
 import { ClaimCurrentWebsiteDomainDto } from "./dto/claim-current-website-domain.dto";
 import { CreateDomainDto } from "./dto/create-domain.dto";
 import { CreateDomainGroupDto } from "./dto/create-domain-group.dto";
@@ -43,6 +51,9 @@ import { CreateWebsiteDto } from "./dto/create-website.dto";
 import { ListDomainsQueryDto } from "./dto/list-domains-query.dto";
 import { ListDomainGroupsQueryDto } from "./dto/list-domain-groups-query.dto";
 import { ListWebsitesQueryDto } from "./dto/list-websites-query.dto";
+import { ListWebsiteVideosQueryDto } from "./dto/list-website-videos-query.dto";
+import { ListWebsiteVideoAssignmentOptionsQueryDto } from "./dto/list-website-video-assignment-options-query.dto";
+import { UpdateWebsiteVideoAssignmentsDto } from "./dto/update-website-video-assignments.dto";
 import { UpdateDomainDto } from "./dto/update-domain.dto";
 import { UpdateDomainGroupDto } from "./dto/update-domain-group.dto";
 import { UpdateWebsiteDomainDto } from "./dto/update-website-domain.dto";
@@ -52,6 +63,8 @@ import {
   AdminDomainGroupResponse,
   AdminDomainListResponse,
   AdminDomainResponse,
+  AdminWebsiteAssignedVideoResponse,
+  AdminWebsiteVideoAssignmentOptionsResponse,
   AdminWebsiteDetailResponse,
   AdminWebsiteDomainResponse,
   AdminWebsiteListResponse,
@@ -59,6 +72,7 @@ import {
   AssignWebsiteVideosResponse,
   DisableDomainGroupResponse,
   DisableWebsiteResponse,
+  UpdateWebsiteVideoAssignmentsResponse,
 } from "./types/admin-website-response.type";
 import {
   AdminShareLinkListResponse,
@@ -68,13 +82,17 @@ import {
 
 @ApiTags("admin-websites")
 @ApiBearerAuth()
-@UseGuards(AdminAccessTokenGuard)
+@UseGuards(AdminAccessTokenGuard, AdminRolesGuard)
 @ThrottleProfile(THROTTLE_PROFILES.admin)
 @Controller("admin")
 export class AdminWebsitesController {
-  constructor(private readonly websitesService: AdminWebsitesService) {}
+  constructor(
+    private readonly websitesService: AdminWebsitesService,
+    private readonly canonicalShareLinkService: CanonicalShareLinkService,
+  ) {}
 
   @Get("domain-groups")
+  @AdminReadRoles()
   @ApiOperation({ summary: "List domain groups" })
   @ApiOkResponse({ type: AdminDomainGroupListResponse })
   @ApiUnauthorizedResponse()
@@ -85,6 +103,7 @@ export class AdminWebsitesController {
   }
 
   @Post("domain-groups")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Create domain group" })
   @ApiCreatedResponse({ type: AdminDomainGroupResponse })
   @ApiBadRequestResponse()
@@ -98,6 +117,7 @@ export class AdminWebsitesController {
   }
 
   @Get("domain-groups/:id")
+  @AdminReadRoles()
   @ApiOperation({ summary: "Get domain group" })
   @ApiOkResponse({ type: AdminDomainGroupResponse })
   @ApiUnauthorizedResponse()
@@ -107,6 +127,7 @@ export class AdminWebsitesController {
   }
 
   @Patch("domain-groups/:id")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Update domain group" })
   @ApiOkResponse({ type: AdminDomainGroupResponse })
   @ApiBadRequestResponse()
@@ -122,6 +143,7 @@ export class AdminWebsitesController {
   }
 
   @Delete("domain-groups/:id")
+  @AdminWriteRoles()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: "Disable domain group" })
   @ApiOkResponse({ type: DisableDomainGroupResponse })
@@ -135,6 +157,7 @@ export class AdminWebsitesController {
   }
 
   @Get("domains")
+  @AdminReadRoles()
   @ApiOperation({ summary: "List domains in the global domain pool" })
   @ApiOkResponse({ type: AdminDomainListResponse })
   @ApiUnauthorizedResponse()
@@ -145,6 +168,7 @@ export class AdminWebsitesController {
   }
 
   @Post("domains")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Create standalone domain in the domain pool" })
   @ApiCreatedResponse({ type: AdminDomainResponse })
   @ApiBadRequestResponse()
@@ -158,6 +182,7 @@ export class AdminWebsitesController {
   }
 
   @Get("domains/:domainId")
+  @AdminReadRoles()
   @ApiOperation({ summary: "Get domain from the domain pool" })
   @ApiOkResponse({ type: AdminDomainResponse })
   @ApiUnauthorizedResponse()
@@ -167,6 +192,7 @@ export class AdminWebsitesController {
   }
 
   @Patch("domains/:domainId")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Update domain in the domain pool" })
   @ApiOkResponse({ type: AdminDomainResponse })
   @ApiBadRequestResponse()
@@ -182,6 +208,7 @@ export class AdminWebsitesController {
   }
 
   @Delete("domains/:domainId")
+  @AdminWriteRoles()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: "Disable available domain" })
   @ApiOkResponse({ type: AdminDomainResponse })
@@ -196,6 +223,7 @@ export class AdminWebsitesController {
   }
 
   @Post("domains/:domainId/activate")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Activate domain" })
   @ApiOkResponse({ type: AdminDomainResponse })
   @ApiUnauthorizedResponse()
@@ -208,6 +236,7 @@ export class AdminWebsitesController {
   }
 
   @Post("domains/:domainId/assign")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Assign available domain to a website" })
   @ApiOkResponse({ type: AdminDomainResponse })
   @ApiBadRequestResponse()
@@ -222,6 +251,7 @@ export class AdminWebsitesController {
   }
 
   @Post("domains/:domainId/unassign")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Unassign domain from its website" })
   @ApiOkResponse({ type: AdminDomainResponse })
   @ApiUnauthorizedResponse()
@@ -234,6 +264,7 @@ export class AdminWebsitesController {
   }
 
   @Get("websites")
+  @AdminReadRoles()
   @ApiOperation({ summary: "List admin websites" })
   @ApiOkResponse({ type: AdminWebsiteListResponse })
   @ApiUnauthorizedResponse()
@@ -244,6 +275,7 @@ export class AdminWebsitesController {
   }
 
   @Get("websites/:id")
+  @AdminReadRoles()
   @ApiOperation({ summary: "Get website detail" })
   @ApiOkResponse({ type: AdminWebsiteDetailResponse })
   @ApiUnauthorizedResponse()
@@ -253,6 +285,7 @@ export class AdminWebsitesController {
   }
 
   @Post("websites")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Create website" })
   @ApiCreatedResponse({ type: AdminWebsiteResponse })
   @ApiBadRequestResponse()
@@ -266,6 +299,7 @@ export class AdminWebsitesController {
   }
 
   @Patch("websites/:id")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Update website" })
   @ApiOkResponse({ type: AdminWebsiteResponse })
   @ApiBadRequestResponse()
@@ -281,6 +315,7 @@ export class AdminWebsitesController {
   }
 
   @Delete("websites/:id")
+  @AdminWriteRoles()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: "Disable website" })
   @ApiOkResponse({ type: DisableWebsiteResponse })
@@ -294,6 +329,7 @@ export class AdminWebsitesController {
   }
 
   @Post("websites/:websiteId/domains")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Create website domain" })
   @ApiCreatedResponse({ type: AdminWebsiteDomainResponse })
   @ApiBadRequestResponse()
@@ -309,6 +345,7 @@ export class AdminWebsitesController {
   }
 
   @Patch("websites/:websiteId/domains/:domainId")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Update website domain" })
   @ApiOkResponse({ type: AdminWebsiteDomainResponse })
   @ApiBadRequestResponse()
@@ -330,6 +367,7 @@ export class AdminWebsitesController {
   }
 
   @Delete("websites/:websiteId/domains/:domainId")
+  @AdminWriteRoles()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: "Disable website domain" })
   @ApiOkResponse({ type: AdminWebsiteDomainResponse })
@@ -344,6 +382,7 @@ export class AdminWebsitesController {
   }
 
   @Post("websites/:websiteId/domains/:domainId/activate")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Activate website domain" })
   @ApiOkResponse({ type: AdminWebsiteDomainResponse })
   @ApiBadRequestResponse()
@@ -364,6 +403,7 @@ export class AdminWebsitesController {
   }
 
   @Post("websites/:websiteId/domains/:domainId/disable")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Disable website domain" })
   @ApiOkResponse({ type: AdminWebsiteDomainResponse })
   @ApiUnauthorizedResponse()
@@ -377,6 +417,7 @@ export class AdminWebsitesController {
   }
 
   @Post("websites/:websiteId/domains/claim-current")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Claim current public domain for a website" })
   @ApiCreatedResponse({ type: AdminWebsiteDomainResponse })
   @ApiBadRequestResponse()
@@ -392,17 +433,35 @@ export class AdminWebsitesController {
   }
 
   @Get("websites/:websiteId/videos")
+  @AdminReadRoles()
   @ApiOperation({ summary: "List website video assignments" })
   @ApiOkResponse({ type: AssignWebsiteVideosResponse })
   @ApiUnauthorizedResponse()
   @ApiNotFoundResponse()
   listAssignedVideos(
     @Param("websiteId") websiteId: string,
+    @Query() query: ListWebsiteVideosQueryDto,
   ): Promise<AssignWebsiteVideosResponse> {
-    return this.websitesService.listAssignedVideos(websiteId);
+    return this.websitesService.listAssignedVideos(websiteId, query);
+  }
+
+  @Get("websites/:websiteId/video-assignment-options")
+  @AdminReadRoles()
+  @ApiOperation({
+    summary: "List authoritative website video assignment options",
+  })
+  @ApiOkResponse({ type: AdminWebsiteVideoAssignmentOptionsResponse })
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  listVideoAssignmentOptions(
+    @Param("websiteId") websiteId: string,
+    @Query() query: ListWebsiteVideoAssignmentOptionsQueryDto,
+  ): Promise<AdminWebsiteVideoAssignmentOptionsResponse> {
+    return this.websitesService.listVideoAssignmentOptions(websiteId, query);
   }
 
   @Put("websites/:websiteId/videos")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Replace website video assignments" })
   @ApiOkResponse({ type: AssignWebsiteVideosResponse })
   @ApiBadRequestResponse()
@@ -416,7 +475,49 @@ export class AdminWebsitesController {
     return this.websitesService.assignVideos(websiteId, dto, admin.id);
   }
 
+  @Patch("websites/:websiteId/video-assignments")
+  @AdminWriteRoles()
+  @ApiOperation({
+    summary: "Atomically assign and unassign multiple website videos",
+  })
+  @ApiOkResponse({ type: UpdateWebsiteVideoAssignmentsResponse })
+  @ApiBadRequestResponse()
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  @ApiConflictResponse()
+  updateVideoAssignments(
+    @Param("websiteId") websiteId: string,
+    @Body() dto: UpdateWebsiteVideoAssignmentsDto,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<UpdateWebsiteVideoAssignmentsResponse> {
+    return this.websitesService.updateVideoAssignments(
+      websiteId,
+      dto,
+      admin.id,
+    );
+  }
+
+  @Post("websites/:websiteId/videos/assign")
+  @AdminWriteRoles()
+  @ApiOperation({ summary: "Assign or reactivate one video for a website" })
+  @ApiCreatedResponse({ type: AdminWebsiteAssignedVideoResponse })
+  @ApiBadRequestResponse()
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  assignSingleVideo(
+    @Param("websiteId") websiteId: string,
+    @Body() dto: AssignSingleWebsiteVideoDto,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<AdminWebsiteAssignedVideoResponse> {
+    return this.websitesService.assignSingleVideo(
+      websiteId,
+      dto.videoId,
+      admin.id,
+    );
+  }
+
   @Get("websites/:websiteId/share-links")
+  @AdminReadRoles()
   @ApiOperation({ summary: "List website share links" })
   @ApiOkResponse({ type: AdminShareLinkListResponse })
   @ApiUnauthorizedResponse()
@@ -428,6 +529,7 @@ export class AdminWebsitesController {
   }
 
   @Post("websites/:websiteId/share-links")
+  @AdminWriteRoles()
   @ApiOperation({
     summary: "Create share link",
     description:
@@ -445,7 +547,52 @@ export class AdminWebsitesController {
     return this.websitesService.createShareLink(websiteId, dto, admin.id);
   }
 
+  @Get("websites/:websiteId/videos/:videoId/canonical-share-link")
+  @AdminReadRoles()
+  @ApiOperation({
+    summary: "Get canonical share link for a website+video pair",
+    description:
+      "Read-only. Returns the stable canonical URL; never creates or rotates.",
+  })
+  @ApiOkResponse({ type: CanonicalShareLinkResponse })
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  getCanonicalShareLink(
+    @Param("websiteId") websiteId: string,
+    @Param("videoId") videoId: string,
+  ): Promise<CanonicalShareLinkResponse> {
+    return this.canonicalShareLinkService.getCanonical(websiteId, videoId);
+  }
+
+  @Post("websites/:websiteId/videos/:videoId/canonical-share-link")
+  @AdminWriteRoles()
+  @ApiOperation({
+    summary: "Create-or-get canonical share link (idempotent)",
+    description:
+      "Same website+video always returns the same alias and byte-for-byte the same publicUrl. No expiry, maxViews, caller alias, or caller token are accepted. Canonical callers receive the alias-based URL without any raw token.",
+  })
+  @ApiCreatedResponse({ type: CanonicalShareLinkResponse })
+  @ApiBadRequestResponse()
+  @ApiConflictResponse({
+    description:
+      "Stable codes: CANONICAL_LINK_REVOKED, CANONICAL_LINK_INACTIVE, CANONICAL_DOMAIN_UNAVAILABLE, CANONICAL_EVIDENCE_DRIFT, CANONICAL_EVIDENCE_INCOMPLETE, CANONICAL_VIDEO_NOT_SHAREABLE.",
+  })
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  createCanonicalShareLink(
+    @Param("websiteId") websiteId: string,
+    @Param("videoId") videoId: string,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<CanonicalShareLinkResponse> {
+    return this.canonicalShareLinkService.createOrGetCanonical(
+      websiteId,
+      videoId,
+      admin.id,
+    );
+  }
+
   @Post("share-links/:shareLinkId/revoke")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Revoke share link" })
   @ApiOkResponse({ type: RevokeShareLinkResponse })
   @ApiUnauthorizedResponse()

@@ -5,6 +5,7 @@ import {
   HttpCode,
   HttpStatus,
   Post,
+  Param,
   Req,
   UseGuards,
 } from "@nestjs/common";
@@ -29,7 +30,10 @@ import {
 } from "../security/throttle-profile.decorator";
 import { AdminAuthService } from "./admin-auth.service";
 import { CurrentAdmin } from "./decorators/current-admin.decorator";
+import { CurrentAdminSessionId } from "./decorators/current-admin-session-id.decorator";
+import { AllowPasswordChangeRequired } from "./decorators/allow-password-change-required.decorator";
 import { ChangeAdminPasswordDto } from "./dto/change-admin-password.dto";
+import { ChangeOwnAdminPasswordDto } from "./dto/change-own-admin-password.dto";
 import { LoginAdminDto } from "./dto/login-admin.dto";
 import { LogoutAdminDto } from "./dto/logout-admin.dto";
 import { RefreshAdminTokenDto } from "./dto/refresh-admin-token.dto";
@@ -43,6 +47,8 @@ import {
   MeAdminResponse,
   RefreshAdminTokenResponse,
   RegisterAdminResponse,
+  AdminOwnSessionListResponse,
+  RevokeOwnAdminSessionResponse,
 } from "./types/admin-auth-response.type";
 
 @ApiTags("admin-auth")
@@ -138,10 +144,13 @@ export class AdminAuthController {
   @Post("logout")
   @HttpCode(HttpStatus.OK)
   @ThrottleProfile(THROTTLE_PROFILES.logout)
+  @UseGuards(AdminAccessTokenGuard)
+  @AllowPasswordChangeRequired()
+  @ApiBearerAuth()
   @ApiOperation({
     summary: "Log out an admin session",
     description:
-      "Revokes the supplied refresh token when it exists. The response is idempotent and does not reveal token state.",
+      "Revokes the authenticated access-token session and all refresh tokens in that session. The response is idempotent and does not reveal refresh-token state.",
   })
   @ApiOkResponse({
     description: "Admin logged out successfully.",
@@ -151,11 +160,15 @@ export class AdminAuthController {
     description: "Request body failed validation.",
   })
   logout(
+    @CurrentAdmin() admin: SafeAdminResponse,
+    @CurrentAdminSessionId() sessionId: string,
     @Body() logoutAdminDto: LogoutAdminDto,
     @Req() request: Request,
   ): Promise<LogoutAdminResponse> {
     return this.adminAuthService.logout(
       logoutAdminDto,
+      admin.id,
+      sessionId,
       this.getRequestMeta(request),
     );
   }
@@ -167,6 +180,7 @@ export class AdminAuthController {
   @ApiBearerAuth()
   @ApiOperation({
     summary: "Change current admin password",
+    deprecated: true,
     description:
       "Requires a valid admin Bearer access token, current password, and server-configured change-password secret. Revokes existing refresh tokens after success.",
   })
@@ -193,9 +207,62 @@ export class AdminAuthController {
     );
   }
 
+  @Post("change-own-password")
+  @HttpCode(HttpStatus.OK)
+  @ThrottleProfile(THROTTLE_PROFILES.login)
+  @UseGuards(AdminAccessTokenGuard)
+  @AllowPasswordChangeRequired()
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "Change the authenticated admin password" })
+  @ApiOkResponse({ type: ChangeAdminPasswordResponse })
+  changeOwnPassword(
+    @CurrentAdmin() admin: SafeAdminResponse,
+    @Body() dto: ChangeOwnAdminPasswordDto,
+    @Req() request: Request,
+  ): Promise<ChangeAdminPasswordResponse> {
+    return this.adminAuthService.changeOwnPassword(
+      admin.id,
+      dto,
+      this.getRequestMeta(request),
+    );
+  }
+
+  @Get("sessions")
+  @ThrottleProfile(THROTTLE_PROFILES.admin)
+  @UseGuards(AdminAccessTokenGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "List active sessions for the current admin" })
+  @ApiOkResponse({ type: AdminOwnSessionListResponse })
+  listOwnSessions(
+    @CurrentAdmin() admin: SafeAdminResponse,
+    @CurrentAdminSessionId() currentSessionId: string,
+  ): Promise<AdminOwnSessionListResponse> {
+    return this.adminAuthService.listOwnSessions(admin.id, currentSessionId);
+  }
+
+  @Post("sessions/:sessionId/revoke")
+  @HttpCode(HttpStatus.OK)
+  @ThrottleProfile(THROTTLE_PROFILES.logout)
+  @UseGuards(AdminAccessTokenGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "Revoke one session owned by the current admin" })
+  @ApiOkResponse({ type: RevokeOwnAdminSessionResponse })
+  revokeOwnSession(
+    @CurrentAdmin() admin: SafeAdminResponse,
+    @CurrentAdminSessionId() currentSessionId: string,
+    @Param("sessionId") sessionId: string,
+  ): Promise<RevokeOwnAdminSessionResponse> {
+    return this.adminAuthService.revokeOwnSession(
+      admin.id,
+      currentSessionId,
+      sessionId,
+    );
+  }
+
   @Get("me")
   @ThrottleProfile(THROTTLE_PROFILES.admin)
   @UseGuards(AdminAccessTokenGuard)
+  @AllowPasswordChangeRequired()
   @ApiBearerAuth()
   @ApiOperation({
     summary: "Get current admin",
@@ -220,6 +287,7 @@ export class AdminAuthController {
     return getRequestSecurityMeta(request, {
       trustProxyEnabled: apiEnvironment.trustProxyEnabled,
       trustProxyCloudflareOnly: apiEnvironment.trustProxyCloudflareOnly,
+      trustedProxyCidrs: apiEnvironment.trustedProxyCidrs,
     });
   }
 }

@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { BadRequestException } from "@nestjs/common";
+import { BadRequestException, ConflictException } from "@nestjs/common";
 import type { ApiEnvironmentConfig } from "../src/config/env.config";
 import {
   AssignmentStatus,
@@ -38,6 +38,7 @@ type FakeVideoRecord = {
 type AuditRecord = {
   action: string;
   entityId: string;
+  status: AuditStatus;
   metadataJson: unknown;
 };
 
@@ -181,6 +182,13 @@ class FakePrismaService {
     },
   };
 
+  /** Canonical mappings block purge; tests opt in via this counter. */
+  canonicalLinkCount = 0;
+
+  canonicalVideoShareLink = {
+    count: async (): Promise<number> => this.canonicalLinkCount,
+  };
+
   adminAuditLog = {
     create: async (args: {
       data: {
@@ -190,10 +198,10 @@ class FakePrismaService {
         metadataJson: unknown;
       };
     }): Promise<void> => {
-      assert.equal(args.data.status, AuditStatus.SUCCESS);
       this.audits.push({
         action: args.data.action,
         entityId: args.data.entityId,
+        status: args.data.status,
         metadataJson: args.data.metadataJson,
       });
     },
@@ -333,6 +341,23 @@ describe("VideosService purge reclaim behavior", () => {
     );
   });
 
+  it("rejects purge while the video anchors a canonical share link", async () => {
+    const { prisma, service } = createVideosService();
+    prisma.videos.set("video-1", createVideo());
+    prisma.canonicalLinkCount = 1;
+
+    await assert.rejects(
+      service.purgeVideo("video-1", { confirmVideoId: "video-1" }, "admin-1"),
+      (error: unknown) => {
+        assert.ok(error instanceof ConflictException);
+        const body = error.getResponse() as { code?: string };
+        assert.equal(body.code, "VIDEO_HAS_CANONICAL_SHARE_LINK");
+        return true;
+      },
+    );
+    assert.deepEqual(prisma.deletedVideoIds, []);
+  });
+
   it("rejects purge while assigned to a website", async () => {
     const { prisma, service } = createVideosService();
     prisma.videos.set("video-1", createVideo());
@@ -434,9 +459,12 @@ describe("VideosService purge reclaim behavior", () => {
       "videos/video-1/source/video.mp4",
       "videos/video-1/thumbnails/thumb.jpg",
     ]);
-    assert.equal(prisma.audits.length, 1);
-    assert.equal(prisma.audits[0]?.action, "VIDEO_PURGE");
-    assert.deepEqual(prisma.audits[0]?.metadataJson, {
+    assert.equal(prisma.audits.length, 2);
+    assert.equal(prisma.audits[0]?.action, "VIDEO_PURGE_COMMIT");
+    assert.equal(prisma.audits[0]?.status, AuditStatus.SUCCESS);
+    assert.equal(prisma.audits[1]?.action, "VIDEO_PURGE_STORAGE");
+    assert.equal(prisma.audits[1]?.status, AuditStatus.SUCCESS);
+    assert.deepEqual(prisma.audits[1]?.metadataJson, {
       provider: VideoProvider.MANUAL,
       sourceType: VideoSourceType.LOCAL_FILE,
       hadWebsiteAssignments: false,
@@ -478,6 +506,9 @@ describe("VideosService purge reclaim behavior", () => {
       bytesReclaimed: "25",
       orphanCleanupRequired: true,
     });
+    assert.equal(prisma.audits[0]?.action, "VIDEO_PURGE_COMMIT");
+    assert.equal(prisma.audits[1]?.action, "VIDEO_PURGE_STORAGE");
+    assert.equal(prisma.audits[1]?.status, AuditStatus.FAIL);
   });
 
   it("soft disable does not delete local files", async () => {

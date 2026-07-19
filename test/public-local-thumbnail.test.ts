@@ -13,6 +13,7 @@ import {
   VideoStatus,
   WebsiteStatus,
 } from "../src/generated/prisma/client";
+import { PublicMediaGrantService } from "../src/public/public-media-grant.service";
 import { PublicService } from "../src/public/public.service";
 import { hashShareToken } from "../src/public/utils/share-token.util";
 
@@ -89,7 +90,24 @@ class FakeConfigService {
       return "api/v1" as T;
     }
 
+    if (key === "PUBLIC_MEDIA_GRANT_SECRET") {
+      return "test-public-media-grant-secret-at-least-32-bytes" as T;
+    }
+
+    if (key === "PUBLIC_MEDIA_GRANT_TTL_SECONDS") {
+      return "21600" as T;
+    }
+
     return undefined;
+  }
+
+  getOrThrow<T = string>(key: string): T {
+    const value = this.get<T>(key);
+    if (value === undefined) {
+      throw new Error(`${key} missing`);
+    }
+
+    return value;
   }
 }
 
@@ -108,6 +126,7 @@ class FakePrismaService {
   websiteDomainFindUniqueCalls = 0;
   shareLinkFindFirstCalls = 0;
   shareLinkUpdateManyCalls = 0;
+  assignmentActive = true;
   readonly accessLogs: Array<{
     status: AccessLogStatus;
     reasonCode: string;
@@ -170,8 +189,9 @@ class FakePrismaService {
       }
 
       const requestedVideoId = args.include?.shareLinkVideos?.where?.videoId;
-      const shareLinkVideos =
-        requestedVideoId === undefined
+      const shareLinkVideos = !this.assignmentActive
+        ? []
+        : requestedVideoId === undefined
           ? this.shareLinkRecord.shareLinkVideos
           : this.shareLinkRecord.shareLinkVideos.filter(
               ({ video }) => video.id === requestedVideoId,
@@ -182,8 +202,14 @@ class FakePrismaService {
         shareLinkVideos,
       };
     },
-    updateMany: async (): Promise<{ count: number }> => {
+    updateMany: async (args: {
+      where?: { currentViews?: { lt: number } };
+    }): Promise<{ count: number }> => {
       this.shareLinkUpdateManyCalls += 1;
+      const limit = args.where?.currentViews?.lt;
+      if (limit !== undefined && this.shareLinkRecord.currentViews >= limit) {
+        return { count: 0 };
+      }
       this.shareLinkRecord.currentViews += 1;
 
       return { count: 1 };
@@ -261,11 +287,13 @@ function createService(
   service: PublicService;
 } {
   const prisma = new FakePrismaService(video);
+  const config = new FakeConfigService();
   const service = new PublicService(
     prisma as never,
-    new FakeConfigService() as never,
+    config as never,
     new FakeLocalVideoStorageService() as never,
     new FakeVideoViewGrowthService() as never,
+    new PublicMediaGrantService(config as never),
     options.memoryCache === true ? createMemoryCache() : undefined,
   );
 
@@ -384,6 +412,22 @@ describe("PublicService LOCAL_FILE thumbnail serialization", () => {
     );
   });
 
+  it("rejects oversized media grants before database lookup", async () => {
+    const { prisma, service } = createService(createLocalFileVideo());
+
+    await assert.rejects(
+      service.getPublicLocalThumbnail({
+        host,
+        token,
+        videoId: "video-1",
+        grant: "x".repeat(2049),
+      }),
+      NotFoundException,
+    );
+    assert.equal(prisma.websiteDomainFindUniqueCalls, 0);
+    assert.equal(prisma.shareLinkFindFirstCalls, 0);
+  });
+
   it("caches safe public watch metadata while preserving view and access-log side effects", async () => {
     const { prisma, service } = createService(createLocalFileVideo(), {
       memoryCache: true,
@@ -418,6 +462,65 @@ describe("PublicService LOCAL_FILE thumbnail serialization", () => {
     assert.equal(prisma.shareLinkRecord.currentViews, 2);
   });
 
+  it("requires a bound grant for limited-share media after the final view", async () => {
+    const { prisma, service } = createService(createLocalFileVideo());
+    prisma.shareLinkRecord.maxViews = 1;
+
+    const response = await service.resolvePublicWatch({ host, token });
+    const thumbnailUrl = response.videos[0]?.thumbnailUrl;
+    assert.ok(thumbnailUrl);
+    const grant = new URL(
+      thumbnailUrl,
+      "https://api.example.com",
+    ).searchParams.get("grant");
+    assert.ok(grant);
+    assert.equal(prisma.shareLinkRecord.currentViews, 1);
+
+    await assert.rejects(
+      service.getPublicLocalThumbnail({ host, token, videoId: "video-1" }),
+      NotFoundException,
+    );
+    await assert.doesNotReject(
+      service.getPublicLocalThumbnail({
+        host,
+        token,
+        videoId: "video-1",
+        grant,
+      }),
+    );
+  });
+
+  it("allows at most one concurrent public watch at the final view", async () => {
+    const { prisma, service } = createService(createLocalFileVideo());
+    prisma.shareLinkRecord.maxViews = 1;
+
+    const responses = await Promise.all([
+      service.resolvePublicWatch({ host, token }),
+      service.resolvePublicWatch({ host, token }),
+    ]);
+
+    assert.equal(responses.filter((response) => response.valid).length, 1);
+    assert.equal(responses.filter((response) => !response.valid).length, 1);
+    assert.equal(prisma.shareLinkRecord.currentViews, 1);
+  });
+
+  it("invalidates watch and media when the active website assignment is removed", async () => {
+    const { prisma, service } = createService(createLocalFileVideo());
+    prisma.assignmentActive = false;
+
+    const response = await service.resolvePublicWatch({ host, token });
+    assert.deepEqual(response, {
+      valid: false,
+      reasonCode: "INVALID_LINK",
+      website: null,
+      videos: [],
+    });
+    await assert.rejects(
+      service.getPublicLocalThumbnail({ host, token, videoId: "video-1" }),
+      NotFoundException,
+    );
+  });
+
   it("keeps public watch response generic after a share link is disabled", async () => {
     const { service, prisma } = createService(createLocalFileVideo());
     prisma.shareLinkRecord.status = ShareLinkStatus.DISABLED;
@@ -427,5 +530,51 @@ describe("PublicService LOCAL_FILE thumbnail serialization", () => {
     assert.equal(response.valid, false);
     assert.equal(response.reasonCode, "INVALID_LINK");
     assert.deepEqual(response.videos, []);
+  });
+
+  it("uses the same invalid shape for token, host, expiry, limit, and video failures", async () => {
+    const expected = {
+      valid: false,
+      reasonCode: "INVALID_LINK",
+      website: null,
+      videos: [],
+    } as const;
+    const wrongToken = createService(createLocalFileVideo());
+    assert.deepEqual(
+      await wrongToken.service.resolvePublicWatch({ host, token: "wrong" }),
+      expected,
+    );
+
+    const wrongHost = createService(createLocalFileVideo());
+    assert.deepEqual(
+      await wrongHost.service.resolvePublicWatch({
+        host: "other.example.com",
+        token,
+      }),
+      expected,
+    );
+
+    const expired = createService(createLocalFileVideo());
+    expired.prisma.shareLinkRecord.expiresAt = new Date(0);
+    assert.deepEqual(
+      await expired.service.resolvePublicWatch({ host, token }),
+      expected,
+    );
+
+    const limited = createService(createLocalFileVideo());
+    limited.prisma.shareLinkRecord.maxViews = 1;
+    limited.prisma.shareLinkRecord.currentViews = 1;
+    assert.deepEqual(
+      await limited.service.resolvePublicWatch({ host, token }),
+      expected,
+    );
+
+    const disabledVideo = createService(
+      createLocalFileVideo({ status: VideoStatus.DISABLED }),
+    );
+    assert.deepEqual(
+      await disabledVideo.service.resolvePublicWatch({ host, token }),
+      expected,
+    );
   });
 });

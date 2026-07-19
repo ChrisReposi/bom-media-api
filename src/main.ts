@@ -4,9 +4,11 @@ import { ConfigService } from "@nestjs/config";
 import { NestFactory } from "@nestjs/core";
 import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
 import helmet from "helmet";
+import proxyaddr from "proxy-addr";
 import { Logger } from "nestjs-pino";
 import type { NextFunction, Request, Response } from "express";
 import { SWAGGER_PATH } from "./common/constants/api.constants";
+import { GlobalExceptionFilter } from "./common/filters/global-exception.filter";
 import type { ApiEnvironmentConfig } from "./config/env.config";
 import { AppModule } from "./app.module";
 import { CorsOriginService } from "./security/cors-origin.service";
@@ -23,10 +25,17 @@ async function bootstrap(): Promise<void> {
 
   if (apiEnvironment.trustProxyEnabled) {
     const expressInstance = app.getHttpAdapter().getInstance() as {
-      set(name: string, value: number): void;
+      set(name: string, value: number | ((address: string) => boolean)): void;
     };
 
-    expressInstance.set("trust proxy", apiEnvironment.trustProxyHops);
+    if (apiEnvironment.trustedProxyCidrs.length > 0) {
+      const trustedProxy = proxyaddr.compile(apiEnvironment.trustedProxyCidrs);
+      expressInstance.set("trust proxy", (address: string): boolean =>
+        trustedProxy(address, 0),
+      );
+    } else {
+      expressInstance.set("trust proxy", apiEnvironment.trustProxyHops);
+    }
   }
 
   app.use(helmet());
@@ -61,6 +70,7 @@ async function bootstrap(): Promise<void> {
       transform: true,
     }),
   );
+  app.useGlobalFilters(new GlobalExceptionFilter());
   app.enableShutdownHooks();
 
   if (apiEnvironment.docsEnabled) {

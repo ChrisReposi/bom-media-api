@@ -4,6 +4,7 @@ import { APP_GUARD } from "@nestjs/core";
 import { ThrottlerGuard, ThrottlerModule } from "@nestjs/throttler";
 import { LoggerModule } from "nestjs-pino";
 import { AdminAuthModule } from "./admin-auth/admin-auth.module";
+import { AdminAccountsModule } from "./admin-accounts/admin-accounts.module";
 import { AdminWebsitesModule } from "./admin-websites/admin-websites.module";
 import { AppController } from "./app.controller";
 import { AppService } from "./app.service";
@@ -17,20 +18,28 @@ import { PublicModule } from "./public/public.module";
 import { SecurityModule } from "./security/security.module";
 import { buildThrottlerOptions } from "./security/throttle.config";
 import { VideosModule } from "./videos/videos.module";
+import { randomUUID } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
 loadApiEnv();
 
-function redactTokenFromUrl(value: string): string {
+export function redactTokenFromUrl(value: string): string {
   const [rawPath, queryString] = value.split("?");
-  const path = rawPath ?? "";
+  const path = (rawPath ?? "").replace(
+    /(\/public\/watch\/)[^/?#]+/i,
+    "$1[Redacted]",
+  );
 
   if (queryString === undefined) {
-    return value;
+    return path;
   }
 
   const searchParams = new URLSearchParams(queryString);
   if (searchParams.has("token")) {
     searchParams.set("token", "[Redacted]");
+  }
+  if (searchParams.has("grant")) {
+    searchParams.set("grant", "[Redacted]");
   }
 
   const nextQueryString = searchParams.toString();
@@ -50,10 +59,13 @@ function redactQueryToken(value: unknown): unknown {
     ...(Object.prototype.hasOwnProperty.call(query, "token")
       ? { token: "[Redacted]" }
       : {}),
+    ...(Object.prototype.hasOwnProperty.call(query, "grant")
+      ? { grant: "[Redacted]" }
+      : {}),
   };
 }
 
-function serializeRequestForLogs(
+export function serializeRequestForLogs(
   request: Record<string, unknown>,
 ): Record<string, unknown> {
   return {
@@ -64,7 +76,6 @@ function serializeRequestForLogs(
         ? redactTokenFromUrl(request.url)
         : request.url,
     query: redactQueryToken(request.query),
-    params: request.params,
     headers: request.headers,
     remoteAddress: request.remoteAddress,
     remotePort: request.remotePort,
@@ -86,13 +97,26 @@ function serializeRequestForLogs(
           paths: [
             "req.headers.authorization",
             "req.headers.cookie",
+            "req.headers.proxy-authorization",
+            "req.headers.x-api-key",
             "res.headers.set-cookie",
             "req.query.token",
+            "req.query.grant",
           ],
           censor: "[Redacted]",
         },
         serializers: {
           req: serializeRequestForLogs,
+        },
+        genReqId(request: IncomingMessage, response: ServerResponse): string {
+          const candidate = request.headers["x-request-id"];
+          const requestId =
+            typeof candidate === "string" &&
+            /^[a-zA-Z0-9._:-]{1,64}$/.test(candidate)
+              ? candidate
+              : randomUUID();
+          response.setHeader("X-Request-Id", requestId);
+          return requestId;
         },
       },
     }),
@@ -106,6 +130,7 @@ function serializeRequestForLogs(
     SecurityModule,
     HealthModule,
     AdminAuthModule,
+    AdminAccountsModule,
     VideosModule,
     PublicModule,
     AdminWebsitesModule,

@@ -48,6 +48,33 @@ export function buildPublicShareUrl(params: {
   )}#/videos`;
 }
 
+/**
+ * Canonical display URL for DMCA/provenance records. Uses the hash-router
+ * form (`/#/s/<alias>/videos`) because the public sites are static SPAs where
+ * the path form needs a server rewrite; this is also the exact shape the
+ * Admin normalizer produces, so the recorded URL is byte-for-byte stable
+ * regardless of which client rebuilds it. Host and protocol must come from
+ * the canonical snapshot, never from the currently-preferred domain.
+ */
+export function buildCanonicalPublicShareUrl(params: {
+  host: string;
+  alias: string;
+  protocol: string;
+}): string {
+  const host = normalizeWebsiteDomain(params.host.trim());
+  if (host === null) {
+    throw new BadRequestException("Canonical share host is invalid.");
+  }
+
+  const alias = params.alias.trim();
+  if (!alias) {
+    throw new BadRequestException("Canonical share alias is required.");
+  }
+
+  const protocol = resolvePublicSiteProtocol(host, params.protocol);
+  return `${protocol}://${host}/#/s/${encodeURIComponent(alias)}/videos`;
+}
+
 export function resolvePublicSiteProtocol(
   domain: string,
   configuredProtocol?: string,

@@ -58,6 +58,9 @@ Public static sites should only render public pages, read share tokens, call pub
 Immediate focus:
 
 - harden login/session/refresh/logout
+- enforce database-backed OWNER/ADMIN/STAFF authorization (`STAFF` read-only, purge OWNER-only)
+- require ACTIVE website assignment and signed media grants for max-view-limited playback
+- expose lightweight liveness at `/api/v1/health` and DB/storage readiness at `/api/v1/health/ready`
 - rate limit auth/public watch
 - protect admin-web behind Cloudflare Access
 - disable public docs

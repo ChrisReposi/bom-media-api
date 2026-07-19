@@ -14,6 +14,7 @@ import { PrismaService } from "../database/prisma.service";
 import { Prisma } from "../generated/prisma/client";
 import {
   AccessLogStatus,
+  AssignmentStatus,
   DomainStatus,
   ShareLinkStatus,
   VideoSourceType,
@@ -28,6 +29,7 @@ import {
   type LocalStorageRangeResult,
 } from "../videos/storage/local-video-storage.service";
 import { VideoViewGrowthService } from "../videos/video-view-growth.service";
+import { PublicMediaGrantService } from "./public-media-grant.service";
 import {
   hashIpAddress,
   truncateAccessLogValue,
@@ -62,6 +64,8 @@ type PublicDatabaseVideoBinaryParams = {
   host: string;
   token: string;
   videoId: string;
+  grant?: string | undefined;
+  headOnly?: boolean | undefined;
   rangeHeader?: string | undefined;
 };
 
@@ -71,6 +75,7 @@ type PublicLocalThumbnailParams = {
   host: string;
   token: string;
   videoId: string;
+  grant?: string | undefined;
 };
 
 type RecordPublicVideoViewParams = {
@@ -148,6 +153,7 @@ export class PublicService {
     private readonly configService: ConfigService,
     private readonly localVideoStorageService: LocalVideoStorageService,
     private readonly videoViewGrowthService: VideoViewGrowthService,
+    private readonly publicMediaGrantService: PublicMediaGrantService,
     @Optional() private readonly memoryCache?: MemoryCacheService,
   ) {}
 
@@ -155,7 +161,7 @@ export class PublicService {
     params: ResolvePublicWatchParams,
   ): Promise<PublicWatchResponse> {
     const normalizedHost = normalizePublicHost(params.host);
-    const trimmedToken = params.token?.trim();
+    const trimmedToken = this.normalizePublicToken(params.token);
 
     if (normalizedHost !== null && trimmedToken) {
       const cacheKey = this.buildPublicWatchCacheKey(
@@ -220,7 +226,7 @@ export class PublicService {
     }
 
     const website = domainRecord.website;
-    const trimmedToken = params.token?.trim();
+    const trimmedToken = this.normalizePublicToken(params.token);
 
     if (!trimmedToken) {
       await this.writeAccessLog({
@@ -231,12 +237,7 @@ export class PublicService {
         requestMeta: params.requestMeta,
       });
 
-      return {
-        valid: false,
-        reasonCode: "MISSING_TOKEN",
-        website: this.toPublicWebsiteResponse(website, normalizedHost),
-        videos: [],
-      };
+      return this.invalidResponse("MISSING_TOKEN");
     }
 
     const tokenPepper = this.configService
@@ -253,12 +254,7 @@ export class PublicService {
       });
       this.logger.error("SHARE_TOKEN_PEPPER is missing for public watch.");
 
-      return {
-        valid: false,
-        reasonCode: "SERVER_ERROR",
-        website: null,
-        videos: [],
-      };
+      return this.invalidResponse("SERVER_ERROR");
     }
 
     const tokenHash = hashShareToken({
@@ -268,6 +264,16 @@ export class PublicService {
 
     const publicWatchInclude = {
       shareLinkVideos: {
+        where: {
+          video: {
+            websiteVideos: {
+              some: {
+                websiteId: website.id,
+                status: AssignmentStatus.ACTIVE,
+              },
+            },
+          },
+        },
         orderBy: {
           sortOrder: "asc" as const,
         },
@@ -481,17 +487,19 @@ export class PublicService {
       };
     }
 
-    const data = await this.readDatabaseVideoBinaryChunk(
-      params.videoId,
-      range.start,
-      range.length,
-    );
+    const data = params.headOnly
+      ? null
+      : await this.readDatabaseVideoBinaryChunk(
+          params.videoId,
+          range.start,
+          range.length,
+        );
 
     return {
       statusCode: range.statusCode,
       mimeType: binaryAsset.mimeType,
       sizeBytes: totalSize,
-      contentLength: data.length,
+      contentLength: data?.length ?? range.length,
       contentRange:
         range.statusCode === 206
           ? `bytes ${range.start}-${range.end}/${totalSize}`
@@ -701,22 +709,34 @@ export class PublicService {
     return this.toPublicVideoResponses(
       shareLink.shareLinkVideos.map(({ video }) => video),
       playbackContext,
+      shareLink,
     );
   }
 
   private toPublicVideoResponses(
     videos: PublicWatchVideoWithBinary[],
     playbackContext: { host: string; token: string },
+    shareLink?: Pick<ShareLink, "id" | "maxViews" | "expiresAt">,
   ): PublicWatchVideoResponse[] {
     return videos
       .filter((video) => this.isPublicPlayableVideo(video))
       .map((video) => {
+        const grant =
+          shareLink === undefined || shareLink.maxViews === null
+            ? undefined
+            : this.publicMediaGrantService.issue({
+                shareLinkId: shareLink.id,
+                videoId: video.id,
+                host: playbackContext.host,
+                shareLinkExpiresAt: shareLink.expiresAt,
+              });
         const binaryPlaybackUrl =
           video.sourceType === VideoSourceType.DB_BLOB
             ? this.buildPublicBinaryPlaybackUrl({
                 token: playbackContext.token,
                 videoId: video.id,
                 host: playbackContext.host,
+                grant,
               })
             : null;
         const localPlaybackUrl =
@@ -725,6 +745,7 @@ export class PublicService {
                 token: playbackContext.token,
                 videoId: video.id,
                 host: playbackContext.host,
+                grant,
               })
             : null;
         const localThumbnailUrl =
@@ -734,6 +755,7 @@ export class PublicService {
                 token: playbackContext.token,
                 videoId: video.id,
                 host: playbackContext.host,
+                grant,
               })
             : null;
         const thumbnailUrl =
@@ -829,9 +851,14 @@ export class PublicService {
     params: PublicDatabaseVideoBinaryParams,
   ): Promise<PublicBinaryAssetMetadata> {
     const normalizedHost = normalizePublicHost(params.host);
-    const trimmedToken = params.token.trim();
+    const trimmedToken = this.normalizePublicToken(params.token);
 
-    if (normalizedHost === null || trimmedToken === "") {
+    if (
+      normalizedHost === null ||
+      trimmedToken === null ||
+      !this.isValidPublicVideoId(params.videoId) ||
+      !this.isValidMediaGrantInput(params.grant)
+    ) {
       throw new NotFoundException("Video not found.");
     }
 
@@ -867,6 +894,14 @@ export class PublicService {
       shareLinkVideos: {
         where: {
           videoId: params.videoId,
+          video: {
+            websiteVideos: {
+              some: {
+                websiteId: domainRecord.website.id,
+                status: AssignmentStatus.ACTIVE,
+              },
+            },
+          },
         },
         take: 1,
         include: {
@@ -902,7 +937,8 @@ export class PublicService {
 
     if (
       shareLink === null ||
-      this.getDeniedReasonForBinaryPlayback(shareLink, new Date()) !== null
+      this.getDeniedReasonForMediaPlayback(shareLink, new Date()) !== null ||
+      !this.hasValidMediaGrant(shareLink, params, normalizedHost)
     ) {
       throw new NotFoundException("Video not found.");
     }
@@ -922,7 +958,7 @@ export class PublicService {
     return binaryAsset;
   }
 
-  private getDeniedReasonForBinaryPlayback(
+  private getDeniedReasonForMediaPlayback(
     shareLink: ShareLink,
     now: Date,
   ): PublicWatchReasonCode | null {
@@ -932,13 +968,6 @@ export class PublicService {
 
     if (shareLink.expiresAt !== null && shareLink.expiresAt <= now) {
       return "EXPIRED_LINK";
-    }
-
-    if (
-      shareLink.maxViews !== null &&
-      shareLink.currentViews > shareLink.maxViews
-    ) {
-      return "VIEW_LIMIT_REACHED";
     }
 
     return null;
@@ -980,11 +1009,17 @@ export class PublicService {
     host: string;
     token: string;
     videoId: string;
+    grant?: string | undefined;
   }): Promise<PublicWatchVideoWithBinary> {
     const normalizedHost = normalizePublicHost(params.host);
-    const trimmedToken = params.token.trim();
+    const trimmedToken = this.normalizePublicToken(params.token);
 
-    if (normalizedHost === null || trimmedToken === "") {
+    if (
+      normalizedHost === null ||
+      trimmedToken === null ||
+      !this.isValidPublicVideoId(params.videoId) ||
+      !this.isValidMediaGrantInput(params.grant)
+    ) {
       throw new NotFoundException("Video not found.");
     }
 
@@ -1004,6 +1039,9 @@ export class PublicService {
       trimmedToken,
       videoId: params.videoId,
     });
+    if (!this.hasValidMediaGrant(shareLink, params, normalizedHost)) {
+      throw new NotFoundException("Video not found.");
+    }
     const ttlSeconds =
       this.memoryCache?.getRuntimeConfig().mediaMetadataTtlSeconds ?? null;
     if (
@@ -1056,6 +1094,14 @@ export class PublicService {
       shareLinkVideos: {
         where: {
           videoId: params.videoId,
+          video: {
+            websiteVideos: {
+              some: {
+                websiteId: domainRecord.website.id,
+                status: AssignmentStatus.ACTIVE,
+              },
+            },
+          },
         },
         take: 1,
         include: {
@@ -1099,7 +1145,7 @@ export class PublicService {
 
     if (
       shareLink === null ||
-      this.getDeniedReasonForBinaryPlayback(shareLink, new Date()) !== null
+      this.getDeniedReasonForMediaPlayback(shareLink, new Date()) !== null
     ) {
       throw new NotFoundException("Video not found.");
     }
@@ -1128,9 +1174,13 @@ export class PublicService {
     video: PublicWatchVideoWithBinary;
   } | null> {
     const normalizedHost = normalizePublicHost(params.host);
-    const trimmedToken = params.token.trim();
+    const trimmedToken = this.normalizePublicToken(params.token);
 
-    if (normalizedHost === null || trimmedToken === "") {
+    if (
+      normalizedHost === null ||
+      trimmedToken === null ||
+      !this.isValidPublicVideoId(params.videoId)
+    ) {
       return null;
     }
 
@@ -1168,6 +1218,14 @@ export class PublicService {
       shareLinkVideos: {
         where: {
           videoId: params.videoId,
+          video: {
+            websiteVideos: {
+              some: {
+                websiteId: domainRecord.website.id,
+                status: AssignmentStatus.ACTIVE,
+              },
+            },
+          },
         },
         take: 1,
         include: {
@@ -1215,7 +1273,10 @@ export class PublicService {
         include: publicViewInclude,
       }));
 
-    if (shareLink === null || this.getDeniedReason(shareLink, new Date())) {
+    if (
+      shareLink === null ||
+      this.getDeniedReasonForMediaPlayback(shareLink, new Date())
+    ) {
       return null;
     }
 
@@ -1374,10 +1435,11 @@ export class PublicService {
     token: string;
     videoId: string;
     host: string;
+    grant?: string | undefined;
   }): string {
     const rawPrefix = this.configService.get<string>("API_PREFIX") ?? "api/v1";
     const prefix = rawPrefix.replace(/^\/+|\/+$/g, "") || "api/v1";
-    const query = new URLSearchParams({ host: params.host });
+    const query = this.buildPublicMediaQuery(params.host, params.grant);
 
     return `/${prefix}/public/watch/${encodeURIComponent(
       params.token,
@@ -1388,10 +1450,11 @@ export class PublicService {
     token: string;
     videoId: string;
     host: string;
+    grant?: string | undefined;
   }): string {
     const rawPrefix = this.configService.get<string>("API_PREFIX") ?? "api/v1";
     const prefix = rawPrefix.replace(/^\/+|\/+$/g, "") || "api/v1";
-    const query = new URLSearchParams({ host: params.host });
+    const query = this.buildPublicMediaQuery(params.host, params.grant);
 
     return `/${prefix}/public/watch/${encodeURIComponent(
       params.token,
@@ -1402,10 +1465,11 @@ export class PublicService {
     token: string;
     videoId: string;
     host: string;
+    grant?: string | undefined;
   }): string {
     const rawPrefix = this.configService.get<string>("API_PREFIX") ?? "api/v1";
     const prefix = rawPrefix.replace(/^\/+|\/+$/g, "") || "api/v1";
-    const query = new URLSearchParams({ host: params.host });
+    const query = this.buildPublicMediaQuery(params.host, params.grant);
 
     return `/${prefix}/public/watch/${encodeURIComponent(
       params.token,
@@ -1425,16 +1489,62 @@ export class PublicService {
   }
 
   private invalidResponse(
-    reasonCode: PublicWatchReasonCode,
-    website?: Pick<Website, "id" | "name" | "slug">,
-    domain: string | null = null,
+    _reasonCode: PublicWatchReasonCode,
+    _website?: Pick<Website, "id" | "name" | "slug">,
+    _domain: string | null = null,
   ): PublicWatchResponse {
     return {
       valid: false,
-      reasonCode,
-      website: website ? this.toPublicWebsiteResponse(website, domain) : null,
+      reasonCode: "INVALID_LINK",
+      website: null,
       videos: [],
     };
+  }
+
+  private hasValidMediaGrant(
+    shareLink: ShareLink,
+    params: { videoId: string; grant?: string | undefined },
+    normalizedHost: string,
+  ): boolean {
+    if (shareLink.maxViews === null) {
+      return true;
+    }
+
+    return this.publicMediaGrantService.verify(params.grant, {
+      shareLinkId: shareLink.id,
+      videoId: params.videoId,
+      host: normalizedHost,
+    });
+  }
+
+  private buildPublicMediaQuery(
+    host: string,
+    grant: string | undefined,
+  ): URLSearchParams {
+    return new URLSearchParams({
+      host,
+      ...(grant === undefined ? {} : { grant }),
+    });
+  }
+
+  private normalizePublicToken(value: unknown): string | null {
+    if (typeof value !== "string" || value.length > 256) {
+      return null;
+    }
+
+    const normalized = value.trim();
+    return normalized.length === 0 ? null : normalized;
+  }
+
+  private isValidPublicVideoId(value: unknown): value is string {
+    return typeof value === "string" && value.length > 0 && value.length <= 191;
+  }
+
+  private isValidMediaGrantInput(value: unknown): value is string | undefined {
+    return (
+      value === undefined ||
+      (typeof value === "string" && value.length > 0 && value.length <= 2048)
+    );
   }
 
   private invalidVideoViewResponse(): PublicVideoViewResponse {

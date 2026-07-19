@@ -34,6 +34,9 @@ export class SafeAdminResponse {
     nullable: true,
   })
   lastLoginAt!: Date | null;
+
+  @ApiProperty()
+  mustChangePassword!: boolean;
 }
 
 export class RegisterAdminResponse {
@@ -123,4 +126,34 @@ export class MeAdminResponse {
     type: SafeAdminResponse,
   })
   admin!: SafeAdminResponse;
+}
+
+export class AdminOwnSessionResponse {
+  @ApiProperty()
+  id!: string;
+
+  @ApiProperty()
+  isCurrent!: boolean;
+
+  @ApiProperty()
+  createdAt!: Date;
+
+  @ApiProperty({ nullable: true })
+  lastUsedAt!: Date | null;
+
+  @ApiProperty()
+  expiresAt!: Date;
+}
+
+export class AdminOwnSessionListResponse {
+  @ApiProperty({ type: [AdminOwnSessionResponse] })
+  items!: AdminOwnSessionResponse[];
+}
+
+export class RevokeOwnAdminSessionResponse {
+  @ApiProperty()
+  message!: string;
+
+  @ApiProperty()
+  currentSessionRevoked!: boolean;
 }

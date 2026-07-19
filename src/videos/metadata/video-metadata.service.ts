@@ -75,6 +75,9 @@ export class VideoMetadataService {
 
     try {
       const url = this.parseSafeRemoteUrl(urlValue);
+      if (!this.isRemoteHostAllowed(url.hostname)) {
+        return EMPTY_METADATA;
+      }
       await this.ensurePublicHost(url.hostname);
 
       const timeoutMs = this.getProbeTimeoutMs();
@@ -254,7 +257,7 @@ export class VideoMetadataService {
     return Buffer.from(arrayBuffer);
   }
 
-  private fetchWithTimeout(
+  private async fetchWithTimeout(
     url: URL,
     options: {
       method: "HEAD" | "GET";
@@ -262,6 +265,10 @@ export class VideoMetadataService {
       timeoutMs: number;
     },
   ): Promise<Response> {
+    if (!this.isRemoteHostAllowed(url.hostname)) {
+      throw new Error("Video metadata probe host is not allowed.");
+    }
+    await this.ensurePublicHost(url.hostname);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
     const requestInit: RequestInit = {
@@ -272,6 +279,25 @@ export class VideoMetadataService {
     };
 
     return fetch(url, requestInit).finally(() => clearTimeout(timeout));
+  }
+
+  private isRemoteHostAllowed(hostname: string): boolean {
+    const allowedHosts = (
+      this.configService.get<string>("MANUAL_VIDEO_URL_ALLOWLIST") ?? ""
+    )
+      .split(",")
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean);
+    const isProduction = [
+      this.configService.get<string>("NODE_ENV"),
+      this.configService.get<string>("APP_ENV"),
+    ].includes("production");
+
+    if (allowedHosts.length === 0) {
+      return !isProduction;
+    }
+
+    return allowedHosts.includes(hostname.trim().toLowerCase());
   }
 
   private parseContentLength(response: Response): number | null {

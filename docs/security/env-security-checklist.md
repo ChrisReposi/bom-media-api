@@ -25,6 +25,7 @@ Production `/docs` must not be exposed. Even if `API_INTERNAL_DOCS_ENABLED=true`
 - `JWT_ACCESS_SECRET`
 - `REFRESH_TOKEN_PEPPER`
 - `SHARE_TOKEN_PEPPER`
+- `PUBLIC_MEDIA_GRANT_SECRET`
 - `ACCESS_LOG_IP_PEPPER`
 - `ADMIN_REGISTER_SECRET`
 - `ADMIN_CHANGE_PASSWORD_SECRET`
@@ -35,6 +36,7 @@ Use placeholders in examples:
 JWT_ACCESS_SECRET=<rotate-before-production>
 REFRESH_TOKEN_PEPPER=<rotate-before-production>
 SHARE_TOKEN_PEPPER=<rotate-before-production>
+PUBLIC_MEDIA_GRANT_SECRET=<independent-secret-at-least-32-characters>
 ACCESS_LOG_IP_PEPPER=<rotate-before-production>
 ADMIN_REGISTER_SECRET=<rotate-before-production>
 ADMIN_CHANGE_PASSWORD_SECRET=<rotate-before-production>
@@ -91,9 +93,10 @@ If behind Cloudflare/Hostinger reverse proxy:
 TRUST_PROXY_ENABLED=true
 TRUST_PROXY_HOPS=1
 TRUST_PROXY_CLOUDFLARE_ONLY=false
+TRUSTED_PROXY_CIDRS=<actual-cloudflare-or-hostinger-proxy-cidrs>
 ```
 
-Only trust forwarded IP headers when the deployment ensures requests reach API through trusted proxy.
+Production startup rejects trusted proxy mode without `TRUSTED_PROXY_CIDRS`. Only trust forwarded IP headers when the deployment ensures requests reach API through a listed proxy.
 
 Do not enable `TRUST_PROXY_CLOUDFLARE_ONLY=true` until raw origin access is blocked or controlled.
 
@@ -116,6 +119,8 @@ VIDEO_DB_UPLOAD_MAX_MB=100
 DB_BLOB is a small fallback only. It is not the production large-video storage path.
 
 Public watch errors must remain generic and token endpoints should use no-store cache headers.
+
+Max-view-limited links receive short-lived signed media grants. Public sites must use the media URLs returned by public watch and must not construct media URLs themselves. Rotating `PUBLIC_MEDIA_GRANT_SECRET` invalidates outstanding grants but does not invalidate stored share links; rotating `SHARE_TOKEN_PEPPER` can invalidate existing links.
 
 ## Hostinger NVMe File Storage
 

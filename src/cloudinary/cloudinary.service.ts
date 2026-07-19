@@ -6,7 +6,9 @@ import {
 import { ConfigService } from "@nestjs/config";
 import { v2 as cloudinary } from "cloudinary";
 import type { UploadApiResponse } from "cloudinary";
+import { createReadStream } from "node:fs";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import type {
   CloudinaryImageUploadInput,
   CloudinaryImageUploadResult,
@@ -14,7 +16,8 @@ import type {
 } from "./types/cloudinary-upload-result.type";
 
 type UploadVideoInput = {
-  fileBuffer: Buffer;
+  fileBuffer?: Buffer;
+  filePath?: string;
   originalFilename: string;
   title: string;
   description?: string | undefined;
@@ -70,7 +73,7 @@ export class CloudinaryService {
     });
 
     try {
-      const response = await this.uploadBuffer(input, config.folder);
+      const response = await this.uploadVideoStream(input, config.folder);
       return this.toUploadResult(response);
     } catch (error) {
       this.logger.error(
@@ -183,7 +186,7 @@ export class CloudinaryService {
     }
   }
 
-  private uploadBuffer(
+  private uploadVideoStream(
     input: UploadVideoInput,
     folder: string,
   ): Promise<UploadApiResponse> {
@@ -214,7 +217,17 @@ export class CloudinaryService {
         },
       );
 
-      Readable.from(input.fileBuffer).pipe(uploadStream);
+      const source = input.filePath
+        ? createReadStream(input.filePath)
+        : input.fileBuffer
+          ? Readable.from(input.fileBuffer)
+          : null;
+      if (source === null) {
+        reject(new Error("Cloudinary upload input is unavailable."));
+        return;
+      }
+
+      void pipeline(source, uploadStream).catch(reject);
     });
   }
 

@@ -1,8 +1,21 @@
 import { ApiPropertyOptional } from "@nestjs/swagger";
 import { Transform } from "class-transformer";
-import { IsEnum, IsInt, IsOptional, IsString, Max, Min } from "class-validator";
+import {
+  IsEnum,
+  IsInt,
+  IsOptional,
+  IsString,
+  Matches,
+  Max,
+  MaxLength,
+  Min,
+} from "class-validator";
 import { DomainStatus } from "../../generated/prisma/client";
 import { AdminDomainUsageStatus } from "../types/admin-website-response.type";
+import {
+  ADMIN_WEBSITE_SEARCH_MAX_LENGTH,
+  normalizeAdminWebsiteSearch,
+} from "../utils/admin-website-search.util";
 
 export class ListDomainsQueryDto {
   @ApiPropertyOptional({ default: 1, minimum: 1 })
@@ -22,7 +35,9 @@ export class ListDomainsQueryDto {
 
   @ApiPropertyOptional()
   @IsOptional()
+  @Transform(({ value }) => normalizeAdminWebsiteSearch(value))
   @IsString()
+  @MaxLength(ADMIN_WEBSITE_SEARCH_MAX_LENGTH)
   search?: string;
 
   @ApiPropertyOptional({ enum: DomainStatus })
@@ -38,10 +53,13 @@ export class ListDomainsQueryDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(80)
+  @Matches(/^[a-z0-9-]+$/)
   domainGroupKey?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(191)
   websiteId?: string;
 }

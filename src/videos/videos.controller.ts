@@ -39,10 +39,19 @@ import {
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import type { Request, Response } from "express";
+import type { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { diskStorage, memoryStorage, MulterError } from "multer";
 import { CurrentAdmin } from "../admin-auth/decorators/current-admin.decorator";
+import {
+  AdminReadRoles,
+  AdminRoles,
+  AdminWriteRoles,
+} from "../admin-auth/decorators/admin-roles.decorator";
 import { AdminAccessTokenGuard } from "../admin-auth/guards/admin-access-token.guard";
+import { AdminRolesGuard } from "../admin-auth/guards/admin-roles.guard";
 import type { SafeAdminResponse } from "../admin-auth/types/admin-auth-response.type";
+import { AdminRole } from "../generated/prisma/client";
 import {
   THROTTLE_PROFILES,
   ThrottleProfile,
@@ -107,6 +116,21 @@ function createDatabaseUploadFilename(
     : "";
 
   callback(null, `video-db-${Date.now()}-${randomUUID()}${extension}`);
+}
+
+function createCloudinaryTempUploadFilename(
+  _request: Express.Request,
+  file: Express.Multer.File,
+  callback: (error: Error | null, filename: string) => void,
+): void {
+  const rawExtension = file.originalname.includes(".")
+    ? file.originalname.slice(file.originalname.lastIndexOf("."))
+    : "";
+  const extension = /^\.[a-z0-9]{1,12}$/i.test(rawExtension)
+    ? rawExtension.toLowerCase()
+    : "";
+
+  callback(null, `video-cloud-${Date.now()}-${randomUUID()}${extension}`);
 }
 
 function createLocalTempUploadFilename(
@@ -219,10 +243,11 @@ function setNoStoreMediaHeaders(response: Response, mimeType: string): void {
   response.setHeader("Content-Type", mimeType);
 }
 
-function streamLocalVideoFile(
+async function streamLocalVideoFile(
   result: LocalVideoFileStream,
   response: Response,
-): void {
+  headOnly: boolean,
+): Promise<void> {
   setNoStoreMediaHeaders(response, result.mimeType);
 
   if (result.statusCode === HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE) {
@@ -239,13 +264,14 @@ function streamLocalVideoFile(
     response.setHeader("Content-Range", result.contentRange);
   }
 
-  result.stream?.pipe(response);
+  await pipeLocalStream(result.stream, response, headOnly);
 }
 
-function streamLocalThumbnail(
+async function streamLocalThumbnail(
   result: LocalThumbnailStream,
   response: Response,
-): void {
+  headOnly: boolean,
+): Promise<void> {
   response.setHeader(
     "Cache-Control",
     "private, no-store, no-cache, must-revalidate",
@@ -256,7 +282,39 @@ function streamLocalThumbnail(
   response.setHeader("Content-Type", result.mimeType);
   response.setHeader("Content-Length", String(result.contentLength));
   response.status(HttpStatus.OK);
-  result.stream.pipe(response);
+  await pipeLocalStream(result.stream, response, headOnly);
+}
+
+async function pipeLocalStream(
+  stream: NodeJS.ReadableStream | null,
+  response: Response,
+  headOnly: boolean,
+): Promise<void> {
+  if (stream === null) {
+    response.end();
+    return;
+  }
+  const readable = stream as Readable;
+  if (headOnly) {
+    readable.destroy();
+    response.end();
+    return;
+  }
+
+  try {
+    await pipeline(readable, response);
+  } catch (error) {
+    if (
+      response.destroyed ||
+      (typeof error === "object" &&
+        error !== null &&
+        (error as { code?: unknown }).code === "ERR_STREAM_PREMATURE_CLOSE")
+    ) {
+      readable.destroy();
+      return;
+    }
+    throw error;
+  }
 }
 
 function getFirstUploadedFile(
@@ -319,13 +377,14 @@ class LocalUploadMulterExceptionFilter implements ExceptionFilter {
 
 @ApiTags("admin-videos")
 @ApiBearerAuth()
-@UseGuards(AdminAccessTokenGuard)
+@UseGuards(AdminAccessTokenGuard, AdminRolesGuard)
 @ThrottleProfile(THROTTLE_PROFILES.admin)
 @Controller("admin/videos")
 export class VideosController {
   constructor(private readonly videosService: VideosService) {}
 
   @Get()
+  @AdminReadRoles()
   @ApiOperation({
     summary: "List admin videos",
     description:
@@ -340,6 +399,7 @@ export class VideosController {
   }
 
   @Post("upload-local/init")
+  @AdminWriteRoles()
   @ApiOperation({
     summary: "Initialize chunked local-file video upload",
     description:
@@ -361,6 +421,7 @@ export class VideosController {
   }
 
   @Post("upload-local/:uploadId/chunks")
+  @AdminWriteRoles()
   @UseFilters(LocalUploadMulterExceptionFilter)
   @UseInterceptors(
     FileInterceptor("chunk", {
@@ -400,6 +461,7 @@ export class VideosController {
   }
 
   @Get("upload-local/:uploadId")
+  @AdminReadRoles()
   @ApiOperation({ summary: "Get local-file upload session progress" })
   @ApiOkResponse({ type: VideoUploadSessionResponse })
   @ApiUnauthorizedResponse({
@@ -414,6 +476,7 @@ export class VideosController {
   }
 
   @Post("upload-local/:uploadId/complete")
+  @AdminWriteRoles()
   @UseFilters(ThumbnailUploadMulterExceptionFilter)
   @UseInterceptors(
     FileInterceptor("thumbnailFile", {
@@ -454,6 +517,7 @@ export class VideosController {
   }
 
   @Post("upload-local/:uploadId/cancel")
+  @AdminWriteRoles()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: "Cancel chunked local-file video upload" })
   @ApiOkResponse({ type: CancelLocalVideoUploadResponse })
@@ -468,6 +532,7 @@ export class VideosController {
   }
 
   @Get(":id")
+  @AdminReadRoles()
   @ApiOperation({ summary: "Get admin video detail" })
   @ApiOkResponse({ type: VideoResponse })
   @ApiUnauthorizedResponse({
@@ -479,6 +544,7 @@ export class VideosController {
   }
 
   @Get(":id/binary")
+  @AdminReadRoles()
   @ApiOperation({
     summary: "Stream admin database-stored video binary",
     description:
@@ -504,6 +570,7 @@ export class VideosController {
   }
 
   @Get(":id/local-file")
+  @AdminReadRoles()
   @ApiOperation({
     summary: "Stream admin local-file video",
     description:
@@ -528,10 +595,11 @@ export class VideosController {
       request.headers.range,
     );
 
-    streamLocalVideoFile(result, response);
+    await streamLocalVideoFile(result, response, request.method === "HEAD");
   }
 
   @Get(":id/thumbnail")
+  @AdminReadRoles()
   @ApiOperation({
     summary: "Stream admin local video thumbnail",
     description:
@@ -548,14 +616,16 @@ export class VideosController {
   })
   async streamLocalThumbnail(
     @Param("id") id: string,
+    @Req() request: Request,
     @Res() response: Response,
   ): Promise<void> {
     const result = await this.videosService.getLocalThumbnailStream(id);
 
-    streamLocalThumbnail(result, response);
+    await streamLocalThumbnail(result, response, request.method === "HEAD");
   }
 
   @Post()
+  @AdminWriteRoles()
   @ApiOperation({
     summary: "Create video metadata",
     description:
@@ -574,6 +644,7 @@ export class VideosController {
   }
 
   @Post("manual-with-thumbnail")
+  @AdminWriteRoles()
   @UseFilters(ThumbnailUploadMulterExceptionFilter)
   @UseInterceptors(
     FileInterceptor("thumbnailFile", {
@@ -605,6 +676,7 @@ export class VideosController {
   }
 
   @Post("embed")
+  @AdminWriteRoles()
   @ApiOperation({
     summary: "Create video from embed code or embed URL",
     description:
@@ -640,6 +712,7 @@ export class VideosController {
   }
 
   @Post("embed-with-thumbnail")
+  @AdminWriteRoles()
   @UseFilters(ThumbnailUploadMulterExceptionFilter)
   @UseInterceptors(
     FileInterceptor("thumbnailFile", {
@@ -671,6 +744,7 @@ export class VideosController {
   }
 
   @Post("upload")
+  @AdminWriteRoles()
   @UseInterceptors(
     FileFieldsInterceptor(
       [
@@ -678,7 +752,10 @@ export class VideosController {
         { name: "thumbnailFile", maxCount: 1 },
       ],
       {
-        storage: memoryStorage(),
+        storage: diskStorage({
+          destination: tmpdir(),
+          filename: createCloudinaryTempUploadFilename,
+        }),
         limits: { fileSize: DEFAULT_UPLOAD_LIMIT_BYTES },
       },
     ),
@@ -711,6 +788,7 @@ export class VideosController {
   }
 
   @Post("upload-db")
+  @AdminWriteRoles()
   @UseFilters(DatabaseUploadMulterExceptionFilter)
   @UseInterceptors(
     FileFieldsInterceptor(
@@ -759,6 +837,7 @@ export class VideosController {
   }
 
   @Patch(":id/binary")
+  @AdminWriteRoles()
   @UseFilters(DatabaseUploadMulterExceptionFilter)
   @UseInterceptors(
     FileFieldsInterceptor(
@@ -807,6 +886,7 @@ export class VideosController {
   }
 
   @Patch(":id/thumbnail-local")
+  @AdminWriteRoles()
   @UseFilters(ThumbnailUploadMulterExceptionFilter)
   @UseInterceptors(
     FileInterceptor("thumbnailFile", {
@@ -846,6 +926,7 @@ export class VideosController {
   }
 
   @Patch(":id")
+  @AdminWriteRoles()
   @ApiOperation({ summary: "Update video metadata" })
   @ApiOkResponse({ type: VideoResponse })
   @ApiBadRequestResponse({ description: "Request body failed validation." })
@@ -862,6 +943,7 @@ export class VideosController {
   }
 
   @Delete(":id")
+  @AdminWriteRoles()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: "Disable video",
@@ -881,6 +963,7 @@ export class VideosController {
   }
 
   @Post(":id/purge")
+  @AdminRoles(AdminRole.OWNER)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: "Permanently delete video",

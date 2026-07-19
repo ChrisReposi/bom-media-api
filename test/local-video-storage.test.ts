@@ -1,7 +1,7 @@
 import "reflect-metadata";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -51,7 +51,9 @@ describe("LocalVideoStorageService", () => {
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "local-video-root-"));
     scratch = await mkdtemp(join(tmpdir(), "local-video-scratch-"));
-    service = new LocalVideoStorageService(new FakeConfigService(root) as never);
+    service = new LocalVideoStorageService(
+      new FakeConfigService(root) as never,
+    );
     await service.ensureRootReady();
   });
 
@@ -71,7 +73,58 @@ describe("LocalVideoStorageService", () => {
     );
   });
 
-  it("merges chunks by streaming and deletes chunk files after append", async () => {
+  it("rejects symlink components and file targets under the storage root", async () => {
+    await mkdir(join(root, "videos"), { recursive: true });
+    const outsideFile = join(scratch, "outside.mp4");
+    await writeFile(outsideFile, Buffer.from("outside"));
+    await symlink(scratch, join(root, "videos", "escaped-directory"));
+    await symlink(outsideFile, join(root, "videos", "escaped-file.mp4"));
+
+    assert.throws(
+      () =>
+        service.createFullReadStream("videos/escaped-directory/outside.mp4"),
+      BadRequestException,
+    );
+    assert.throws(
+      () => service.createFullReadStream("videos/escaped-file.mp4"),
+      BadRequestException,
+    );
+  });
+
+  it("uses distinct exclusive candidates for duplicate chunk indices", async () => {
+    const firstPath = join(scratch, "first");
+    const secondPath = join(scratch, "second");
+    await writeFile(firstPath, Buffer.from("first"));
+    await writeFile(secondPath, Buffer.from("second"));
+    const tempStorageKey = service.buildUploadTempKey("upload-duplicate");
+
+    const first = await service.saveUploadedChunk({
+      temporaryPath: firstPath,
+      tempStorageKey,
+      chunkIndex: 0,
+    });
+    const second = await service.saveUploadedChunk({
+      temporaryPath: secondPath,
+      tempStorageKey,
+      chunkIndex: 0,
+    });
+
+    assert.notEqual(first.storageKey, second.storageKey);
+    assert.equal(
+      (
+        await readStream(service.createFullReadStream(first.storageKey).stream)
+      ).toString(),
+      "first",
+    );
+    assert.equal(
+      (
+        await readStream(service.createFullReadStream(second.storageKey).stream)
+      ).toString(),
+      "second",
+    );
+  });
+
+  it("merges chunks atomically while retaining source chunks for recovery", async () => {
     const firstChunkPath = join(scratch, "chunk-0");
     const secondChunkPath = join(scratch, "chunk-1");
     await writeFile(firstChunkPath, Buffer.from("first-"));
@@ -90,8 +143,7 @@ describe("LocalVideoStorageService", () => {
     });
 
     const final = await service.mergeChunksToFinalFile({
-      tempStorageKey,
-      totalChunks: 2,
+      chunkStorageKeys: [first.storageKey, second.storageKey],
       finalStorageKey: service.buildFinalVideoKey("video-1", "demo.mp4"),
     });
 
@@ -101,11 +153,44 @@ describe("LocalVideoStorageService", () => {
       createHash("sha256").update("first-second").digest("hex"),
     );
 
-    await assert.rejects(stat(service.resolveStoragePath(first.storageKey)));
-    await assert.rejects(stat(service.resolveStoragePath(second.storageKey)));
+    await assert.doesNotReject(
+      stat(service.resolveStoragePath(first.storageKey)),
+    );
+    await assert.doesNotReject(
+      stat(service.resolveStoragePath(second.storageKey)),
+    );
 
     const full = service.createFullReadStream(final.storageKey);
-    assert.equal((await readStream(full.stream)).toString("utf8"), "first-second");
+    assert.equal(
+      (await readStream(full.stream)).toString("utf8"),
+      "first-second",
+    );
+  });
+
+  it("keeps source chunks and removes staging output after merge failure", async () => {
+    const sourcePath = join(scratch, "chunk");
+    await writeFile(sourcePath, Buffer.from("recoverable"));
+    const tempStorageKey = service.buildUploadTempKey("upload-failure");
+    const chunk = await service.saveUploadedChunk({
+      temporaryPath: sourcePath,
+      tempStorageKey,
+      chunkIndex: 0,
+    });
+    const finalStorageKey = service.buildFinalVideoKey(
+      "video-failure",
+      "demo.mp4",
+    );
+
+    await assert.rejects(
+      service.mergeChunksToFinalFile({
+        chunkStorageKeys: [chunk.storageKey, `${tempStorageKey}/missing.part`],
+        finalStorageKey,
+      }),
+    );
+    await assert.doesNotReject(
+      stat(service.resolveStoragePath(chunk.storageKey)),
+    );
+    await assert.rejects(stat(service.resolveStoragePath(finalStorageKey)));
   });
 
   it("supports HTTP range reads", async () => {

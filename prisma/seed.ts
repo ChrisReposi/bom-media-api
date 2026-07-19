@@ -80,20 +80,24 @@ async function main(): Promise<void> {
   const password = requireEnv("ADMIN_BOOTSTRAP_PASSWORD");
   const passwordHash = await hash(password, PASSWORD_HASH_ROUNDS);
 
-  await prisma.adminUser.upsert({
-    where: { username },
-    update: {
-      passwordHash,
-      role: AdminRole.OWNER,
-      status: AccountStatus.ACTIVE,
+  await prisma.$transaction(
+    async (tx) => {
+      if ((await tx.adminUser.count()) !== 0) {
+        throw new Error(
+          "Bootstrap seed is initial-owner-only; an admin account already exists",
+        );
+      }
+      await tx.adminUser.create({
+        data: {
+          username,
+          passwordHash,
+          role: AdminRole.OWNER,
+          status: AccountStatus.ACTIVE,
+        },
+      });
     },
-    create: {
-      username,
-      passwordHash,
-      role: AdminRole.OWNER,
-      status: AccountStatus.ACTIVE,
-    },
-  });
+    { isolationLevel: "Serializable" },
+  );
 
   console.info(`Seeded bootstrap admin account for username: ${username}`);
 }

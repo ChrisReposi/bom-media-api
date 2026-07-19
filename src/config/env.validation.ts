@@ -5,6 +5,8 @@ import {
   DEFAULT_API_PREFIX,
 } from "../common/constants/api.constants";
 import { normalizePrefix } from "../common/utils/normalize-prefix";
+import { isAbsolute } from "node:path";
+import proxyaddr from "proxy-addr";
 
 const BOOLEAN_VALUES = new Set(["true", "false", "1", "0"]);
 const DEFAULT_VIDEO_DB_UPLOAD_MB = 50;
@@ -226,6 +228,26 @@ export function validateEnv(
     config,
     "SHARE_TOKEN_PEPPER",
   );
+  const mediaGrantSecret = isProduction
+    ? readRequiredString(config, "PUBLIC_MEDIA_GRANT_SECRET")
+    : readString(
+        config,
+        "PUBLIC_MEDIA_GRANT_SECRET",
+        "local-public-media-grant-secret-change-me",
+      );
+  if (mediaGrantSecret.length < 32) {
+    throw new Error("PUBLIC_MEDIA_GRANT_SECRET must be at least 32 characters");
+  }
+  validated.PUBLIC_MEDIA_GRANT_SECRET = mediaGrantSecret;
+  validated.PUBLIC_MEDIA_GRANT_TTL_SECONDS = String(
+    readBoundedInteger(
+      config,
+      "PUBLIC_MEDIA_GRANT_TTL_SECONDS",
+      6 * 60 * 60,
+      5 * 60,
+      24 * 60 * 60,
+    ),
+  );
   validated.ACCESS_LOG_IP_PEPPER = readRequiredString(
     config,
     "ACCESS_LOG_IP_PEPPER",
@@ -255,7 +277,15 @@ export function validateEnv(
   validated.ADMIN_REGISTER_ENABLED = readBoolean(
     config,
     "ADMIN_REGISTER_ENABLED",
-    true,
+    !isProduction,
+  );
+  validated.ADMIN_ACCOUNT_MANAGEMENT_ENABLED = readBoolean(
+    config,
+    "ADMIN_ACCOUNT_MANAGEMENT_ENABLED",
+    !isProduction,
+  );
+  validated.ADMIN_TEMP_PASSWORD_TTL_HOURS = String(
+    readBoundedInteger(config, "ADMIN_TEMP_PASSWORD_TTL_HOURS", 24, 1, 168),
   );
 
   if (typeof config.ADMIN_REGISTER_SECRET === "string") {
@@ -280,11 +310,28 @@ export function validateEnv(
     }
   }
 
-  validated.ADMIN_WEB_ORIGIN = readString(
+  const adminWebOrigin = readString(
     config,
     "ADMIN_WEB_ORIGIN",
     DEFAULT_ADMIN_WEB_ORIGIN,
   );
+  if (isProduction) {
+    let parsedAdminOrigin: URL;
+    try {
+      parsedAdminOrigin = new URL(adminWebOrigin);
+    } catch {
+      throw new Error("ADMIN_WEB_ORIGIN must be a valid HTTPS origin");
+    }
+    if (
+      parsedAdminOrigin.protocol !== "https:" ||
+      ["localhost", "127.0.0.1", "::1"].includes(parsedAdminOrigin.hostname)
+    ) {
+      throw new Error(
+        "ADMIN_WEB_ORIGIN must be a non-local HTTPS origin in production",
+      );
+    }
+  }
+  validated.ADMIN_WEB_ORIGIN = adminWebOrigin;
   validated.ALLOW_LOCALHOST_DOMAIN_CLAIM = readBoolean(
     config,
     "ALLOW_LOCALHOST_DOMAIN_CLAIM",
@@ -344,6 +391,37 @@ export function validateEnv(
     "TRUST_PROXY_CLOUDFLARE_ONLY",
     false,
   );
+  const trustedProxyCidrs = readOptionalTrimmedString(
+    config,
+    "TRUSTED_PROXY_CIDRS",
+  );
+  if (
+    isProduction &&
+    validated.TRUST_PROXY_ENABLED === "true" &&
+    trustedProxyCidrs === undefined
+  ) {
+    throw new Error(
+      "TRUSTED_PROXY_CIDRS is required when trusted proxy is enabled in production",
+    );
+  }
+  if (trustedProxyCidrs !== undefined) {
+    const cidrs = trustedProxyCidrs
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (cidrs.length === 0) {
+      throw new Error("TRUSTED_PROXY_CIDRS must contain at least one CIDR");
+    }
+    try {
+      proxyaddr.compile(cidrs);
+    } catch {
+      throw new Error(
+        "TRUSTED_PROXY_CIDRS contains an invalid address or CIDR",
+      );
+    }
+    validated.TRUSTED_PROXY_CIDRS = cidrs.join(",");
+    process.env.TRUSTED_PROXY_CIDRS = cidrs.join(",");
+  }
 
   validated.MEMORY_CACHE_ENABLED = readBoolean(
     config,
@@ -617,6 +695,13 @@ export function validateEnv(
     "VIDEO_METADATA_PROBE_ENABLED",
     true,
   );
+  const manualVideoUrlAllowlist = readOptionalTrimmedString(
+    config,
+    "MANUAL_VIDEO_URL_ALLOWLIST",
+  );
+  if (manualVideoUrlAllowlist !== undefined) {
+    validated.MANUAL_VIDEO_URL_ALLOWLIST = manualVideoUrlAllowlist;
+  }
 
   const metadataProbeTimeoutMs = Number(
     readString(config, "VIDEO_METADATA_PROBE_TIMEOUT_MS", "8000"),
@@ -668,6 +753,11 @@ export function validateEnv(
         "LOCAL_FILE_STORAGE_ROOT must be outside public web roots such as public_html, htdocs, www, public, or dist",
       );
     }
+    if (isProduction && !isAbsolute(localFileStorageRoot)) {
+      throw new Error(
+        "LOCAL_FILE_STORAGE_ROOT must be an absolute path in production",
+      );
+    }
 
     validated.LOCAL_FILE_STORAGE_ROOT = localFileStorageRoot;
   } else if (localFileStorageRoot !== undefined) {
@@ -708,6 +798,9 @@ export function validateEnv(
       "LOCAL_VIDEO_CHUNK_SIZE_MB must be less than or equal to LOCAL_VIDEO_UPLOAD_MAX_MB",
     );
   }
+  if (localVideoChunkSizeMb > 100) {
+    throw new Error("LOCAL_VIDEO_CHUNK_SIZE_MB must be 100 or smaller");
+  }
   validated.LOCAL_VIDEO_CHUNK_SIZE_MB = String(localVideoChunkSizeMb);
 
   validated.LOCAL_VIDEO_UPLOAD_SESSION_TTL_MINUTES = String(
@@ -742,6 +835,49 @@ export function validateEnv(
     );
   }
   validated.LOCAL_THUMBNAIL_UPLOAD_MAX_MB = String(localThumbnailUploadMaxMb);
+
+  // Optional release identity, injected at build/deploy time (never read from
+  // .git at runtime). Absent values are always allowed — including in
+  // production — so a deploy without them cannot fail readiness; present
+  // values are validated strictly so a malformed injection fails at boot.
+  if (typeof config.APP_RELEASE_VERSION === "string") {
+    const releaseVersion = config.APP_RELEASE_VERSION.trim();
+    if (releaseVersion.length > 64) {
+      throw new Error("APP_RELEASE_VERSION must be 64 characters or fewer");
+    }
+    if (releaseVersion.length > 0) {
+      process.env.APP_RELEASE_VERSION = releaseVersion;
+      validated.APP_RELEASE_VERSION = releaseVersion;
+    }
+  }
+  if (typeof config.APP_BUILD_SHA === "string") {
+    const buildSha = config.APP_BUILD_SHA.trim();
+    if (buildSha.length > 0 && !/^[0-9a-f]{7,40}$/i.test(buildSha)) {
+      throw new Error(
+        "APP_BUILD_SHA must be a 7-40 character hexadecimal commit SHA",
+      );
+    }
+    if (buildSha.length > 0) {
+      process.env.APP_BUILD_SHA = buildSha;
+      validated.APP_BUILD_SHA = buildSha;
+    }
+  }
+  if (typeof config.APP_BUILD_TIME === "string") {
+    const buildTime = config.APP_BUILD_TIME.trim();
+    if (buildTime.length > 0) {
+      const parsedBuildTime = new Date(buildTime);
+      if (
+        Number.isNaN(parsedBuildTime.getTime()) ||
+        parsedBuildTime.toISOString() !== buildTime
+      ) {
+        throw new Error(
+          "APP_BUILD_TIME must be an ISO 8601 UTC timestamp such as 2026-07-18T00:00:00.000Z",
+        );
+      }
+      process.env.APP_BUILD_TIME = buildTime;
+      validated.APP_BUILD_TIME = buildTime;
+    }
+  }
 
   return validated;
 }

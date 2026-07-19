@@ -57,6 +57,7 @@ import {
   normalizeVideoFilterKey,
 } from "./utils/video-filter-key.util";
 import {
+  escapeAdminVideoSearchLike,
   isShortAdminVideoSearch,
   normalizeAdminVideoSearch,
 } from "./utils/video-search.util";
@@ -67,6 +68,7 @@ import {
   type ParsedVideoEmbed,
 } from "./utils/video-embed.util";
 import { createVideoSlug } from "./utils/video-slug.util";
+import { computeSha256Hex } from "./utils/video-checksum.util";
 import { VideoMetadataService } from "./metadata/video-metadata.service";
 import {
   LocalVideoStorageService,
@@ -86,7 +88,8 @@ type VideoMutationAction =
   | "VIDEO_DB_BINARY_REPLACE"
   | "VIDEO_UPDATE"
   | "VIDEO_DISABLE"
-  | "VIDEO_PURGE";
+  | "VIDEO_PURGE_COMMIT"
+  | "VIDEO_PURGE_STORAGE";
 
 const DEFAULT_DB_UPLOAD_MAX_MB = 50;
 const MAX_DB_UPLOAD_MAX_MB = 100;
@@ -461,75 +464,80 @@ export class VideosService {
     thumbnailFile: Express.Multer.File | undefined,
     adminId: string,
   ): Promise<VideoResponse> {
-    this.validateUploadFile(file);
+    try {
+      this.validateUploadFile(file);
 
-    const tags = this.parseTags(dto.tags);
-    const uploadResult = await this.cloudinaryService.uploadVideo({
-      fileBuffer: file.buffer,
-      originalFilename: file.originalname,
-      title: dto.title.trim(),
-      tags,
-      ...(this.trimOptional(dto.description) !== undefined
-        ? { description: this.trimOptional(dto.description) }
-        : {}),
-    });
-
-    const cloudName = this.cloudinaryService.getCloudName();
-    const thumbnail = await this.resolveThumbnailUrl({
-      thumbnailUrl: dto.thumbnailUrl,
-      thumbnailFile,
-      tags: [...tags, "video-upload"],
-    });
-    const thumbnailUrl =
-      thumbnail.thumbnailUrl ??
-      this.safeBuildCloudinaryThumbnailUrl(cloudName, uploadResult.publicId);
-    const slug = await this.ensureUniqueSlug(dto.slug ?? dto.title);
-    const uploadMetadata = this.removeUndefinedValues({
-      asset_id: uploadResult.assetId,
-      public_id: uploadResult.publicId,
-      version: uploadResult.version,
-      format: uploadResult.format,
-      resource_type: uploadResult.resourceType,
-      bytes: uploadResult.bytes,
-      width: uploadResult.width,
-      height: uploadResult.height,
-      duration: uploadResult.duration,
-      original_filename: uploadResult.originalFilename,
-    });
-
-    const video = await this.prisma.videoAsset.create({
-      data: {
+      const tags = this.parseTags(dto.tags);
+      const uploadResult = await this.cloudinaryService.uploadVideo({
+        filePath: file.path,
+        originalFilename: file.originalname,
         title: dto.title.trim(),
-        slug,
-        description: this.trimNullable(dto.description),
-        provider: VideoProvider.CLOUDINARY,
-        sourceType: VideoSourceType.UPLOAD,
-        providerAssetId: uploadResult.publicId,
-        playbackId: uploadResult.publicId,
-        playbackUrl: uploadResult.secureUrl,
-        thumbnailUrl,
-        durationSeconds:
-          uploadResult.duration === undefined
-            ? (dto.durationSeconds ?? null)
-            : Math.round(uploadResult.duration),
-        viewCount: this.parseViewCount(dto.viewCount),
-        publishedAt: this.parseNullableDate(dto.publishedAt),
-        status: dto.status ?? VideoStatus.READY,
-        filterKey: this.normalizeNullableVideoFilterKey(dto.filterKey),
-        metadataJson: this.buildMetadataJson(
-          uploadMetadata,
-          thumbnail.thumbnailMetadata,
-        ),
-      },
-    });
+        tags,
+        ...(this.trimOptional(dto.description) !== undefined
+          ? { description: this.trimOptional(dto.description) }
+          : {}),
+      });
 
-    await this.writeAudit(adminId, "VIDEO_UPLOAD", video.id, {
-      provider: video.provider,
-      status: video.status,
-    });
-    this.invalidateAdminVideoCaches();
+      const cloudName = this.cloudinaryService.getCloudName();
+      const thumbnail = await this.resolveThumbnailUrl({
+        thumbnailUrl: dto.thumbnailUrl,
+        thumbnailFile,
+        tags: [...tags, "video-upload"],
+      });
+      const thumbnailUrl =
+        thumbnail.thumbnailUrl ??
+        this.safeBuildCloudinaryThumbnailUrl(cloudName, uploadResult.publicId);
+      const slug = await this.ensureUniqueSlug(dto.slug ?? dto.title);
+      const uploadMetadata = this.removeUndefinedValues({
+        asset_id: uploadResult.assetId,
+        public_id: uploadResult.publicId,
+        version: uploadResult.version,
+        format: uploadResult.format,
+        resource_type: uploadResult.resourceType,
+        bytes: uploadResult.bytes,
+        width: uploadResult.width,
+        height: uploadResult.height,
+        duration: uploadResult.duration,
+        original_filename: uploadResult.originalFilename,
+      });
 
-    return this.toVideoResponse(video);
+      const video = await this.prisma.videoAsset.create({
+        data: {
+          title: dto.title.trim(),
+          slug,
+          description: this.trimNullable(dto.description),
+          provider: VideoProvider.CLOUDINARY,
+          sourceType: VideoSourceType.UPLOAD,
+          providerAssetId: uploadResult.publicId,
+          playbackId: uploadResult.publicId,
+          playbackUrl: uploadResult.secureUrl,
+          thumbnailUrl,
+          durationSeconds:
+            uploadResult.duration === undefined
+              ? (dto.durationSeconds ?? null)
+              : Math.round(uploadResult.duration),
+          viewCount: this.parseViewCount(dto.viewCount),
+          publishedAt: this.parseNullableDate(dto.publishedAt),
+          status: dto.status ?? VideoStatus.READY,
+          filterKey: this.normalizeNullableVideoFilterKey(dto.filterKey),
+          metadataJson: this.buildMetadataJson(
+            uploadMetadata,
+            thumbnail.thumbnailMetadata,
+          ),
+        },
+      });
+
+      await this.writeAudit(adminId, "VIDEO_UPLOAD", video.id, {
+        provider: video.provider,
+        status: video.status,
+      });
+      this.invalidateAdminVideoCaches();
+
+      return this.toVideoResponse(video);
+    } finally {
+      await this.deleteTempUploadFile(file);
+      await this.deleteTempUploadFile(thumbnailFile);
+    }
   }
 
   async uploadDatabaseVideo(
@@ -553,6 +561,7 @@ export class VideosService {
         dto.durationSeconds ??
         (await this.probeLocalDurationSeconds(file.path));
       const data = await readFile(file.path);
+      const checksumSha256 = computeSha256Hex(data);
 
       let video: VideoAssetWithBinaryMetadata;
 
@@ -588,6 +597,7 @@ export class VideosService {
                   mimeType: file.mimetype,
                   sizeBytes: BigInt(file.size),
                   data,
+                  checksumSha256,
                 },
               },
             },
@@ -705,6 +715,7 @@ export class VideosService {
 
       const upload = await this.getOwnedActiveUploadSession(uploadId, adminId);
       this.validateLocalChunkRequest(upload, dto, file);
+      this.localVideoStorageService.ensureAvailableCapacity(file.size);
 
       const existingChunk = upload.chunks.find(
         (chunk) => chunk.chunkIndex === dto.chunkIndex,
@@ -745,30 +756,67 @@ export class VideosService {
         throw new BadRequestException("Chunk checksum does not match.");
       }
 
-      const updatedUpload = await this.prisma.$transaction(async (tx) => {
-        await tx.videoUploadSessionChunk.create({
-          data: {
-            uploadSessionId: upload.id,
-            chunkIndex: dto.chunkIndex,
-            storageKey: storedChunk.storageKey,
-            sizeBytes: storedChunk.sizeBytes,
-            checksumSha256:
-              dto.checksumSha256?.toLowerCase() ?? storedChunk.checksumSha256,
-          },
-        });
-
-        return tx.videoUploadSession.update({
-          where: { id: upload.id },
-          data: {
-            receivedChunks: { increment: 1 },
-          },
-          include: {
-            chunks: {
-              orderBy: { chunkIndex: "asc" },
+      let updatedUpload: LocalUploadSessionWithChunks;
+      try {
+        updatedUpload = await this.prisma.$transaction(async (tx) => {
+          await tx.videoUploadSessionChunk.create({
+            data: {
+              uploadSessionId: upload.id,
+              chunkIndex: dto.chunkIndex,
+              storageKey: storedChunk.storageKey,
+              sizeBytes: storedChunk.sizeBytes,
+              checksumSha256:
+                dto.checksumSha256?.toLowerCase() ?? storedChunk.checksumSha256,
             },
-          },
+          });
+
+          const claimed = await tx.videoUploadSession.updateMany({
+            where: {
+              id: upload.id,
+              adminId,
+              status: VideoUploadSessionStatus.ACTIVE,
+            },
+            data: { receivedChunks: { increment: 1 } },
+          });
+          if (claimed.count !== 1) {
+            throw new ConflictException("Upload session is no longer active.");
+          }
+
+          return tx.videoUploadSession.findUniqueOrThrow({
+            where: { id: upload.id },
+            include: { chunks: { orderBy: { chunkIndex: "asc" } } },
+          });
         });
-      });
+      } catch (error) {
+        await this.localVideoStorageService.deleteStorageKeyBestEffort(
+          storedChunk.storageKey,
+        );
+        if (this.isPrismaUniqueConstraintError(error)) {
+          const latest = await this.prisma.videoUploadSession.findUnique({
+            where: { id: upload.id },
+            include: { chunks: { orderBy: { chunkIndex: "asc" } } },
+          });
+          const committed = latest?.chunks.find(
+            (chunk) => chunk.chunkIndex === dto.chunkIndex,
+          );
+          if (
+            latest !== null &&
+            latest !== undefined &&
+            committed !== undefined &&
+            committed.sizeBytes === storedChunk.sizeBytes &&
+            committed.checksumSha256 === storedChunk.checksumSha256
+          ) {
+            return {
+              message: "Chunk already uploaded.",
+              upload: this.toUploadSessionResponse(latest),
+            };
+          }
+          throw new BadRequestException(
+            "Chunk was already uploaded with different metadata.",
+          );
+        }
+        throw error;
+      }
 
       await this.writeAudit(adminId, "VIDEO_LOCAL_CHUNK_UPLOAD", upload.id, {
         chunkIndex: dto.chunkIndex,
@@ -812,16 +860,53 @@ export class VideosService {
   ): Promise<VideoResponse> {
     let finalStorageKey: string | null = null;
     let thumbnailStorageKey: string | null = null;
+    let completionOwned = false;
 
     try {
       await this.cleanupStaleLocalUploadSessions();
-      const upload = await this.getOwnedActiveUploadSession(uploadId, adminId);
+      const upload = await this.prisma.videoUploadSession.findUnique({
+        where: { id: uploadId },
+        include: { chunks: { orderBy: { chunkIndex: "asc" } } },
+      });
+      if (upload === null || upload.adminId !== adminId) {
+        throw new NotFoundException("Upload session not found.");
+      }
+      if (
+        upload.status === VideoUploadSessionStatus.COMPLETED &&
+        upload.videoId !== null
+      ) {
+        return this.getVideo(upload.videoId);
+      }
+      if (upload.status !== VideoUploadSessionStatus.ACTIVE) {
+        throw new ConflictException("Upload session cannot be completed.");
+      }
+      if (upload.expiresAt <= new Date()) {
+        await this.prisma.videoUploadSession.updateMany({
+          where: { id: upload.id, status: VideoUploadSessionStatus.ACTIVE },
+          data: { status: VideoUploadSessionStatus.EXPIRED },
+        });
+        throw new BadRequestException("Upload session has expired.");
+      }
       this.ensureAllUploadChunksPresent(upload);
 
-      await this.prisma.videoUploadSession.update({
-        where: { id: upload.id },
+      const claimed = await this.prisma.videoUploadSession.updateMany({
+        where: {
+          id: upload.id,
+          adminId,
+          status: VideoUploadSessionStatus.ACTIVE,
+        },
         data: { status: VideoUploadSessionStatus.COMPLETING },
       });
+      if (claimed.count !== 1) {
+        throw new ConflictException(
+          "Upload completion is already in progress.",
+        );
+      }
+      completionOwned = true;
+
+      this.localVideoStorageService.ensureAvailableCapacity(
+        Number(upload.totalBytes),
+      );
 
       const videoId = randomUUID();
       finalStorageKey = this.localVideoStorageService.buildFinalVideoKey(
@@ -830,8 +915,7 @@ export class VideosService {
       );
       const finalFile =
         await this.localVideoStorageService.mergeChunksToFinalFile({
-          tempStorageKey: upload.tempStorageKey,
-          totalChunks: upload.totalChunks,
+          chunkStorageKeys: upload.chunks.map((chunk) => chunk.storageKey),
           finalStorageKey,
         });
       const requestedChecksum =
@@ -957,8 +1041,11 @@ export class VideosService {
           where: { uploadSessionId: upload.id },
         });
 
-        await tx.videoUploadSession.update({
-          where: { id: upload.id },
+        const completed = await tx.videoUploadSession.updateMany({
+          where: {
+            id: upload.id,
+            status: VideoUploadSessionStatus.COMPLETING,
+          },
           data: {
             videoId,
             finalStorageKey: finalFile.storageKey,
@@ -968,6 +1055,9 @@ export class VideosService {
             receivedChunks: upload.totalChunks,
           },
         });
+        if (completed.count !== 1) {
+          throw new ConflictException("Upload completion lost ownership.");
+        }
 
         return createdVideo;
       });
@@ -995,10 +1085,12 @@ export class VideosService {
           thumbnailStorageKey,
         );
       }
-      await this.prisma.videoUploadSession.updateMany({
-        where: { id: uploadId, status: VideoUploadSessionStatus.COMPLETING },
-        data: { status: VideoUploadSessionStatus.FAILED },
-      });
+      if (completionOwned) {
+        await this.prisma.videoUploadSession.updateMany({
+          where: { id: uploadId, status: VideoUploadSessionStatus.COMPLETING },
+          data: { status: VideoUploadSessionStatus.FAILED },
+        });
+      }
       throw error;
     } finally {
       await this.deleteTempUploadFile(thumbnailFile);
@@ -1018,17 +1110,35 @@ export class VideosService {
       throw new NotFoundException("Upload session not found.");
     }
 
+    if (upload.status === VideoUploadSessionStatus.COMPLETING) {
+      throw new ConflictException("Upload completion is in progress.");
+    }
+    if (upload.status === VideoUploadSessionStatus.COMPLETED) {
+      return { message: "Upload canceled successfully." };
+    }
+
     if (
-      upload.status !== VideoUploadSessionStatus.ABORTED &&
-      upload.status !== VideoUploadSessionStatus.COMPLETED
+      upload.status === VideoUploadSessionStatus.ACTIVE ||
+      upload.status === VideoUploadSessionStatus.FAILED
     ) {
-      await this.prisma.videoUploadSession.update({
-        where: { id: upload.id },
+      const canceled = await this.prisma.videoUploadSession.updateMany({
+        where: {
+          id: upload.id,
+          status: {
+            in: [
+              VideoUploadSessionStatus.ACTIVE,
+              VideoUploadSessionStatus.FAILED,
+            ],
+          },
+        },
         data: {
           status: VideoUploadSessionStatus.ABORTED,
           abortedAt: new Date(),
         },
       });
+      if (canceled.count !== 1) {
+        throw new ConflictException("Upload session state changed.");
+      }
     }
 
     await this.localVideoStorageService.deleteDirectoryBestEffort(
@@ -1250,6 +1360,7 @@ export class VideosService {
         (await this.probeLocalDurationSeconds(file.path)) ??
         existingVideo.durationSeconds;
       const data = await readFile(file.path);
+      const checksumSha256 = computeSha256Hex(data);
       const updateData: VideoAssetUpdateInput = {
         durationSeconds,
         status: dto.status ?? existingVideo.status,
@@ -1259,11 +1370,13 @@ export class VideosService {
               mimeType: file.mimetype,
               sizeBytes: BigInt(file.size),
               data,
+              checksumSha256,
             },
             update: {
               mimeType: file.mimetype,
               sizeBytes: BigInt(file.size),
               data,
+              checksumSha256,
             },
           },
         },
@@ -1433,7 +1546,13 @@ export class VideosService {
       data.status = dto.status;
     }
 
-    if (Object.prototype.hasOwnProperty.call(dto, "filterKey")) {
+    // `hasOwnProperty` cannot distinguish "field omitted" here: validated DTO
+    // instances are class objects whose declared fields are always own
+    // properties (`useDefineForClassFields`), so every PATCH without
+    // `filterKey` used to clear the column. The DTO transform maps the
+    // explicit clear signals (null / empty string) to null, so `undefined`
+    // now means "leave unchanged".
+    if (dto.filterKey !== undefined) {
       data.filterKey = this.normalizeNullableVideoFilterKey(dto.filterKey);
     }
 
@@ -1569,6 +1688,20 @@ export class VideosService {
       );
     }
 
+    // Purging a video that anchors a canonical provenance URL would orphan a
+    // recorded DMCA source link (the FK is Restrict, so the delete would fail
+    // at the database anyway) — surface a stable, actionable conflict first.
+    const canonicalCount = await this.prisma.canonicalVideoShareLink.count({
+      where: { videoId: id },
+    });
+    if (canonicalCount > 0) {
+      throw new ConflictException({
+        message:
+          "This video anchors a canonical share link used for provenance records. Owner must resolve the canonical mapping before purging.",
+        code: "VIDEO_HAS_CANONICAL_SHARE_LINK",
+      });
+    }
+
     const deleteRemoteAsset = dto.deleteRemoteAsset ?? false;
     const purgeResult = await this.prisma.$transaction(async (transaction) => {
       const video = await transaction.videoAsset.findUnique({
@@ -1631,6 +1764,22 @@ export class VideosService {
 
       await transaction.videoAsset.delete({ where: { id } });
 
+      await transaction.adminAuditLog.create({
+        data: {
+          adminId,
+          action: "VIDEO_PURGE_COMMIT",
+          module: "videos",
+          entityType: "VideoAsset",
+          entityId: id,
+          status: AuditStatus.SUCCESS,
+          metadataJson: this.toJsonInput({
+            sourceType: video.sourceType,
+            disabledShareLinkCount,
+            detachedShareLinkVideoCount,
+          }),
+        },
+      });
+
       return {
         video,
         hadWebsiteAssignments,
@@ -1684,25 +1833,33 @@ export class VideosService {
       (localVideoDeleteAttempted && !localVideoDeleted) ||
       (localThumbnailDeleteAttempted && !localThumbnailDeleted);
 
-    await this.writeAudit(adminId, "VIDEO_PURGE", id, {
-      provider: purgeResult.video.provider,
-      sourceType: purgeResult.video.sourceType,
-      hadWebsiteAssignments: purgeResult.hadWebsiteAssignments,
-      hadShareLinks: purgeResult.hadShareLinks,
-      activeWebsiteAssignmentCount: purgeResult.activeWebsiteAssignmentCount,
-      disabledShareLinkCount: purgeResult.disabledShareLinkCount,
-      detachedShareLinkVideoCount: purgeResult.detachedShareLinkVideoCount,
-      deleteRemoteAsset,
-      remoteAssetDeleteAttempted: shouldDeleteRemoteAsset,
-      remoteAssetDeleted,
-      ownedCloudinaryThumbnailDeleted,
-      localVideoDeleteAttempted,
-      localVideoDeleted,
-      localThumbnailDeleteAttempted,
-      localThumbnailDeleted,
-      bytesReclaimed: bytesReclaimed.toString(),
-      orphanCleanupRequired,
-    });
+    const storageCleanupFailed =
+      orphanCleanupRequired || (shouldDeleteRemoteAsset && !remoteAssetDeleted);
+    await this.writeAudit(
+      adminId,
+      "VIDEO_PURGE_STORAGE",
+      id,
+      {
+        provider: purgeResult.video.provider,
+        sourceType: purgeResult.video.sourceType,
+        hadWebsiteAssignments: purgeResult.hadWebsiteAssignments,
+        hadShareLinks: purgeResult.hadShareLinks,
+        activeWebsiteAssignmentCount: purgeResult.activeWebsiteAssignmentCount,
+        disabledShareLinkCount: purgeResult.disabledShareLinkCount,
+        detachedShareLinkVideoCount: purgeResult.detachedShareLinkVideoCount,
+        deleteRemoteAsset,
+        remoteAssetDeleteAttempted: shouldDeleteRemoteAsset,
+        remoteAssetDeleted,
+        ownedCloudinaryThumbnailDeleted,
+        localVideoDeleteAttempted,
+        localVideoDeleted,
+        localThumbnailDeleteAttempted,
+        localThumbnailDeleted,
+        bytesReclaimed: bytesReclaimed.toString(),
+        orphanCleanupRequired,
+      },
+      storageCleanupFailed ? AuditStatus.FAIL : AuditStatus.SUCCESS,
+    );
     this.invalidateAdminVideoCaches();
 
     return {
@@ -1960,9 +2117,10 @@ export class VideosService {
     }
 
     if (normalizedSearch.length > 0) {
+      const literalSearch = escapeAdminVideoSearchLike(normalizedSearch);
       where.OR = [
-        { title: { contains: normalizedSearch } },
-        { slug: { contains: normalizedSearch } },
+        { title: { contains: literalSearch } },
+        { slug: { contains: literalSearch } },
       ];
     }
 
@@ -2017,8 +2175,9 @@ export class VideosService {
     dto: InitLocalVideoUploadDto,
     originalFilename: string,
   ): void {
-    if (!dto.mimeType.toLowerCase().startsWith("video/")) {
-      throw new BadRequestException("mimeType must be a video MIME type.");
+    const normalizedMimeType = dto.mimeType.trim().toLowerCase();
+    if (!this.isSupportedLocalVideoMimeType(normalizedMimeType)) {
+      throw new BadRequestException("Video MIME type is not supported.");
     }
 
     if (!this.isAllowedLocalVideoExtension(originalFilename)) {
@@ -2058,6 +2217,19 @@ export class VideosService {
       ".mpeg",
       ".mpg",
     ].some((extension) => lower.endsWith(extension));
+  }
+
+  private isSupportedLocalVideoMimeType(mimeType: string): boolean {
+    return new Set([
+      "video/mp4",
+      "video/x-m4v",
+      "video/quicktime",
+      "video/webm",
+      "video/x-matroska",
+      "video/x-msvideo",
+      "video/avi",
+      "video/mpeg",
+    ]).has(mimeType);
   }
 
   private validateLocalChunkFile(
@@ -2136,6 +2308,14 @@ export class VideosService {
     return upload;
   }
 
+  private isPrismaUniqueConstraintError(error: unknown): boolean {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      (error as { code?: unknown }).code === "P2002"
+    );
+  }
+
   private ensureAllUploadChunksPresent(
     upload: LocalUploadSessionWithChunks,
   ): void {
@@ -2157,18 +2337,34 @@ export class VideosService {
         this.localVideoStorageService.getStaleUploadMaxAgeHours() * 60 * 60_000,
     );
     const now = new Date();
-    const staleSessions = await this.prisma.videoUploadSession.findMany({
-      where: {
-        status: {
-          in: [
-            VideoUploadSessionStatus.ACTIVE,
-            VideoUploadSessionStatus.COMPLETING,
-          ],
+    const cleanupStatuses = [
+      VideoUploadSessionStatus.ACTIVE,
+      VideoUploadSessionStatus.FAILED,
+    ];
+    const [expiredSessions, oldSessions] = await Promise.all([
+      this.prisma.videoUploadSession.findMany({
+        where: {
+          status: { in: cleanupStatuses },
+          expiresAt: { lt: now },
         },
-        OR: [{ expiresAt: { lt: now } }, { createdAt: { lt: cutoff } }],
-      },
-      take: 20,
-    });
+        take: 20,
+      }),
+      this.prisma.videoUploadSession.findMany({
+        where: {
+          status: { in: cleanupStatuses },
+          createdAt: { lt: cutoff },
+        },
+        take: 20,
+      }),
+    ]);
+    const staleSessions = Array.from(
+      new Map(
+        [...expiredSessions, ...oldSessions].map((session) => [
+          session.id,
+          session,
+        ]),
+      ).values(),
+    ).slice(0, 20);
 
     for (const session of staleSessions) {
       await this.prisma.videoUploadSession.updateMany({
@@ -2177,7 +2373,7 @@ export class VideosService {
           status: {
             in: [
               VideoUploadSessionStatus.ACTIVE,
-              VideoUploadSessionStatus.COMPLETING,
+              VideoUploadSessionStatus.FAILED,
             ],
           },
         },
@@ -2220,6 +2416,38 @@ export class VideosService {
         "Uploaded video content is not valid WebM.",
       );
     }
+
+    if (
+      normalizedMimeType.includes("matroska") &&
+      !magicBytes.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))
+    ) {
+      throw new BadRequestException("Uploaded video content is not valid MKV.");
+    }
+
+    if (
+      (normalizedMimeType.includes("msvideo") ||
+        normalizedMimeType === "video/avi") &&
+      !(
+        magicBytes.subarray(0, 4).toString("ascii") === "RIFF" &&
+        magicBytes.subarray(8, 12).toString("ascii") === "AVI "
+      )
+    ) {
+      throw new BadRequestException("Uploaded video content is not valid AVI.");
+    }
+
+    if (
+      normalizedMimeType === "video/mpeg" &&
+      !(
+        magicBytes[0] === 0 &&
+        magicBytes[1] === 0 &&
+        magicBytes[2] === 1 &&
+        (magicBytes[3] === 0xba || magicBytes[3] === 0xb3)
+      )
+    ) {
+      throw new BadRequestException(
+        "Uploaded video content is not valid MPEG.",
+      );
+    }
   }
 
   private async storeLocalThumbnailForVideo(
@@ -2247,6 +2475,14 @@ export class VideosService {
       temporaryPath: file.path,
       storageKey,
     });
+    try {
+      await this.validateLocalThumbnailMagicBytes(storageKey, file.mimetype);
+    } catch (error) {
+      await this.localVideoStorageService.deleteStorageKeyBestEffort(
+        storageKey,
+      );
+      throw error;
+    }
 
     return {
       storageKey: storedFile.storageKey,
@@ -2264,12 +2500,12 @@ export class VideosService {
       return undefined;
     }
 
-    if (!file.mimetype.startsWith("image/")) {
-      throw new BadRequestException("Thumbnail file must be an image.");
-    }
-
-    if (file.mimetype === "image/svg+xml") {
-      throw new BadRequestException("SVG thumbnails are not allowed.");
+    if (
+      !["image/jpeg", "image/png", "image/gif", "image/webp"].includes(
+        file.mimetype.toLowerCase(),
+      )
+    ) {
+      throw new BadRequestException("Thumbnail image type is not supported.");
     }
 
     if (typeof file.path !== "string" || file.path.trim() === "") {
@@ -2281,6 +2517,42 @@ export class VideosService {
     }
 
     return file as Express.Multer.File & { path: string };
+  }
+
+  private async validateLocalThumbnailMagicBytes(
+    storageKey: string,
+    mimeType: string,
+  ): Promise<void> {
+    const bytes = await this.localVideoStorageService.readMagicBytes(
+      storageKey,
+      16,
+    );
+    const normalized = mimeType.toLowerCase();
+    const valid =
+      (normalized === "image/jpeg" &&
+        bytes.length >= 3 &&
+        bytes[0] === 0xff &&
+        bytes[1] === 0xd8 &&
+        bytes[2] === 0xff) ||
+      (normalized === "image/png" &&
+        bytes
+          .subarray(0, 8)
+          .equals(
+            Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+          )) ||
+      (normalized === "image/gif" &&
+        ["GIF87a", "GIF89a"].includes(
+          bytes.subarray(0, 6).toString("ascii"),
+        )) ||
+      (normalized === "image/webp" &&
+        bytes.subarray(0, 4).toString("ascii") === "RIFF" &&
+        bytes.subarray(8, 12).toString("ascii") === "WEBP");
+
+    if (!valid) {
+      throw new BadRequestException(
+        "Thumbnail content does not match its MIME type.",
+      );
+    }
   }
 
   private parseVideoStatusFromMetadata(
@@ -2357,13 +2629,17 @@ export class VideosService {
 
   private validateUploadFile(
     file: Express.Multer.File | undefined,
-  ): asserts file is Express.Multer.File {
+  ): asserts file is Express.Multer.File & { path: string } {
     if (file === undefined) {
       throw new BadRequestException("Video file is required.");
     }
 
     if (!file.mimetype.startsWith("video/")) {
       throw new BadRequestException("Uploaded file must be a video.");
+    }
+
+    if (typeof file.path !== "string" || file.path.trim() === "") {
+      throw new BadRequestException("Video temporary file is unavailable.");
     }
 
     const maxBytes = this.getUploadMaxBytes();
@@ -3071,6 +3347,7 @@ export class VideosService {
     action: VideoMutationAction,
     videoId: string,
     metadata: Record<string, unknown>,
+    status: AuditStatus = AuditStatus.SUCCESS,
   ): Promise<void> {
     try {
       await this.prisma.adminAuditLog.create({
@@ -3080,7 +3357,7 @@ export class VideosService {
           module: "videos",
           entityType: "VideoAsset",
           entityId: videoId,
-          status: AuditStatus.SUCCESS,
+          status,
           metadataJson: this.toJsonInput(metadata),
         },
       });

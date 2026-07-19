@@ -53,6 +53,8 @@ Alternative:
 
 Do not rely on Cloudflare WAF if the raw Hostinger/API origin remains reachable directly.
 
+When application proxy trust is enabled, set `TRUSTED_PROXY_CIDRS` to the actual immediate Cloudflare/Hostinger proxy ranges. The API only accepts `CF-Connecting-IP` from a matching socket peer. Keep the allowlist synchronized with the ingress topology and test direct-origin spoof attempts after every proxy change.
+
 ## Starter WAF / Rate-Limit Rules
 
 These are conservative starting points. Tune with real traffic and app-side throttling metrics.

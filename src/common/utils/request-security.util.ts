@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
+import { isIP } from "node:net";
 import type { Request } from "express";
+import proxyaddr from "proxy-addr";
 
 export type ProxyTrustOptions = {
   trustProxyEnabled: boolean;
   trustProxyCloudflareOnly: boolean;
+  trustedProxyCidrs?: string[] | undefined;
 };
 
 export type RequestSecurityMeta = {
@@ -32,9 +35,15 @@ export function getClientIpFromRequest(
   },
 ): string | undefined {
   if (options.trustProxyEnabled && options.trustProxyCloudflareOnly) {
-    const cloudflareIp = normalizeIp(
-      readRequestHeader(request, "cf-connecting-ip"),
-    );
+    const remoteAddress = normalizeIp(request.socket.remoteAddress);
+    const cloudflareIp = isTrustedProxyPeer(
+      remoteAddress,
+      options.trustedProxyCidrs ?? [],
+    )
+      ? normalizeForwardedClientIp(
+          readRequestHeader(request, "cf-connecting-ip"),
+        )
+      : undefined;
 
     if (cloudflareIp !== undefined) {
       return cloudflareIp;
@@ -46,6 +55,33 @@ export function getClientIpFromRequest(
     normalizeIp(request.socket.remoteAddress) ??
     undefined
   );
+}
+
+const proxyMatcherCache = new Map<
+  string,
+  (address: string, index: number) => boolean
+>();
+
+function isTrustedProxyPeer(
+  address: string | undefined,
+  cidrs: string[],
+): boolean {
+  if (address === undefined || cidrs.length === 0) {
+    return false;
+  }
+
+  const key = cidrs.join(",");
+  let matcher = proxyMatcherCache.get(key);
+  if (matcher === undefined) {
+    matcher = proxyaddr.compile(cidrs);
+    proxyMatcherCache.set(key, matcher);
+  }
+
+  try {
+    return matcher(address, 0);
+  } catch {
+    return false;
+  }
 }
 
 export function getRequestSecurityMeta(
@@ -89,4 +125,13 @@ function normalizeIp(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
 
   return trimmed ? trimmed : undefined;
+}
+
+function normalizeForwardedClientIp(
+  value: string | undefined,
+): string | undefined {
+  const normalized = normalizeIp(value);
+  return normalized !== undefined && isIP(normalized) !== 0
+    ? normalized
+    : undefined;
 }

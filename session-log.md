@@ -12,6 +12,25 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-19 — Gate 3A: persisted DB_BLOB SHA-256 checksums
+
+### Changed
+
+- Added nullable `VideoBinaryAsset.checksumSha256 CHAR(64)` and additive migration `20260719090000_add_video_binary_asset_checksum`; the migration contains one nullable `ADD COLUMN` only, with no blob scan, data rewrite, or backfill.
+- `uploadDatabaseVideo` and `replaceDatabaseVideoBinary` now compute lowercase SHA-256 from the exact Buffer read for persistence. New upload create and both replacement upsert branches write `data`, existing size/MIME metadata, and checksum together in the existing Prisma transaction.
+- Added the shared pure `computeSha256Hex` helper and four focused tests covering deterministic hashing/non-mutation, exact upload payload, equal-size/equal-MIME replacement drift, atomic nested payloads, nullable legacy schema, and checksum-free existing read/response contracts.
+- DB upload/replacement DTOs still accept no checksum. Admin/public media responses still expose only the existing DB binary MIME/size fields. Canonical fingerprint/drift consumption is intentionally deferred to Gate 3B.
+
+### Verified
+
+- Local standard migration workflow applied the additive migration; `db:local:generate`, `db:local:validate`, and `db:local:status` pass with 19 migrations and schema up to date. No Production access or backfill occurred.
+- Focused Gate 3A suite: 4/4 pass. Full API suite: 163/163 pass across 44 suites. `typecheck`, `build`, repository `format:check`, and `git diff --check` pass. Lint has 0 errors and the same 90 existing `consistent-type-imports` warnings.
+- Leakage scan proves no DB checksum request/public contract, no checksum-path console logging, and no regression of canonical `rawToken` removal. Admin repository remained untouched at `2f65eab`.
+
+### Pending
+
+- Gate 3B must explicitly select the persisted DB_BLOB checksum, define canonical behavior for legacy null rows, and integrate it into evidence fingerprint/drift tests. Gate 3C MySQL proof, Gate 4 public parser, Production migration/backfill, push/merge/deploy, and browser verification were not run.
+
 ## 2026-07-19 — Gate 2: canonical raw-token exposure removed
 
 ### Changed

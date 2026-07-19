@@ -68,6 +68,7 @@ import {
   type ParsedVideoEmbed,
 } from "./utils/video-embed.util";
 import { createVideoSlug } from "./utils/video-slug.util";
+import { computeSha256Hex } from "./utils/video-checksum.util";
 import { VideoMetadataService } from "./metadata/video-metadata.service";
 import {
   LocalVideoStorageService,
@@ -560,6 +561,7 @@ export class VideosService {
         dto.durationSeconds ??
         (await this.probeLocalDurationSeconds(file.path));
       const data = await readFile(file.path);
+      const checksumSha256 = computeSha256Hex(data);
 
       let video: VideoAssetWithBinaryMetadata;
 
@@ -595,6 +597,7 @@ export class VideosService {
                   mimeType: file.mimetype,
                   sizeBytes: BigInt(file.size),
                   data,
+                  checksumSha256,
                 },
               },
             },
@@ -1357,6 +1360,7 @@ export class VideosService {
         (await this.probeLocalDurationSeconds(file.path)) ??
         existingVideo.durationSeconds;
       const data = await readFile(file.path);
+      const checksumSha256 = computeSha256Hex(data);
       const updateData: VideoAssetUpdateInput = {
         durationSeconds,
         status: dto.status ?? existingVideo.status,
@@ -1366,11 +1370,13 @@ export class VideosService {
               mimeType: file.mimetype,
               sizeBytes: BigInt(file.size),
               data,
+              checksumSha256,
             },
             update: {
               mimeType: file.mimetype,
               sizeBytes: BigInt(file.size),
               data,
+              checksumSha256,
             },
           },
         },

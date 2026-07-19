@@ -217,13 +217,14 @@ model VideoAsset {
 }
 
 model VideoBinaryAsset {
-  id        String   @id @default(cuid())
-  videoId   String   @unique
-  mimeType  String   @db.VarChar(120)
-  sizeBytes BigInt
-  data      Bytes    @db.LongBlob
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id             String   @id @default(cuid())
+  videoId        String   @unique
+  mimeType       String   @db.VarChar(120)
+  sizeBytes      BigInt
+  data           Bytes    @db.LongBlob
+  checksumSha256 String?  @db.Char(64)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
   video VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
 

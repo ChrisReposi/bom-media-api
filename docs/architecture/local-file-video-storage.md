@@ -35,7 +35,15 @@ VIDEO_DB_STORAGE_ALLOW_PRODUCTION_OVERRIDE=false
 - `VideoLocalThumbnailAsset` stores local thumbnail metadata.
 - `VideoUploadSession` stores chunked upload lifecycle state.
 - `VideoUploadSessionChunk` stores received chunk metadata.
-- `VideoBinaryAsset` remains for legacy `DB_BLOB` fallback compatibility.
+- `VideoBinaryAsset` remains for legacy `DB_BLOB` fallback compatibility. Its
+  nullable `checksumSha256` is the server-computed SHA-256 of the exact bytes
+  stored in `data`; new uploads and replacements populate it atomically with
+  data, MIME type, and size. Legacy rows may remain null because the additive
+  migration does not scan or backfill blobs.
+
+The DB_BLOB checksum supports integrity comparison; it is not proof of
+ownership. It is not accepted from an upload request and is not exposed in
+admin/public media responses.
 
 ## Admin Upload Contract
 

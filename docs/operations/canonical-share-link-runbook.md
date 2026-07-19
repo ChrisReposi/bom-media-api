@@ -40,6 +40,13 @@ metadata. The generic review-bundle endpoint retains its legacy one-time
 `rawToken` response. Public resolution remains alias-first with the legacy
 `tokenHash` fallback unchanged. Gate 2 verification did not access Production.
 
+Gate 3A adds a nullable, persisted SHA-256 for the exact bytes stored in each
+`VideoBinaryAsset`. New DB_BLOB uploads and replacements populate it; legacy
+rows may remain null and no Production backfill was run. The checksum supports
+integrity comparison, not ownership proof. Canonical evidence does not consume
+this DB_BLOB field in Gate 3A; selecting it, defining legacy-null behavior, and
+using it for fingerprint/drift comparison are explicitly deferred to Gate 3B.
+
 ## Mutation policy while a canonical mapping exists
 
 | Mutation | Policy |

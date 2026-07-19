@@ -18,6 +18,7 @@
     "audit:share-link-assignments": "tsx scripts/audit/share-link-assignment-audit.ts",
     "audit:admin-accounts": "tsx scripts/audit/admin-account-audit.ts",
     "audit:canonical-share-links": "cross-env APP_ENV=local DOTENV_CONFIG_PATH=.env.local tsx scripts/audit/canonical-share-link-audit.ts",
+    "test:integration:canonical-fk": "cross-env APP_ENV=test DOTENV_CONFIG_PATH=.env.test tsx scripts/test/canonical-fk-proof.ts",
     "remediate:local:adopt-canonical": "cross-env APP_ENV=local DOTENV_CONFIG_PATH=.env.local tsx scripts/remediate/adopt-canonical-share-link.ts",
     "cleanup:admin-sessions": "tsx scripts/operations/cleanup-admin-sessions.ts",
     "remediate:local:website-video": "cross-env APP_ENV=local DOTENV_CONFIG_PATH=.env.local tsx scripts/remediate/assign-local-website-video.ts",

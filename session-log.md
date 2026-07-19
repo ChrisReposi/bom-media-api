@@ -12,6 +12,26 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-19 — Gate 1.5: destructive database proofs isolated
+
+### Changed
+
+- Dedicated disposable database `video_share_cms_test` (same local Docker MySQL, full 18-migration chain via `DOTENV_CONFIG_PATH=.env.test yarn prisma migrate deploy`); tracked template `.env.test.example` (+ .gitignore whitelist), local `.env.test` stays ignored.
+- `scripts/safety/assert-destructive-test-database.ts`: reusable hard guard — requires APP_ENV test/local, repository-owned local host, database name ending `_test`/`_scratch`, and typed `ALLOW_DESTRUCTIVE_DB_TESTS=I_UNDERSTAND_THIS_DELETES_FIXTURES`; never prints credentials. 6 unit tests cover the allow/deny matrix incl. dev-DB-with-confirmation rejection and credential-leak checks.
+- `scripts/test/canonical-fk-proof.ts` + opt-in `yarn test:integration:canonical-fk` (not part of `yarn test`): guard → migration-completeness check → run-scoped Prisma fixtures count-verified before any destructive call → 4× parent-DELETE expecting P2003 with row-survival asserts → revoke-retention → dependency-order cleanup → zero-leftover check; non-zero exit on any deviation.
+- Root-cause addendum (PROVEN): `load-env` lets `.env` set `APP_ENV=local`, which then loads `.env.local` with override:true — an exported `DATABASE_URL` is silently replaced. Documented in `.env.test.example` and the runbook; the guard validates the effective URL so this class of mix-up now hard-stops.
+
+### Verified
+
+- Guard refusals live: no confirmation → exit 1; dev DB even with confirmation → exit 1.
+- Isolated proof on `video_share_cms_test`: 18 migrations verified, 6/6 fixtures, 4× P2003 blocks with survival, revoke retained mapping, zero leftovers, exit 0.
+- Read-only dev-DB audit before/after identical (W=1 D=2 V=26 WV=5 SL=0 SLV=0 C=0 AL=23); the five 2026-07-19 assignments are classified GATE1_RECOVERY_FIXTURE and untouched; the Gate-1 deleted website/video remain IRRECOVERABLE (not reconstructed). Admin repo untouched.
+- Suites: generate/validate/status, typecheck, lint 0 errors, **tests 159/159**, build, format, diff-check.
+
+### Pending
+
+- Gates 2/3/4 unchanged and not started.
+
 ## 2026-07-19 — Gate 1: canonical delete policy hardened to all-Restrict
 
 ### Changed

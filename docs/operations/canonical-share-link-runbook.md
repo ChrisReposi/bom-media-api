@@ -74,6 +74,39 @@ video, has an alias, no expiry/maxViews, ACTIVE assignment, READY/playable
 video, a known ACTIVE domain, and no existing mapping; it snapshots evidence
 and writes the audit row in the same transaction. There is no bulk mode.
 
+## Destructive proof isolation (mandatory after the 2026-07-19 dev-DB incident)
+
+Destructive database proofs are **forbidden** against `video_share_cms_dev`.
+They run only against a disposable local database whose name ends with
+`_test`/`_scratch`, via:
+
+```bash
+cp .env.test.example .env.test           # once; local Docker credentials
+DOTENV_CONFIG_PATH=.env.test APP_ENV=test yarn prisma migrate deploy
+ALLOW_DESTRUCTIVE_DB_TESTS=I_UNDERSTAND_THIS_DELETES_FIXTURES \
+  yarn test:integration:canonical-fk
+```
+
+`scripts/safety/assert-destructive-test-database.ts` hard-refuses anything
+else: wrong APP_ENV, non-local host, non `_test`/`_scratch` database (dev is
+rejected even with the confirmation), missing/incorrect typed confirmation, or
+malformed URL — validated on the EFFECTIVE env, because `load-env` gives
+`.env.local` override priority whenever `.env` sets `APP_ENV=local` (an
+exported `DATABASE_URL` is silently replaced; `DOTENV_CONFIG_PATH` is the only
+deterministic selector).
+
+Fixture contract enforced by `scripts/test/canonical-fk-proof.ts`: unique
+run-scoped ids → create via Prisma → count-verify every row **before** any
+destructive statement → assert the expected P2003 block and row survival →
+revoke-retention check → dependency-order cleanup → zero-leftover check; any
+deviation exits non-zero. Never suppress stderr or exit codes around database
+commands.
+
+Incident record: on 2026-07-19 a Gate-1 proof deleted one dev website and one
+dev video (fixture inserts had silently failed; DELETEs then ran against real
+ids). The rows were **not recovered** — the five ACTIVE assignments added
+afterwards are recovery fixtures, not original data.
+
 ## Migration and rollback
 
 - Migration `20260718113156_canonical_video_share_links` is additive

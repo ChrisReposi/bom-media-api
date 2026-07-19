@@ -9,6 +9,7 @@ import {
 } from "../src/admin-websites/canonical-share-link.service";
 import { isShareLinkTokenOrAliasCollision } from "../src/admin-websites/utils/share-link-errors.util";
 import { buildCanonicalPublicShareUrl } from "../src/admin-websites/utils/share-url.util";
+import { computeSha256Hex } from "../src/videos/utils/video-checksum.util";
 import {
   classifyPair,
   mask,
@@ -74,6 +75,7 @@ class FakePrisma {
   audits: { action: string; entityId: string }[] = [];
   failNextShareLinkCreateWith: unknown = null;
   failNextCanonicalCreateWith: unknown = null;
+  lastVideoFindUniqueArgs: Record<string, unknown> | null = null;
   private sequence = 0;
 
   nextId(prefix: string): string {
@@ -131,8 +133,11 @@ class FakePrisma {
   videoAsset = {
     findUnique: async (args: {
       where: { id: string };
-    }): Promise<Record<string, unknown> | null> =>
-      this.videos.get(args.where.id) ?? null,
+      include?: Record<string, unknown>;
+    }): Promise<Record<string, unknown> | null> => {
+      this.lastVideoFindUniqueArgs = args;
+      return this.videos.get(args.where.id) ?? null;
+    },
   };
 
   shareLink = {
@@ -350,6 +355,7 @@ function createService(options?: { eligibilityError?: Error }) {
 function expectConflictCode(code: string) {
   return (error: unknown): boolean => {
     assert.ok(error instanceof ConflictException, String(error));
+    assert.equal(error.getStatus(), 409);
     assert.equal((error.getResponse() as { code?: string }).code, code);
     return true;
   };
@@ -365,6 +371,52 @@ function assertCanonicalResponseHasNoSecrets(response: object): void {
     false,
   );
   assert.equal(JSON.stringify(response).includes("tokenHash"), false);
+}
+
+function configureDbBlobVideo(
+  prisma: FakePrisma,
+  checksumSha256: string | null,
+  sizeBytes = 5n,
+  mimeType = "video/mp4",
+): void {
+  const video = prisma.videos.get("video-1");
+  assert.ok(video);
+  prisma.videos.set("video-1", {
+    ...video,
+    sourceType: "DB_BLOB",
+    playbackUrl: null,
+    providerAssetId: null,
+    embedProvider: null,
+    embedUrl: null,
+    embedPublicId: null,
+    localFileAsset: null,
+    binaryAsset: { checksumSha256, sizeBytes, mimeType },
+  });
+}
+
+function addLegacySingleVideoLink(prisma: FakePrisma): FakeShareLink {
+  const now = new Date();
+  const shareLink: FakeShareLink = {
+    id: "legacy-link",
+    websiteId: "site-a",
+    tokenHash: "private-test-hash",
+    alias: "legacy1",
+    label: null,
+    expiresAt: null,
+    maxViews: null,
+    currentViews: 0,
+    status: "ACTIVE",
+    createdAt: now,
+    updatedAt: now,
+    lastViewedAt: null,
+  };
+  prisma.shareLinks.set(shareLink.id, shareLink);
+  prisma.shareLinkVideos.push({
+    shareLinkId: shareLink.id,
+    videoId: "video-1",
+    sortOrder: 0,
+  });
+  return shareLink;
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +504,201 @@ describe("evidence fingerprint", () => {
     assert.notEqual(
       service.computeFingerprint({ ...baseSnapshot, title: "Renamed" }),
       original,
+    );
+  });
+});
+
+describe("DB_BLOB canonical evidence", () => {
+  const bytesA = Buffer.from("alpha");
+  const bytesB = Buffer.from("bravo");
+  const checksumA = computeSha256Hex(bytesA);
+  const checksumB = computeSha256Hex(bytesB);
+
+  it("selects and snapshots the persisted binary checksum with size and MIME", async () => {
+    const { prisma, service } = createService();
+    configureDbBlobVideo(prisma, checksumA, BigInt(bytesA.length));
+
+    const created = await service.createOrGetCanonical(
+      "site-a",
+      "video-1",
+      "admin-1",
+    );
+    const snapshot = created.evidenceSnapshot as CanonicalEvidenceSnapshot;
+
+    assert.equal(snapshot.sourceType, "DB_BLOB");
+    assert.equal(snapshot.checksumSha256, checksumA);
+    assert.equal(snapshot.sizeBytes, String(bytesA.length));
+    assert.equal(snapshot.mimeType, "video/mp4");
+    assert.match(snapshot.checksumSha256, /^[0-9a-f]{64}$/);
+    assert.equal(
+      (
+        prisma.lastVideoFindUniqueArgs?.include as {
+          binaryAsset?: { select?: Record<string, boolean> };
+        }
+      )?.binaryAsset?.select?.checksumSha256,
+      true,
+    );
+  });
+
+  it("detects same-size and same-MIME byte replacement through checksum drift", async () => {
+    assert.equal(bytesA.length, bytesB.length);
+    assert.notEqual(checksumA, checksumB);
+    const { prisma, service } = createService();
+    configureDbBlobVideo(prisma, checksumA, BigInt(bytesA.length));
+    const created = await service.createOrGetCanonical(
+      "site-a",
+      "video-1",
+      "admin-1",
+    );
+    const originalSnapshot =
+      created.evidenceSnapshot as CanonicalEvidenceSnapshot;
+
+    configureDbBlobVideo(prisma, checksumB, BigInt(bytesB.length));
+    const replacementVideo = prisma.videos.get("video-1")!;
+    const replacementSnapshot: CanonicalEvidenceSnapshot = {
+      ...originalSnapshot,
+      checksumSha256: checksumB,
+      snapshotAt: new Date().toISOString(),
+    };
+    assert.equal(replacementSnapshot.sizeBytes, originalSnapshot.sizeBytes);
+    assert.equal(replacementSnapshot.mimeType, originalSnapshot.mimeType);
+    assert.notEqual(
+      service.computeFingerprint(replacementSnapshot),
+      service.computeFingerprint(originalSnapshot),
+    );
+    assert.equal(
+      (replacementVideo.binaryAsset as { sizeBytes: bigint }).sizeBytes,
+      BigInt(bytesA.length),
+    );
+
+    await assert.rejects(
+      service.createOrGetCanonical("site-a", "video-1", "admin-1"),
+      expectConflictCode("CANONICAL_EVIDENCE_DRIFT"),
+    );
+  });
+
+  it("reuses the canonical mapping when DB evidence is unchanged", async () => {
+    const { prisma, service } = createService();
+    configureDbBlobVideo(prisma, checksumA, BigInt(bytesA.length));
+    const created = await service.createOrGetCanonical(
+      "site-a",
+      "video-1",
+      "admin-1",
+    );
+    configureDbBlobVideo(prisma, checksumA, BigInt(bytesA.length));
+
+    const reused = await service.createOrGetCanonical(
+      "site-a",
+      "video-1",
+      "admin-1",
+    );
+    assert.equal(reused.outcome, "REUSED");
+    assert.equal(reused.alias, created.alias);
+    assert.equal(reused.publicUrl, created.publicUrl);
+  });
+
+  it("rejects a new legacy-null DB blob before any canonical write", async () => {
+    const { prisma, service } = createService();
+    configureDbBlobVideo(prisma, null);
+
+    await assert.rejects(
+      service.createOrGetCanonical("site-a", "video-1", "admin-1"),
+      expectConflictCode("CANONICAL_EVIDENCE_INCOMPLETE"),
+    );
+    assert.equal(prisma.shareLinks.size, 0);
+    assert.equal(prisma.shareLinkVideos.length, 0);
+    assert.equal(prisma.canonicals.size, 0);
+    assert.equal(prisma.audits.length, 0);
+  });
+
+  it("rejects reuse and GET when current or stored DB evidence is incomplete", async () => {
+    const currentNull = createService();
+    configureDbBlobVideo(currentNull.prisma, checksumA);
+    await currentNull.service.createOrGetCanonical(
+      "site-a",
+      "video-1",
+      "admin-1",
+    );
+    configureDbBlobVideo(currentNull.prisma, null);
+    await assert.rejects(
+      currentNull.service.createOrGetCanonical("site-a", "video-1", "admin-1"),
+      expectConflictCode("CANONICAL_EVIDENCE_INCOMPLETE"),
+    );
+    await assert.rejects(
+      currentNull.service.getCanonical("site-a", "video-1"),
+      expectConflictCode("CANONICAL_EVIDENCE_INCOMPLETE"),
+    );
+
+    const storedNull = createService();
+    configureDbBlobVideo(storedNull.prisma, checksumA);
+    await storedNull.service.createOrGetCanonical(
+      "site-a",
+      "video-1",
+      "admin-1",
+    );
+    const canonical = [...storedNull.prisma.canonicals.values()][0];
+    canonical.evidenceSnapshotJson = {
+      ...(canonical.evidenceSnapshotJson as object),
+      checksumSha256: null,
+    };
+    await assert.rejects(
+      storedNull.service.createOrGetCanonical("site-a", "video-1", "admin-1"),
+      expectConflictCode("CANONICAL_EVIDENCE_INCOMPLETE"),
+    );
+  });
+
+  it("refuses legacy-link adoption before mapping or success audit writes", async () => {
+    const { prisma, service } = createService();
+    configureDbBlobVideo(prisma, null);
+    const legacyLink = addLegacySingleVideoLink(prisma);
+
+    await assert.rejects(
+      service.adoptExistingShareLink({
+        websiteId: "site-a",
+        videoId: "video-1",
+        shareLinkId: legacyLink.id,
+        adminId: "admin-1",
+      }),
+      expectConflictCode("CANONICAL_EVIDENCE_INCOMPLETE"),
+    );
+    assert.equal(prisma.canonicals.size, 0);
+    assert.equal(prisma.audits.length, 0);
+    assert.equal(prisma.shareLinks.size, 1, "legacy link is untouched");
+    assert.equal(
+      prisma.shareLinkVideos.length,
+      1,
+      "legacy relation is untouched",
+    );
+  });
+});
+
+describe("non-database canonical evidence regression", () => {
+  it("preserves DIRECT_URL identity without inventing a byte checksum", async () => {
+    const { prisma, service } = createService();
+    const video = prisma.videos.get("video-1")!;
+    prisma.videos.set("video-1", {
+      ...video,
+      sourceType: "DIRECT_URL",
+      playbackUrl: "https://media.example.test/video.mp4",
+      localFileAsset: null,
+      binaryAsset: null,
+    });
+
+    const created = await service.createOrGetCanonical(
+      "site-a",
+      "video-1",
+      "admin-1",
+    );
+    const snapshot = created.evidenceSnapshot as CanonicalEvidenceSnapshot;
+    assert.equal(snapshot.sourceType, "DIRECT_URL");
+    assert.equal(snapshot.playbackUrl, "https://media.example.test/video.mp4");
+    assert.equal(snapshot.checksumSha256, null);
+    assert.equal(snapshot.sizeBytes, null);
+    assert.equal(snapshot.mimeType, null);
+    assert.equal(
+      (await service.createOrGetCanonical("site-a", "video-1", "admin-1"))
+        .outcome,
+      "REUSED",
     );
   });
 });

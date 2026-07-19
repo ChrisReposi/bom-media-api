@@ -31,7 +31,8 @@ GET  /api/v1/admin/websites/:websiteId/videos/:videoId/canonical-share-link   (r
   alias in `publicUrl` is the public credential used by this workflow.
 - Stable conflict codes: `CANONICAL_LINK_REVOKED`, `CANONICAL_LINK_INACTIVE`,
   `CANONICAL_DOMAIN_UNAVAILABLE`, `CANONICAL_EVIDENCE_DRIFT`,
-  `CANONICAL_VIDEO_NOT_SHAREABLE`. No silent replacement, ever.
+  `CANONICAL_EVIDENCE_INCOMPLETE`, `CANONICAL_VIDEO_NOT_SHAREABLE`. No silent
+  replacement, ever.
 
 At creation time the API generates a raw token only transiently in memory to
 calculate the stored `tokenHash`, then discards it before response
@@ -40,12 +41,21 @@ metadata. The generic review-bundle endpoint retains its legacy one-time
 `rawToken` response. Public resolution remains alias-first with the legacy
 `tokenHash` fallback unchanged. Gate 2 verification did not access Production.
 
-Gate 3A adds a nullable, persisted SHA-256 for the exact bytes stored in each
-`VideoBinaryAsset`. New DB_BLOB uploads and replacements populate it; legacy
-rows may remain null and no Production backfill was run. The checksum supports
-integrity comparison, not ownership proof. Canonical evidence does not consume
-this DB_BLOB field in Gate 3A; selecting it, defining legacy-null behavior, and
-using it for fingerprint/drift comparison are explicitly deferred to Gate 3B.
+The DB_BLOB evidence snapshot selects the nullable SHA-256 persisted on
+`VideoBinaryAsset` together with its size and MIME. The fingerprint includes
+that checksum, so replacing bytes with different content is detected even
+when size and MIME are unchanged. Size plus MIME is never accepted as an
+integrity substitute. New DB_BLOB uploads and replacements populate the hash;
+a legacy null-checksum DB_BLOB returns `409 CANONICAL_EVIDENCE_INCOMPLETE`
+before create/adoption writes, and an existing incomplete mapping is not
+silently regenerated or reused. No blob scan, automatic backfill, Gate 3C
+database proof, or Production access occurred in Gate 3B.
+
+LOCAL_FILE continues to use its persisted file checksum. DIRECT_URL, provider
+upload (including Cloudinary), and EMBED retain their URL/provider identity
+fields; those identifiers support deterministic comparison but do not prove
+that remote bytes behind an unchanged identifier are immutable. Checksums are
+integrity evidence, not ownership or copyright proof.
 
 ## Mutation policy while a canonical mapping exists
 
@@ -53,7 +63,7 @@ using it for fingerprint/drift comparison are explicitly deferred to Gate 3B.
 |---|---|
 | thumbnail/description/filterKey/viewCount edits | ALLOWED_WITHOUT_DRIFT |
 | title / duration / publishedAt / playback / provider / embed identity edit | MARKS_DRIFT → POST returns `CANONICAL_EVIDENCE_DRIFT` until owner review |
-| LOCAL_FILE / DB_BLOB binary replacement | MARKS_DRIFT (checksum/size change) |
+| LOCAL_FILE / DB_BLOB binary replacement | MARKS_DRIFT (DB_BLOB detects checksum change even with unchanged size/MIME) |
 | video disable / assignment deactivate | OWNER action; POST returns `CANONICAL_VIDEO_NOT_SHAREABLE`; URL preserved |
 | video purge | BLOCKED (`VIDEO_HAS_CANONICAL_SHARE_LINK`, DB FK Restrict backs it) |
 | domain host rename / unassign | BLOCKED (`DOMAIN_HAS_ACTIVE_CANONICAL_LINKS`); disable/transfer are transitively blocked because they require unassign first; domain delete is DB-Restricted |
@@ -86,8 +96,11 @@ yarn remediate:local:adopt-canonical \
 
 Adoption verifies: link belongs to the website, contains exactly the target
 video, has an alias, no expiry/maxViews, ACTIVE assignment, READY/playable
-video, a known ACTIVE domain, and no existing mapping; it snapshots evidence
-and writes the audit row in the same transaction. There is no bulk mode.
+video, a known ACTIVE domain, and no existing mapping. A DB_BLOB must already
+have a valid persisted SHA-256; legacy null evidence is refused before the
+mapping or success audit write. Successful adoption snapshots evidence and
+writes the audit row in the same transaction. There is no bulk mode and no
+automatic blob read/backfill.
 
 ## Destructive proof isolation (mandatory after the 2026-07-19 dev-DB incident)
 

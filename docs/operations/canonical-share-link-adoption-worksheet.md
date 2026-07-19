@@ -18,6 +18,7 @@ Candidate link (masked id/alias):
 Candidate has expiry/maxViews?      yes → reject candidate or clear limits first
 Candidate alias present?            required
 Assignment ACTIVE + video READY?    required
+DB_BLOB persisted SHA-256 present?  required; null → DEFER for explicit remediation
 Decision:                           ADOPT <link> | CREATE_NEW | DEFER
 Executed (command + date + operator):
 ```
@@ -33,6 +34,10 @@ Decision rules:
   cited link is revoked, this is an OWNER incident decision — document it.
 - `MULTI_VIDEO_ONLY`: bundles cannot be canonical; CREATE_NEW.
 - `NO_LINKS`: CREATE_NEW via the canonical endpoint when needed.
+- Any `DB_BLOB` with a null checksum: `DEFER`. Size plus MIME is not an
+  integrity substitute; adoption must not read/backfill the blob or write a
+  canonical mapping implicitly. Explicit bounded remediation is a Gate 3C
+  operator decision.
 
 Every executed adoption writes an `CANONICAL_SHARE_LINK_ADOPT` audit row in
 the same transaction. Production execution happens only after a database

@@ -12,6 +12,23 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-19 — Gate 3B: DB_BLOB checksum integrated into canonical evidence
+
+### Changed
+
+- Canonical evidence now selects `VideoBinaryAsset.checksumSha256` with DB size/MIME through an explicit source-specific policy. The deterministic fingerprint includes the checksum, so equal-size/equal-MIME byte replacement produces `CANONICAL_EVIDENCE_DRIFT`; LOCAL_FILE and remote/provider/embed identity behavior remains source-specific.
+- Added `409 CANONICAL_EVIDENCE_INCOMPLETE`. A DB_BLOB with a null/malformed persisted checksum cannot create, adopt, reuse, or GET a canonical mapping; pre-release stored DB snapshots without a valid checksum are also refused rather than regenerated. Validation occurs before create/adoption mapping and success-audit writes. Size/MIME are not substituted and no blob is read for backfill.
+- Added focused DB snapshot, unchanged-content, equal-size replacement, legacy-null no-write, adoption no-write and DIRECT_URL regression tests. Updated Swagger conflict docs, runbook and adoption worksheet. No schema/migration/public-media contract/raw-token change.
+
+### Verified
+
+- Focused canonical suite: 26/26 pass. Full API suite: 170/170 pass across 46 suites. `db:local:generate`, `db:local:validate`, `db:local:status` (19 migrations, schema up to date), `typecheck`, `build`, repository `format:check`, focused test formatting and `git diff --check` pass. Lint remains 0 errors with the existing 90 `consistent-type-imports` warnings.
+- No Production access, development-data mutation, backfill, destructive FK proof, Gate 3C, Gate 4, browser test, push, merge or deploy occurred.
+
+### Pending
+
+- Gate 3C must provide the isolated guarded MySQL proof and any explicit bounded legacy remediation workflow. Gate 4 public parser audit remains separate.
+
 ## 2026-07-19 — Gate 3A: persisted DB_BLOB SHA-256 checksums
 
 ### Changed

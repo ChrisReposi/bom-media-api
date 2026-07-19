@@ -13,9 +13,11 @@ import {
   DomainStatus,
   Prisma,
   ShareLinkStatus,
+  VideoSourceType,
   WebsiteStatus,
   type CanonicalVideoShareLink,
   type VideoAsset,
+  type VideoBinaryAsset,
   type VideoLocalFileAsset,
 } from "../generated/prisma/client";
 import { hashShareToken } from "../public/utils/share-token.util";
@@ -32,27 +34,37 @@ import {
 } from "./utils/share-url.util";
 
 const CANONICAL_CREATE_MAX_ATTEMPTS = 5;
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
 
 export const CANONICAL_ERROR_CODES = {
   inactive: "CANONICAL_LINK_INACTIVE",
   revoked: "CANONICAL_LINK_REVOKED",
   domainUnavailable: "CANONICAL_DOMAIN_UNAVAILABLE",
   evidenceDrift: "CANONICAL_EVIDENCE_DRIFT",
+  evidenceIncomplete: "CANONICAL_EVIDENCE_INCOMPLETE",
   videoNotShareable: "CANONICAL_VIDEO_NOT_SHAREABLE",
   notFound: "CANONICAL_LINK_NOT_FOUND",
 } as const;
 
-type VideoWithLocalFile = VideoAsset & {
+type VideoWithEvidenceAssets = VideoAsset & {
   localFileAsset: Pick<
     VideoLocalFileAsset,
     "checksumSha256" | "sizeBytes" | "mimeType"
   > | null;
-  binaryAsset: { sizeBytes: bigint; mimeType: string } | null;
+  binaryAsset: Pick<
+    VideoBinaryAsset,
+    "checksumSha256" | "sizeBytes" | "mimeType"
+  > | null;
 };
 
+type SourceIntegrityEvidence = Pick<
+  CanonicalEvidenceSnapshot,
+  "checksumSha256" | "sizeBytes" | "mimeType"
+>;
+
 /**
- * Evidence-critical identity, covering every source type: LOCAL_FILE carries
- * checksum/size/mime; DB_BLOB carries binary size/mime; DIRECT_URL/CLOUDINARY
+ * Evidence-critical identity, covering every source type: LOCAL_FILE and
+ * DB_BLOB carry source-specific checksum/size/mime; DIRECT_URL/provider upload
  * carry playbackUrl/providerAssetId; EMBED carries provider/url/publicId.
  * Fields prove content *integrity*, never copyright ownership. `snapshotAt`
  * is informational only and excluded from the deterministic fingerprint.
@@ -108,7 +120,10 @@ export class CanonicalShareLinkService {
       });
     }
 
-    const currentFingerprint = await this.computeCurrentFingerprint(videoId);
+    const currentFingerprint = await this.computeCurrentFingerprint(
+      canonical,
+      videoId,
+    );
     return this.toResponse(canonical, {
       outcome: "REUSED",
       evidenceDrift:
@@ -518,18 +533,19 @@ export class CanonicalShareLinkService {
       });
     }
 
-    if (canonical.evidenceFingerprint !== null) {
-      const currentFingerprint = await this.computeCurrentFingerprint(videoId);
-      if (
-        currentFingerprint !== null &&
-        currentFingerprint !== canonical.evidenceFingerprint
-      ) {
-        throw new ConflictException({
-          message:
-            "The video's evidence-critical identity changed since the canonical snapshot. Owner review is required before reusing this canonical URL.",
-          code: CANONICAL_ERROR_CODES.evidenceDrift,
-        });
-      }
+    const currentFingerprint = await this.computeCurrentFingerprint(
+      canonical,
+      videoId,
+    );
+    if (
+      canonical.evidenceFingerprint !== null &&
+      currentFingerprint !== canonical.evidenceFingerprint
+    ) {
+      throw new ConflictException({
+        message:
+          "The video's evidence-critical identity changed since the canonical snapshot. Owner review is required before reusing this canonical URL.",
+        code: CANONICAL_ERROR_CODES.evidenceDrift,
+      });
     }
   }
 
@@ -542,15 +558,20 @@ export class CanonicalShareLinkService {
         localFileAsset: {
           select: { checksumSha256: true, sizeBytes: true, mimeType: true },
         },
-        binaryAsset: { select: { sizeBytes: true, mimeType: true } },
+        binaryAsset: {
+          select: {
+            checksumSha256: true,
+            sizeBytes: true,
+            mimeType: true,
+          },
+        },
       },
-    })) as VideoWithLocalFile | null;
+    })) as VideoWithEvidenceAssets | null;
     if (video === null) {
       throw new NotFoundException("Video not found.");
     }
 
-    const sizeBytes =
-      video.localFileAsset?.sizeBytes ?? video.binaryAsset?.sizeBytes ?? null;
+    const integrity = this.resolveSourceIntegrityEvidence(video);
 
     return {
       videoId: video.id,
@@ -563,12 +584,41 @@ export class CanonicalShareLinkService {
       embedProvider: video.embedProvider,
       embedUrl: video.embedUrl,
       embedPublicId: video.embedPublicId,
-      checksumSha256: video.localFileAsset?.checksumSha256 ?? null,
-      sizeBytes: sizeBytes?.toString() ?? null,
-      mimeType:
-        video.localFileAsset?.mimeType ?? video.binaryAsset?.mimeType ?? null,
+      ...integrity,
       snapshotAt: new Date().toISOString(),
     };
+  }
+
+  private resolveSourceIntegrityEvidence(
+    video: VideoWithEvidenceAssets,
+  ): SourceIntegrityEvidence {
+    if (video.sourceType === VideoSourceType.LOCAL_FILE) {
+      return {
+        checksumSha256: video.localFileAsset?.checksumSha256 ?? null,
+        sizeBytes: video.localFileAsset?.sizeBytes.toString() ?? null,
+        mimeType: video.localFileAsset?.mimeType ?? null,
+      };
+    }
+
+    if (video.sourceType === VideoSourceType.DB_BLOB) {
+      const binary = video.binaryAsset;
+      if (
+        binary === null ||
+        binary.checksumSha256 === null ||
+        !SHA256_HEX_PATTERN.test(binary.checksumSha256)
+      ) {
+        this.throwEvidenceIncomplete();
+      }
+      return {
+        checksumSha256: binary.checksumSha256,
+        sizeBytes: binary.sizeBytes.toString(),
+        mimeType: binary.mimeType,
+      };
+    }
+
+    // Remote/provider identifiers remain useful deterministic evidence, but
+    // they do not prove that bytes served behind the identifier are immutable.
+    return { checksumSha256: null, sizeBytes: null, mimeType: null };
   }
 
   /**
@@ -587,13 +637,50 @@ export class CanonicalShareLinkService {
   }
 
   private async computeCurrentFingerprint(
+    canonical: CanonicalWithRelations,
     videoId: string,
-  ): Promise<string | null> {
-    try {
-      return this.computeFingerprint(await this.buildEvidenceSnapshot(videoId));
-    } catch {
-      return null;
+  ): Promise<string> {
+    const currentSnapshot = await this.buildEvidenceSnapshot(videoId);
+    this.assertStoredEvidenceComplete(
+      canonical.evidenceSnapshotJson,
+      currentSnapshot.sourceType,
+    );
+    return this.computeFingerprint(currentSnapshot);
+  }
+
+  private assertStoredEvidenceComplete(
+    snapshotValue: Prisma.JsonValue | null,
+    currentSourceType: string,
+  ): void {
+    const snapshot =
+      typeof snapshotValue === "object" &&
+      snapshotValue !== null &&
+      !Array.isArray(snapshotValue)
+        ? snapshotValue
+        : null;
+    const storedSourceType = snapshot?.sourceType;
+    const storedChecksum = snapshot?.checksumSha256;
+    const storedDbChecksumComplete =
+      storedSourceType === VideoSourceType.DB_BLOB &&
+      typeof storedChecksum === "string" &&
+      SHA256_HEX_PATTERN.test(storedChecksum);
+
+    if (
+      (storedSourceType === VideoSourceType.DB_BLOB &&
+        !storedDbChecksumComplete) ||
+      (currentSourceType === VideoSourceType.DB_BLOB &&
+        !storedDbChecksumComplete)
+    ) {
+      this.throwEvidenceIncomplete();
     }
+  }
+
+  private throwEvidenceIncomplete(): never {
+    throw new ConflictException({
+      message:
+        "Canonical evidence is incomplete because this database video has no valid persisted SHA-256 checksum. Operator remediation is required.",
+      code: CANONICAL_ERROR_CODES.evidenceIncomplete,
+    });
   }
 
   private isSerializationConflict(error: unknown): boolean {

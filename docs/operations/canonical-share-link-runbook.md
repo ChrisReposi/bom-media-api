@@ -27,10 +27,18 @@ GET  /api/v1/admin/websites/:websiteId/videos/:videoId/canonical-share-link   (r
 ```
 
 - Same pair → same ShareLink id, alias, and identical publicUrl; outcome
-  `REUSED`; `rawToken` is returned only on first creation.
+  `REUSED`. Canonical callers never receive `rawToken` or `tokenHash`; the
+  alias in `publicUrl` is the public credential used by this workflow.
 - Stable conflict codes: `CANONICAL_LINK_REVOKED`, `CANONICAL_LINK_INACTIVE`,
   `CANONICAL_DOMAIN_UNAVAILABLE`, `CANONICAL_EVIDENCE_DRIFT`,
   `CANONICAL_VIDEO_NOT_SHAREABLE`. No silent replacement, ever.
+
+At creation time the API generates a raw token only transiently in memory to
+calculate the stored `tokenHash`, then discards it before response
+serialization. Neither value is logged or included in canonical audit
+metadata. The generic review-bundle endpoint retains its legacy one-time
+`rawToken` response. Public resolution remains alias-first with the legacy
+`tokenHash` fallback unchanged. Gate 2 verification did not access Production.
 
 ## Mutation policy while a canonical mapping exists
 

@@ -165,6 +165,13 @@ describe("share-link website scope", () => {
     );
 
     assert.equal(result.shareLink.videos[0]?.videoId, "video-1");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(result, "rawToken"),
+      true,
+      "generic review bundles keep their one-time raw-token contract",
+    );
+    assert.equal(typeof result.rawToken, "string");
+    assert.ok(result.rawToken.length > 0);
     assert.deepEqual(harness.counts(), {
       transactionCalls: 1,
       shareLinkCreateCalls: 1,

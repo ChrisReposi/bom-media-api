@@ -355,6 +355,18 @@ function expectConflictCode(code: string) {
   };
 }
 
+function assertCanonicalResponseHasNoSecrets(response: object): void {
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(response, "rawToken"),
+    false,
+  );
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(response, "tokenHash"),
+    false,
+  );
+  assert.equal(JSON.stringify(response).includes("tokenHash"), false);
+}
+
 // ---------------------------------------------------------------------------
 // Pure URL and fingerprint behavior
 // ---------------------------------------------------------------------------
@@ -449,7 +461,7 @@ describe("evidence fingerprint", () => {
 // ---------------------------------------------------------------------------
 
 describe("canonical create-or-get", () => {
-  it("creates once, then reuses byte-for-byte the same URL without a new token", async () => {
+  it("creates once, then reuses byte-for-byte the same alias URL without exposing a token", async () => {
     const { service } = createService();
 
     const created = await service.createOrGetCanonical(
@@ -459,7 +471,8 @@ describe("canonical create-or-get", () => {
     );
     assert.equal(created.outcome, "CREATED");
     assert.equal(created.isCanonical, true);
-    assert.ok(created.rawToken, "creator receives the raw token once");
+    assertCanonicalResponseHasNoSecrets(created);
+    assert.ok(created.alias);
     assert.equal(
       created.publicUrl,
       `https://plushcomedystudios.com/#/s/${encodeURIComponent(created.alias)}/videos`,
@@ -471,7 +484,7 @@ describe("canonical create-or-get", () => {
       "admin-1",
     );
     assert.equal(reused.outcome, "REUSED");
-    assert.equal(reused.rawToken, undefined);
+    assertCanonicalResponseHasNoSecrets(reused);
     assert.equal(reused.alias, created.alias);
     assert.equal(reused.publicUrl, created.publicUrl);
     assert.equal(reused.shareLink.id, created.shareLink.id);
@@ -604,11 +617,15 @@ describe("canonical create-or-get", () => {
     const { prisma, service } = createService();
     await service.createOrGetCanonical("site-a", "video-1", "x");
     const clean = await service.getCanonical("site-a", "video-1");
+    assertCanonicalResponseHasNoSecrets(clean);
+    assert.ok(clean.alias);
+    assert.ok(clean.publicUrl);
     assert.equal(clean.evidenceDrift, false);
 
     const video = prisma.videos.get("video-1")!;
     (video as { title: string }).title = "Edited title";
     const drifted = await service.getCanonical("site-a", "video-1");
+    assertCanonicalResponseHasNoSecrets(drifted);
     assert.equal(drifted.evidenceDrift, true);
     assert.equal(drifted.outcome, "REUSED");
   });

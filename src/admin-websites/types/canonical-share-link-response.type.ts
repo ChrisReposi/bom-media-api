@@ -31,12 +31,6 @@ export class CanonicalShareLinkResponse {
   @ApiProperty({ example: "G3tqak0" })
   alias!: string;
 
-  @ApiPropertyOptional({
-    description:
-      "Present only on outcome CREATED. Tokens are never recoverable from storage, so REUSED responses never include one.",
-  })
-  rawToken?: string;
-
   @ApiPropertyOptional({ type: Object, nullable: true })
   evidenceSnapshot!: Record<string, unknown> | null;
 

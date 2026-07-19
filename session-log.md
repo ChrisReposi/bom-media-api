@@ -12,6 +12,24 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-19 — Gate 2: canonical raw-token exposure removed
+
+### Changed
+
+- Canonical CREATED, REUSED, adoption and GET responses no longer define or serialize `rawToken`; the Swagger response type and canonical POST description now document the alias-only contract. The creation attempt keeps a generated token only in local memory long enough to calculate the persisted `tokenHash`.
+- Generic review bundles (`POST /admin/websites/:websiteId/share-links`) retain their legacy one-time `rawToken` response. Public resolution remains alias-first with the legacy token-hash fallback unchanged; canonical URL/evidence behavior is unchanged.
+- Regression assertions prove canonical CREATED/REUSED/GET objects have no own `rawToken`/`tokenHash`, while the generic response still owns a non-empty `rawToken`; the existing short-alias public-watch test remains green. Canonical runbook updated. No schema or migration change.
+
+### Verified
+
+- Targeted API canonical/generic/public tests: 36/36 pass. Full suite: 159/159 pass.
+- `yarn db:local:generate`, `db:local:validate`, `db:local:status` (18 migrations, up to date), `typecheck`, `build`, `format:check`, and `git diff --check` pass. Lint: 0 errors, 90 pre-existing `consistent-type-imports` warnings.
+- Paired Admin mutation proof: temporarily reintroducing canonical `rawToken` made the intended contract test fail; the mutation was removed and the test returned green. Production was not accessed.
+
+### Pending
+
+- Gate 3 and Gate 4 were not started. Browser and deployed-artifact verification were not run in Gate 2.
+
 ## 2026-07-19 — Gate 1.5: destructive database proofs isolated
 
 ### Changed

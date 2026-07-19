@@ -111,7 +111,6 @@ export class CanonicalShareLinkService {
     const currentFingerprint = await this.computeCurrentFingerprint(videoId);
     return this.toResponse(canonical, {
       outcome: "REUSED",
-      rawToken: undefined,
       evidenceDrift:
         canonical.evidenceFingerprint !== null &&
         currentFingerprint !== canonical.evidenceFingerprint,
@@ -130,7 +129,6 @@ export class CanonicalShareLinkService {
       await this.assertReusable(existing, websiteId, videoId);
       return this.toResponse(existing, {
         outcome: "REUSED",
-        rawToken: undefined,
         evidenceDrift: false,
       });
     }
@@ -182,16 +180,15 @@ export class CanonicalShareLinkService {
           await this.assertReusable(raced, websiteId, videoId);
           return this.toResponse(raced, {
             outcome: "REUSED",
-            rawToken: undefined,
             evidenceDrift: false,
           });
         }
       }
 
-      const rawToken = generateShareToken();
+      const transientToken = generateShareToken();
       const alias = generateShareAlias();
       const tokenHash = hashShareToken({
-        token: rawToken,
+        token: transientToken,
         pepper: tokenPepper,
       });
 
@@ -261,7 +258,6 @@ export class CanonicalShareLinkService {
 
         return this.toResponse(created as CanonicalWithRelations, {
           outcome: "CREATED",
-          rawToken,
           evidenceDrift: false,
         });
       } catch (error) {
@@ -271,7 +267,6 @@ export class CanonicalShareLinkService {
             await this.assertReusable(winner, websiteId, videoId);
             return this.toResponse(winner, {
               outcome: "REUSED",
-              rawToken: undefined,
               evidenceDrift: false,
             });
           }
@@ -425,7 +420,6 @@ export class CanonicalShareLinkService {
 
     return this.toResponse(adopted as CanonicalWithRelations, {
       outcome: "CREATED",
-      rawToken: undefined,
       evidenceDrift: false,
     });
   }
@@ -617,7 +611,6 @@ export class CanonicalShareLinkService {
     canonical: CanonicalWithRelations,
     options: {
       outcome: "CREATED" | "REUSED";
-      rawToken: string | undefined;
       evidenceDrift: boolean;
     },
   ): CanonicalShareLinkResponse {
@@ -641,7 +634,6 @@ export class CanonicalShareLinkService {
       ),
       publicUrl,
       alias: canonical.shareLink.alias ?? "",
-      ...(options.rawToken ? { rawToken: options.rawToken } : {}),
       evidenceSnapshot:
         (canonical.evidenceSnapshotJson as CanonicalEvidenceSnapshot | null) ??
         null,

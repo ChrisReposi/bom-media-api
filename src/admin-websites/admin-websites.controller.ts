@@ -528,7 +528,7 @@ export class AdminWebsitesController {
   @ApiOperation({
     summary: "Create-or-get canonical share link (idempotent)",
     description:
-      "Same website+video always returns the same alias and byte-for-byte the same publicUrl. No expiry, maxViews, caller alias, or caller token are accepted. rawToken is returned only on first creation.",
+      "Same website+video always returns the same alias and byte-for-byte the same publicUrl. No expiry, maxViews, caller alias, or caller token are accepted. Canonical callers receive the alias-based URL without any raw token.",
   })
   @ApiCreatedResponse({ type: CanonicalShareLinkResponse })
   @ApiBadRequestResponse()

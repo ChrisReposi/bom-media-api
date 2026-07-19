@@ -12,6 +12,25 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-19 — Atomic bulk website-video assignment management
+
+### Changed
+
+- Added paginated `GET /admin/websites/:websiteId/video-assignment-options`. It returns active assignments (including non-READY/non-playable rows that must remain removable), eligible unassigned candidates, per-item lifecycle flags, and the authoritative full `activeAssignedVideoIds` set without binary data.
+- Added OWNER/ADMIN-only `PATCH /admin/websites/:websiteId/video-assignments`. Disjoint assign/unassign deltas are normalized and bounded to 100 total IDs; every video is validated before mutation, DISABLED rows are reactivated, removals become DISABLED, and assignment writes plus bounded audit metadata commit in one Serializable transaction with limited conflict retry.
+- Unassignment does not delete or rotate canonical mappings. Existing canonical/public paths continue to require an ACTIVE website assignment. Legacy website-video GET/PUT/single-assign routes and share-link contracts remain unchanged; no Prisma schema or migration changed.
+- Added focused coverage for authoritative options/pagination, assigned-but-ineligible visibility, exact read/write roles, multi-assign/unassign/reactivation, idempotency, overlap/duplicate/missing validation, zero writes on invalid input, transactional audit and canonical-mapping preservation. Updated the assignment operations runbook.
+
+### Verified
+
+- Prisma generate/validate/status PASS; all 19 migrations are applied and the local schema is up to date. Typecheck, build, repository format check and `git diff --check` PASS.
+- Lint PASS with 0 errors and 92 existing/runtime-metadata `consistent-type-imports` warnings. Full API tests PASS: 179/179 across 49 suites.
+- No browser test, destructive database proof, Production access, push, merge or deploy occurred.
+
+### Pending
+
+- Run the Admin browser acceptance in staging for keyboard/focus behavior, large paginated candidate sets, same-session assignment races and canonical playback after disable/reactivate. Production remains unverified.
+
 ## 2026-07-19 — Gate 3C-1: isolated MySQL/API proof for canonical DB_BLOB evidence
 
 ### Changed
@@ -132,7 +151,7 @@ This file is the persistent implementation log for Codex and future assistants.
 ### Changed
 
 - Schema: additive `CanonicalVideoShareLink` (`@@unique(websiteId, videoId)`, unique `shareLinkId`, snapshotted host/protocol, evidence fingerprint/snapshot; video+domain FKs Restrict, website+shareLink Cascade). Migration `20260718113156_canonical_video_share_links` (applied local only).
-- `CanonicalShareLinkService`: idempotent create-or-get (Serializable tx, DB unique as arbiter, alias/token collision + P2034 retry, raced-loser reload → REUSED), read path with `evidenceDrift`, owner adoption operation (audit in-transaction), domain guard helper. Stable codes: CANONICAL_LINK_{REVOKED,INACTIVE}, CANONICAL_DOMAIN_UNAVAILABLE, CANONICAL_EVIDENCE_DRIFT, CANONICAL_VIDEO_NOT_SHAREABLE.
+- `CanonicalShareLinkService`: idempotent create-or-get (Serializable tx, DB unique as arbiter, alias/token collision + P2034 retry, raced-loser reload → REUSED), read path with `evidenceDrift`, owner adoption operation (audit in-transaction), domain guard helper. Stable codes: CANONICAL*LINK*{REVOKED,INACTIVE}, CANONICAL_DOMAIN_UNAVAILABLE, CANONICAL_EVIDENCE_DRIFT, CANONICAL_VIDEO_NOT_SHAREABLE.
 - Endpoints: GET/POST `/admin/websites/:websiteId/videos/:videoId/canonical-share-link` (POST accepts no body — no expiry/maxViews/caller alias/token; rawToken only on CREATED).
 - Guards: purge blocked while canonical exists (`VIDEO_HAS_CANONICAL_SHARE_LINK`); domain host-rename and unassign blocked (`DOMAIN_HAS_ACTIVE_CANONICAL_LINKS`); disable/transfer transitively blocked; delete DB-Restricted.
 - **Latent bug fixed for all share-link retries:** with `@prisma/adapter-mariadb`, P2002 has no `meta.target` — the constraint arrives only in `meta.driverAdapterError.cause.constraint.index` (proven by probing MySQL 1062 through the live adapter). New `share-link-errors.util.ts` consults both shapes; the pre-existing alias-collision retry in `createShareLink` silently never matched adapter-shaped errors before this.

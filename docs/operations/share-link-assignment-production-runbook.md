@@ -50,6 +50,37 @@ Never infer ownership merely because a video appears in an old `ShareLinkVideo` 
 5. Re-run the read-only audit, then smoke the intended host, website-scoped picker, share-link create and public watch.
 6. Compensate by reverting only the approved assignment or revoking the newly created link. Do not reset the database.
 
+## Bulk assignment management contract
+
+The Dashboard assignment dialog uses two additive admin endpoints:
+
+```txt
+GET   /api/v1/admin/websites/:websiteId/video-assignment-options
+PATCH /api/v1/admin/websites/:websiteId/video-assignments
+```
+
+The read endpoint returns every ACTIVE assignment in its authoritative
+`activeAssignedVideoIds` metadata, including assigned videos that are no longer
+READY/playable. Its paginated items contain active assignments plus eligible
+unassigned candidates; binary data and credentials are never selected or
+returned. OWNER, ADMIN and STAFF may read the state.
+
+The PATCH endpoint is OWNER/ADMIN-only and accepts bounded, disjoint
+`assignVideoIds` and `unassignVideoIds` arrays (100 total IDs maximum). It
+validates the entire request, reactivates existing DISABLED rows, marks removed
+rows DISABLED, writes one bounded audit event, and commits all assignment
+changes in one Serializable transaction. Invalid input produces no assignment
+write.
+
+Unassignment does not delete or rotate a canonical mapping. The canonical and
+public-watch paths continue to enforce `WebsiteVideo.ACTIVE`, so an existing
+canonical URL becomes non-shareable until an operator explicitly reactivates
+the assignment. This preserves the recorded canonical identity while keeping
+the assignment boundary authoritative.
+
 ## Deployment and monitoring
 
 Deploy the additive API list/error/assignment contract before the Admin Web. Audit and remediate approved legacy data before relying on existing links. Monitor `VIDEO_NOT_ACTIVE_FOR_WEBSITE` responses, public generic-invalid rates and assignment audit events. The additive endpoint can remain during a frontend rollback; never roll back by weakening the backend invariant.
+
+No Production database or deployed artifact was accessed while implementing
+the bulk assignment contract.

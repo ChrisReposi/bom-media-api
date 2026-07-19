@@ -52,6 +52,8 @@ import { ListDomainsQueryDto } from "./dto/list-domains-query.dto";
 import { ListDomainGroupsQueryDto } from "./dto/list-domain-groups-query.dto";
 import { ListWebsitesQueryDto } from "./dto/list-websites-query.dto";
 import { ListWebsiteVideosQueryDto } from "./dto/list-website-videos-query.dto";
+import { ListWebsiteVideoAssignmentOptionsQueryDto } from "./dto/list-website-video-assignment-options-query.dto";
+import { UpdateWebsiteVideoAssignmentsDto } from "./dto/update-website-video-assignments.dto";
 import { UpdateDomainDto } from "./dto/update-domain.dto";
 import { UpdateDomainGroupDto } from "./dto/update-domain-group.dto";
 import { UpdateWebsiteDomainDto } from "./dto/update-website-domain.dto";
@@ -62,6 +64,7 @@ import {
   AdminDomainListResponse,
   AdminDomainResponse,
   AdminWebsiteAssignedVideoResponse,
+  AdminWebsiteVideoAssignmentOptionsResponse,
   AdminWebsiteDetailResponse,
   AdminWebsiteDomainResponse,
   AdminWebsiteListResponse,
@@ -69,6 +72,7 @@ import {
   AssignWebsiteVideosResponse,
   DisableDomainGroupResponse,
   DisableWebsiteResponse,
+  UpdateWebsiteVideoAssignmentsResponse,
 } from "./types/admin-website-response.type";
 import {
   AdminShareLinkListResponse,
@@ -441,6 +445,21 @@ export class AdminWebsitesController {
     return this.websitesService.listAssignedVideos(websiteId, query);
   }
 
+  @Get("websites/:websiteId/video-assignment-options")
+  @AdminReadRoles()
+  @ApiOperation({
+    summary: "List authoritative website video assignment options",
+  })
+  @ApiOkResponse({ type: AdminWebsiteVideoAssignmentOptionsResponse })
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  listVideoAssignmentOptions(
+    @Param("websiteId") websiteId: string,
+    @Query() query: ListWebsiteVideoAssignmentOptionsQueryDto,
+  ): Promise<AdminWebsiteVideoAssignmentOptionsResponse> {
+    return this.websitesService.listVideoAssignmentOptions(websiteId, query);
+  }
+
   @Put("websites/:websiteId/videos")
   @AdminWriteRoles()
   @ApiOperation({ summary: "Replace website video assignments" })
@@ -454,6 +473,28 @@ export class AdminWebsitesController {
     @CurrentAdmin() admin: SafeAdminResponse,
   ): Promise<AssignWebsiteVideosResponse> {
     return this.websitesService.assignVideos(websiteId, dto, admin.id);
+  }
+
+  @Patch("websites/:websiteId/video-assignments")
+  @AdminWriteRoles()
+  @ApiOperation({
+    summary: "Atomically assign and unassign multiple website videos",
+  })
+  @ApiOkResponse({ type: UpdateWebsiteVideoAssignmentsResponse })
+  @ApiBadRequestResponse()
+  @ApiUnauthorizedResponse()
+  @ApiNotFoundResponse()
+  @ApiConflictResponse()
+  updateVideoAssignments(
+    @Param("websiteId") websiteId: string,
+    @Body() dto: UpdateWebsiteVideoAssignmentsDto,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<UpdateWebsiteVideoAssignmentsResponse> {
+    return this.websitesService.updateVideoAssignments(
+      websiteId,
+      dto,
+      admin.id,
+    );
   }
 
   @Post("websites/:websiteId/videos/assign")

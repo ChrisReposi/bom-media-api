@@ -33,6 +33,9 @@ import {
 import { hashShareToken } from "../public/utils/share-token.util";
 import type { ActivateWebsiteDomainDto } from "./dto/activate-website-domain.dto";
 import type { AssignWebsiteVideosDto } from "./dto/assign-website-videos.dto";
+import type { ListWebsiteVideoAssignmentOptionsQueryDto } from "./dto/list-website-video-assignment-options-query.dto";
+import type { UpdateWebsiteVideoAssignmentsDto } from "./dto/update-website-video-assignments.dto";
+import { WEBSITE_VIDEO_ASSIGNMENT_BATCH_MAX_IDS } from "./dto/update-website-video-assignments.dto";
 import type { ClaimCurrentWebsiteDomainDto } from "./dto/claim-current-website-domain.dto";
 import type { AssignDomainToWebsiteDto } from "./dto/assign-domain-to-website.dto";
 import type { CreateDomainDto } from "./dto/create-domain.dto";
@@ -59,6 +62,7 @@ import {
   AdminDomainGroupListResponse,
   AdminDomainGroupResponse,
   AdminWebsiteAssignedVideoResponse,
+  AdminWebsiteVideoAssignmentOptionsResponse,
   AdminWebsiteDetailResponse,
   AdminWebsiteDomainResponse,
   AdminWebsiteListResponse,
@@ -66,6 +70,7 @@ import {
   AssignWebsiteVideosResponse,
   DisableDomainGroupResponse,
   DisableWebsiteResponse,
+  UpdateWebsiteVideoAssignmentsResponse,
 } from "./types/admin-website-response.type";
 import type {
   AdminShareLinkListResponse,
@@ -130,6 +135,10 @@ type WebsiteVideoWithVideo = WebsiteVideo & {
   video: VideoWithAdminMediaMetadata;
 };
 
+type VideoAssignmentOptionRecord = VideoWithAdminMediaMetadata & {
+  websiteVideos: Array<Pick<WebsiteVideo, "id" | "status">>;
+};
+
 type VideoWithBinaryAssetMetadata = VideoAsset & {
   binaryAsset?: VideoBinaryAssetMetadata | null;
   localFileAsset?: VideoLocalFileAssetMetadata | null;
@@ -162,6 +171,7 @@ type AuditAction =
   | "WEBSITE_DOMAIN_CLAIM_CURRENT"
   | "WEBSITE_VIDEOS_ASSIGN"
   | "WEBSITE_VIDEO_ASSIGN"
+  | "WEBSITE_VIDEO_ASSIGNMENTS_UPDATE"
   | "SHARE_LINK_CREATE"
   | "SHARE_LINK_REVOKE";
 
@@ -1299,6 +1309,126 @@ export class AdminWebsitesService {
     };
   }
 
+  async listVideoAssignmentOptions(
+    websiteId: string,
+    query: ListWebsiteVideoAssignmentOptionsQueryDto = {},
+  ): Promise<AdminWebsiteVideoAssignmentOptionsResponse> {
+    await this.ensureWebsiteExists(websiteId);
+
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 24;
+    const activeAssignmentWhere: Prisma.WebsiteVideoWhereInput = {
+      websiteId,
+      status: AssignmentStatus.ACTIVE,
+    };
+    const eligibleCandidateWhere =
+      this.buildEligibleAssignmentCandidateWhere(websiteId);
+
+    if (isShortAdminVideoSearch(query.search ?? "")) {
+      const [activeAssignments, eligibleCandidateTotal] =
+        await this.prisma.$transaction([
+          this.prisma.websiteVideo.findMany({
+            where: activeAssignmentWhere,
+            orderBy: [{ sortOrder: "asc" }, { videoId: "asc" }],
+            select: { videoId: true },
+          }),
+          this.prisma.videoAsset.count({ where: eligibleCandidateWhere }),
+        ]);
+
+      return {
+        items: [],
+        meta: {
+          page,
+          limit,
+          total: 0,
+          totalPages: 0,
+          activeAssignmentTotal: activeAssignments.length,
+          eligibleCandidateTotal,
+          activeAssignedVideoIds: activeAssignments.map(
+            (assignment) => assignment.videoId,
+          ),
+        },
+      };
+    }
+
+    const optionWhere = this.buildVideoAssignmentOptionWhere(websiteId, query);
+    const [total, activeAssignments, eligibleCandidateTotal, videos] =
+      await this.prisma.$transaction([
+        this.prisma.videoAsset.count({ where: optionWhere }),
+        this.prisma.websiteVideo.findMany({
+          where: activeAssignmentWhere,
+          orderBy: [{ sortOrder: "asc" }, { videoId: "asc" }],
+          select: { videoId: true },
+        }),
+        this.prisma.videoAsset.count({ where: eligibleCandidateWhere }),
+        this.prisma.videoAsset.findMany({
+          where: optionWhere,
+          include: {
+            websiteVideos: {
+              where: { websiteId },
+              select: { id: true, status: true },
+              take: 1,
+            },
+            binaryAsset: { select: { mimeType: true, sizeBytes: true } },
+            localFileAsset: {
+              select: {
+                mimeType: true,
+                sizeBytes: true,
+                checksumSha256: true,
+                originalFilename: true,
+              },
+            },
+            localThumbnailAsset: {
+              select: {
+                mimeType: true,
+                sizeBytes: true,
+                checksumSha256: true,
+                originalFilename: true,
+              },
+            },
+          },
+          orderBy: [
+            { [query.sortBy ?? "createdAt"]: query.sortOrder ?? "desc" },
+            { id: "asc" },
+          ],
+          skip: (page - 1) * limit,
+          take: limit,
+        }),
+      ]);
+
+    return {
+      items: (videos as VideoAssignmentOptionRecord[]).map((video) => {
+        const assignmentStatus = video.websiteVideos[0]?.status ?? null;
+        const isAssigned = assignmentStatus === AssignmentStatus.ACTIVE;
+        const isEligible = this.isPublicPlayableVideo(video);
+
+        return {
+          video: this.toAdminVideoResponse(video),
+          isAssigned,
+          assignmentStatus,
+          canAssign: !isAssigned && isEligible,
+          canUnassign: isAssigned,
+          blockedReason: isEligible
+            ? null
+            : video.status !== VideoStatus.READY
+              ? "VIDEO_NOT_READY"
+              : "VIDEO_NOT_PLAYABLE",
+        };
+      }),
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages: total === 0 ? 0 : Math.ceil(total / limit),
+        activeAssignmentTotal: activeAssignments.length,
+        eligibleCandidateTotal,
+        activeAssignedVideoIds: activeAssignments.map(
+          (assignment) => assignment.videoId,
+        ),
+      },
+    };
+  }
+
   async assignVideos(
     websiteId: string,
     dto: AssignWebsiteVideosDto,
@@ -1353,6 +1483,217 @@ export class AdminWebsitesService {
         this.toAssignedVideoResponse(assignment),
       ),
     };
+  }
+
+  async updateVideoAssignments(
+    websiteId: string,
+    dto: UpdateWebsiteVideoAssignmentsDto,
+    adminId: string,
+  ): Promise<UpdateWebsiteVideoAssignmentsResponse> {
+    const assignVideoIds = this.normalizeAssignmentVideoIds(dto.assignVideoIds);
+    const unassignVideoIds = this.normalizeAssignmentVideoIds(
+      dto.unassignVideoIds,
+    );
+    const assignVideoIdSet = new Set(assignVideoIds);
+    const overlapVideoIds = unassignVideoIds.filter((videoId) =>
+      assignVideoIdSet.has(videoId),
+    );
+
+    if (overlapVideoIds.length > 0) {
+      throw new BadRequestException({
+        statusCode: 400,
+        message: "A video cannot be assigned and unassigned in one request.",
+        error: "Bad Request",
+        code: "WEBSITE_VIDEO_ASSIGNMENT_OVERLAP",
+        details: { invalidVideoIds: overlapVideoIds },
+      });
+    }
+
+    const allVideoIds = [...assignVideoIds, ...unassignVideoIds];
+    if (allVideoIds.length > WEBSITE_VIDEO_ASSIGNMENT_BATCH_MAX_IDS) {
+      throw new BadRequestException({
+        statusCode: 400,
+        message: `At most ${WEBSITE_VIDEO_ASSIGNMENT_BATCH_MAX_IDS} videos can be changed per request.`,
+        error: "Bad Request",
+        code: "WEBSITE_VIDEO_ASSIGNMENT_BATCH_TOO_LARGE",
+      });
+    }
+
+    const runUpdate = () =>
+      this.prisma.$transaction(
+        async (tx) => {
+          const website = await tx.website.findUnique({
+            where: { id: websiteId },
+            select: { id: true, status: true },
+          });
+          if (website === null) {
+            throw new NotFoundException("Website not found.");
+          }
+          if (website.status !== WebsiteStatus.ACTIVE) {
+            throw new BadRequestException("Website is not active.");
+          }
+
+          const videos = allVideoIds.length
+            ? ((await tx.videoAsset.findMany({
+                where: { id: { in: allVideoIds } },
+                include: {
+                  binaryAsset: { select: { mimeType: true, sizeBytes: true } },
+                  localFileAsset: {
+                    select: { mimeType: true, sizeBytes: true },
+                  },
+                },
+              })) as VideoWithBinaryAssetMetadata[])
+            : [];
+          const videosById = new Map(videos.map((video) => [video.id, video]));
+          const notFoundVideoIds = allVideoIds.filter(
+            (videoId) => !videosById.has(videoId),
+          );
+          if (notFoundVideoIds.length > 0) {
+            throw new BadRequestException({
+              statusCode: 400,
+              message: "One or more videos do not exist.",
+              error: "Bad Request",
+              code: "WEBSITE_VIDEO_ASSIGNMENT_VIDEO_NOT_FOUND",
+              details: { invalidVideoIds: notFoundVideoIds },
+            });
+          }
+
+          const ineligibleVideoIds = assignVideoIds.filter((videoId) => {
+            const video = videosById.get(videoId);
+            return video === undefined || !this.isPublicPlayableVideo(video);
+          });
+          if (ineligibleVideoIds.length > 0) {
+            throw new BadRequestException({
+              statusCode: 400,
+              message:
+                "One or more videos are not READY and playable for assignment.",
+              error: "Bad Request",
+              code: "VIDEO_NOT_ELIGIBLE_FOR_ASSIGNMENT",
+              details: { invalidVideoIds: ineligibleVideoIds },
+            });
+          }
+
+          const existingAssignments = allVideoIds.length
+            ? await tx.websiteVideo.findMany({
+                where: { websiteId, videoId: { in: allVideoIds } },
+                select: {
+                  id: true,
+                  videoId: true,
+                  status: true,
+                  sortOrder: true,
+                },
+              })
+            : [];
+          const assignmentsByVideoId = new Map(
+            existingAssignments.map((assignment) => [
+              assignment.videoId,
+              assignment,
+            ]),
+          );
+          const maxSortOrder = assignVideoIds.some(
+            (videoId) => !assignmentsByVideoId.has(videoId),
+          )
+            ? await tx.websiteVideo.aggregate({
+                where: { websiteId },
+                _max: { sortOrder: true },
+              })
+            : null;
+          let nextSortOrder = (maxSortOrder?._max.sortOrder ?? -1) + 1;
+          const assignedVideoIds: string[] = [];
+          const unassignedVideoIds: string[] = [];
+          const unchangedVideoIds: string[] = [];
+
+          for (const videoId of assignVideoIds) {
+            const existing = assignmentsByVideoId.get(videoId);
+            if (existing?.status === AssignmentStatus.ACTIVE) {
+              unchangedVideoIds.push(videoId);
+              continue;
+            }
+
+            await tx.websiteVideo.upsert({
+              where: { websiteId_videoId: { websiteId, videoId } },
+              update: { status: AssignmentStatus.ACTIVE },
+              create: {
+                websiteId,
+                videoId,
+                sortOrder: nextSortOrder,
+                status: AssignmentStatus.ACTIVE,
+              },
+            });
+            if (!existing) nextSortOrder += 1;
+            assignedVideoIds.push(videoId);
+          }
+
+          for (const videoId of unassignVideoIds) {
+            const existing = assignmentsByVideoId.get(videoId);
+            if (!existing || existing.status === AssignmentStatus.DISABLED) {
+              unchangedVideoIds.push(videoId);
+              continue;
+            }
+
+            await tx.websiteVideo.update({
+              where: { id: existing.id },
+              data: {
+                status: AssignmentStatus.DISABLED,
+                isFeatured: false,
+              },
+            });
+            unassignedVideoIds.push(videoId);
+          }
+
+          const activeAssignmentTotal = await tx.websiteVideo.count({
+            where: { websiteId, status: AssignmentStatus.ACTIVE },
+          });
+
+          await tx.adminAuditLog.create({
+            data: {
+              adminId,
+              action: "WEBSITE_VIDEO_ASSIGNMENTS_UPDATE",
+              module: "admin-websites",
+              entityType: "Website",
+              entityId: websiteId,
+              status: AuditStatus.SUCCESS,
+              metadataJson: this.toJsonInput({
+                requestedAssignCount: assignVideoIds.length,
+                requestedUnassignCount: unassignVideoIds.length,
+                assignedVideoIds,
+                unassignedVideoIds,
+                unchangedVideoIds,
+                activeAssignmentTotal,
+              }),
+            },
+          });
+
+          return {
+            assignedVideoIds,
+            unassignedVideoIds,
+            unchangedVideoIds,
+            activeAssignmentTotal,
+          };
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+
+    let result: Awaited<ReturnType<typeof runUpdate>> | undefined;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        result = await runUpdate();
+        break;
+      } catch (error) {
+        if (attempt === 3 || !this.isRetryableAssignmentConflict(error)) {
+          throw error;
+        }
+      }
+    }
+
+    if (result === undefined) {
+      throw new ConflictException(
+        "Website video assignments are busy. Please retry.",
+      );
+    }
+
+    this.invalidatePublicAccessCaches();
+    return result;
   }
 
   async assignSingleVideo(
@@ -2354,6 +2695,53 @@ export class AdminWebsitesService {
     };
   }
 
+  private buildVideoAssignmentOptionWhere(
+    websiteId: string,
+    query: ListWebsiteVideoAssignmentOptionsQueryDto,
+  ): Prisma.VideoAssetWhereInput {
+    const and: Prisma.VideoAssetWhereInput[] = [];
+
+    if (query.search) {
+      const literalSearch = escapeAdminVideoSearchLike(query.search);
+      and.push({
+        OR: [
+          { title: { contains: literalSearch } },
+          { slug: { contains: literalSearch } },
+        ],
+      });
+    }
+    if (query.filterKey) and.push({ filterKey: query.filterKey });
+    if (query.sourceType) and.push({ sourceType: query.sourceType });
+
+    and.push({
+      OR: [
+        {
+          websiteVideos: {
+            some: { websiteId, status: AssignmentStatus.ACTIVE },
+          },
+        },
+        {
+          status: VideoStatus.READY,
+          AND: [this.getPlayableVideoWhereInput()],
+        },
+      ],
+    });
+
+    return { AND: and };
+  }
+
+  private buildEligibleAssignmentCandidateWhere(
+    websiteId: string,
+  ): Prisma.VideoAssetWhereInput {
+    return {
+      status: VideoStatus.READY,
+      AND: [this.getPlayableVideoWhereInput()],
+      websiteVideos: {
+        none: { websiteId, status: AssignmentStatus.ACTIVE },
+      },
+    };
+  }
+
   private getPlayableVideoWhereInput(): Prisma.VideoAssetWhereInput {
     return {
       OR: [
@@ -2600,6 +2988,14 @@ export class AdminWebsitesService {
     );
   }
 
+  private normalizeAssignmentVideoIds(videoIds: string[]): string[] {
+    return Array.from(
+      new Set(
+        videoIds.map((videoId) => videoId.trim()).filter((videoId) => videoId),
+      ),
+    );
+  }
+
   private async getPreferredActiveDomain(
     websiteId: string,
   ): Promise<string | null> {
@@ -2775,9 +3171,6 @@ export class AdminWebsitesService {
     assignment: WebsiteVideoWithVideo,
   ): AdminWebsiteAssignedVideoResponse {
     const video = assignment.video;
-    const binaryAsset = video.binaryAsset ?? null;
-    const localFileAsset = video.localFileAsset ?? null;
-    const localThumbnailAsset = video.localThumbnailAsset ?? null;
 
     return {
       id: assignment.id,
@@ -2790,52 +3183,61 @@ export class AdminWebsitesService {
       videoStatus: video.status,
       thumbnailUrl: video.thumbnailUrl,
       playbackUrl: video.playbackUrl,
-      video: {
-        id: video.id,
-        title: video.title,
-        slug: video.slug,
-        description: video.description,
-        provider: video.provider,
-        sourceType: video.sourceType,
-        providerAssetId: video.providerAssetId,
-        playbackId: video.playbackId,
-        playbackUrl: video.playbackUrl,
-        embedProvider: video.embedProvider,
-        embedUrl: video.embedUrl,
-        embedCloudName: video.embedCloudName,
-        embedPublicId: video.embedPublicId,
-        embedAllow: video.embedAllow,
-        thumbnailUrl:
-          localThumbnailAsset === null
-            ? video.thumbnailUrl
-            : `/api/v1/admin/videos/${encodeURIComponent(video.id)}/thumbnail`,
-        durationSeconds: video.durationSeconds,
-        viewCount: video.viewCount.toString(),
-        publishedAt: video.publishedAt,
-        status: video.status,
-        filterKey: video.filterKey,
-        metadataJson: video.metadataJson,
-        binaryAsset:
-          binaryAsset === null
-            ? null
-            : {
-                mimeType: binaryAsset.mimeType,
-                sizeBytes: binaryAsset.sizeBytes.toString(),
-              },
-        localFileAsset: this.toAdminLocalAssetResponse(localFileAsset),
-        localThumbnailAsset:
-          this.toAdminLocalAssetResponse(localThumbnailAsset),
-        binaryPlaybackUrl:
-          binaryAsset === null
-            ? null
-            : `/api/v1/admin/videos/${encodeURIComponent(video.id)}/binary`,
-        localPlaybackUrl:
-          localFileAsset === null
-            ? null
-            : `/api/v1/admin/videos/${encodeURIComponent(video.id)}/local-file`,
-        createdAt: video.createdAt,
-        updatedAt: video.updatedAt,
-      },
+      video: this.toAdminVideoResponse(video),
+    };
+  }
+
+  private toAdminVideoResponse(
+    video: VideoWithAdminMediaMetadata,
+  ): AdminWebsiteAssignedVideoResponse["video"] {
+    const binaryAsset = video.binaryAsset ?? null;
+    const localFileAsset = video.localFileAsset ?? null;
+    const localThumbnailAsset = video.localThumbnailAsset ?? null;
+
+    return {
+      id: video.id,
+      title: video.title,
+      slug: video.slug,
+      description: video.description,
+      provider: video.provider,
+      sourceType: video.sourceType,
+      providerAssetId: video.providerAssetId,
+      playbackId: video.playbackId,
+      playbackUrl: video.playbackUrl,
+      embedProvider: video.embedProvider,
+      embedUrl: video.embedUrl,
+      embedCloudName: video.embedCloudName,
+      embedPublicId: video.embedPublicId,
+      embedAllow: video.embedAllow,
+      thumbnailUrl:
+        localThumbnailAsset === null
+          ? video.thumbnailUrl
+          : `/api/v1/admin/videos/${encodeURIComponent(video.id)}/thumbnail`,
+      durationSeconds: video.durationSeconds,
+      viewCount: video.viewCount.toString(),
+      publishedAt: video.publishedAt,
+      status: video.status,
+      filterKey: video.filterKey,
+      metadataJson: video.metadataJson,
+      binaryAsset:
+        binaryAsset === null
+          ? null
+          : {
+              mimeType: binaryAsset.mimeType,
+              sizeBytes: binaryAsset.sizeBytes.toString(),
+            },
+      localFileAsset: this.toAdminLocalAssetResponse(localFileAsset),
+      localThumbnailAsset: this.toAdminLocalAssetResponse(localThumbnailAsset),
+      binaryPlaybackUrl:
+        binaryAsset === null
+          ? null
+          : `/api/v1/admin/videos/${encodeURIComponent(video.id)}/binary`,
+      localPlaybackUrl:
+        localFileAsset === null
+          ? null
+          : `/api/v1/admin/videos/${encodeURIComponent(video.id)}/local-file`,
+      createdAt: video.createdAt,
+      updatedAt: video.updatedAt,
     };
   }
 

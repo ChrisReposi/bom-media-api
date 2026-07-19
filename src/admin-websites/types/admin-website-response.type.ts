@@ -214,3 +214,53 @@ export class AssignWebsiteVideosResponse {
     eligibleAssignmentTotal: number;
   };
 }
+
+export class AdminWebsiteVideoAssignmentOptionResponse {
+  @ApiProperty({ type: VideoResponse })
+  video!: VideoResponse;
+
+  @ApiProperty()
+  isAssigned!: boolean;
+
+  @ApiPropertyOptional({ enum: AssignmentStatus, nullable: true })
+  assignmentStatus!: AssignmentStatus | null;
+
+  @ApiProperty()
+  canAssign!: boolean;
+
+  @ApiProperty()
+  canUnassign!: boolean;
+
+  @ApiPropertyOptional({ nullable: true })
+  blockedReason!: string | null;
+}
+
+export class AdminWebsiteVideoAssignmentOptionsResponse {
+  @ApiProperty({ type: [AdminWebsiteVideoAssignmentOptionResponse] })
+  items!: AdminWebsiteVideoAssignmentOptionResponse[];
+
+  @ApiProperty()
+  meta!: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+    activeAssignmentTotal: number;
+    eligibleCandidateTotal: number;
+    activeAssignedVideoIds: string[];
+  };
+}
+
+export class UpdateWebsiteVideoAssignmentsResponse {
+  @ApiProperty({ type: [String] })
+  assignedVideoIds!: string[];
+
+  @ApiProperty({ type: [String] })
+  unassignedVideoIds!: string[];
+
+  @ApiProperty({ type: [String] })
+  unchangedVideoIds!: string[];
+
+  @ApiProperty()
+  activeAssignmentTotal!: number;
+}

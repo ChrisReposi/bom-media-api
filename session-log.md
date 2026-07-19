@@ -12,6 +12,25 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-19 — Gate 3C-1: isolated MySQL/API proof for canonical DB_BLOB evidence
+
+### Changed
+
+- Added opt-in `test:integration:canonical-db-evidence`. It invokes the existing destructive database guard, additionally requires the exact local `video_share_cms_test` name and all 19 migrations, builds/starts the real compiled Nest API on a disposable port, and creates only unique run-scoped fixtures. A child-side datasource guard runs before AppModule initialization as defense in depth.
+- The harness exercises real HTTP login, multipart DB_BLOB upload, website assignment, canonical POST/GET, multipart binary replacement and generic legacy-link creation; the non-HTTP legacy adoption path invokes the existing compiled service and real eligibility query. `finally` cleanup removes only run-derived rows, restores aggregate counts, stops the child and verifies no proof-owned database connection remains.
+- Added three deterministic safety tests for dev-database/missing-confirmation refusal, mandatory run IDs, exact cleanup scope, guard ordering and absence of credential/checksum value logging. Updated the canonical runbook with the command, observed GET-after-drift contract and Gate 3C-2 boundary. No product API/schema/migration/Admin change.
+
+### Verified
+
+- Real MySQL/API proof PASS: initial upload persisted exact bytes/size/MIME and server SHA-256; canonical CREATED wrote exactly one ShareLink, ShareLinkVideo, mapping and success audit without `rawToken`/`tokenHash`; unchanged content returned REUSED with identical id/alias/public URL and GET `evidenceDrift=false`; equal-size/equal-MIME replacement changed checksum, POST returned 409 `CANONICAL_EVIDENCE_DRIFT`, GET retained the original canonical identity with `evidenceDrift=true`, and the stored snapshot was unchanged.
+- A separate legacy-null DB_BLOB graph returned 409 `CANONICAL_EVIDENCE_INCOMPLETE` with zero canonical/create-success writes. Existing-service adoption was also refused with zero mapping/adoption-success writes while the generic legacy link/relation remained intact.
+- Isolated test counts were zero before and after across website/domain/video/binary/assignment/link/relation/canonical/audit/admin/session/token tables; zero run leftovers and zero proof-owned connections. Count-only shared-dev snapshots before/after were identical (Website=1, WebsiteDomain=2, VideoAsset=26, VideoBinaryAsset=0, WebsiteVideo=5, ShareLink=0, ShareLinkVideo=0, CanonicalVideoShareLink=0, AdminAuditLog=471). Production was not accessed.
+- Full verification: Prisma generate/validate/status PASS (19 migrations, dev schema up to date); typecheck PASS; lint 0 errors/90 existing warnings; tests 173/173 across 47 suites; build, repository format check, focused proof-source format check and diff check PASS. Admin repo remained clean at `22bf65e`.
+
+### Pending
+
+- Gate 3C-2 must define an explicit bounded owner-approved remediation workflow for legacy null checksums. Gate 4 public parser, Production migration/backfill, browser testing, push, merge and deploy were not run.
+
 ## 2026-07-19 — Gate 3B: DB_BLOB checksum integrated into canonical evidence
 
 ### Changed

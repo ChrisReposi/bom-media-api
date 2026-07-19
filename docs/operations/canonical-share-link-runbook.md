@@ -48,8 +48,9 @@ when size and MIME are unchanged. Size plus MIME is never accepted as an
 integrity substitute. New DB_BLOB uploads and replacements populate the hash;
 a legacy null-checksum DB_BLOB returns `409 CANONICAL_EVIDENCE_INCOMPLETE`
 before create/adoption writes, and an existing incomplete mapping is not
-silently regenerated or reused. No blob scan, automatic backfill, Gate 3C
-database proof, or Production access occurred in Gate 3B.
+silently regenerated or reused. Gate 3B performed no blob scan, automatic
+backfill, database integration proof, or Production access; the isolated
+Gate 3C-1 proof below subsequently verified that contract without backfill.
 
 LOCAL_FILE continues to use its persisted file checksum. DIRECT_URL, provider
 upload (including Cloudinary), and EMBED retain their URL/provider identity
@@ -113,6 +114,10 @@ cp .env.test.example .env.test           # once; local Docker credentials
 DOTENV_CONFIG_PATH=.env.test APP_ENV=test yarn prisma migrate deploy
 ALLOW_DESTRUCTIVE_DB_TESTS=I_UNDERSTAND_THIS_DELETES_FIXTURES \
   yarn test:integration:canonical-fk
+
+# Gate 3C-1: real compiled API + MySQL DB_BLOB evidence proof
+ALLOW_DESTRUCTIVE_DB_TESTS=I_UNDERSTAND_THIS_DELETES_FIXTURES \
+  yarn test:integration:canonical-db-evidence
 ```
 
 `scripts/safety/assert-destructive-test-database.ts` hard-refuses anything
@@ -129,6 +134,34 @@ destructive statement → assert the expected P2003 block and row survival →
 revoke-retention check → dependency-order cleanup → zero-leftover check; any
 deviation exits non-zero. Never suppress stderr or exit codes around database
 commands.
+
+`test:integration:canonical-db-evidence` builds and starts the real compiled
+Nest API on a disposable local port. Both the parent harness and API child
+validate the effective datasource; the harness additionally requires the
+exact database name `video_share_cms_test` and all 19 repository migrations.
+It creates a unique `gate3c1_<timestamp>_<random>` fixture graph and proves:
+
+- a real multipart DB_BLOB upload persists exact bytes, size, MIME, and a
+  server-computed SHA-256, then canonical POST creates exactly one link,
+  relation, mapping, and success audit without returning `rawToken` or
+  `tokenHash`;
+- unchanged content returns `REUSED`, identical alias/public URL and
+  `evidenceDrift=false` without new canonical writes;
+- a real multipart replacement with equal size and MIME but different bytes
+  changes the checksum, makes POST return `409 CANONICAL_EVIDENCE_DRIFT`, and
+  makes the read-only GET retain the original identity with
+  `evidenceDrift=true` without overwriting its snapshot;
+- a run-scoped legacy DB_BLOB with null checksum makes both canonical create
+  and the existing adoption service return
+  `CANONICAL_EVIDENCE_INCOMPLETE`, with zero mapping/success-audit writes and
+  the generic legacy link unchanged.
+
+Cleanup runs in `finally`, targets only run-derived identifiers, restores all
+test-table aggregate counts, stops the API child, and verifies no proof-owned
+database connection remains. The 2026-07-19 proof started and ended with zero
+rows in all fixture tables. Count-only shared-dev snapshots before and after
+were identical; Production was not accessed. This proof does not backfill or
+remediate legacy null checksums — that remains Gate 3C-2 owner/operator work.
 
 Incident record: on 2026-07-19 a Gate-1 proof deleted one dev website and one
 dev video (fixture inserts had silently failed; DELETEs then ran against real

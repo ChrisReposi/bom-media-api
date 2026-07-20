@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, unlink } from "node:fs/promises";
 import { buildCacheKey } from "../cache/memory-cache-key.util";
 import { MemoryCacheService } from "../cache/memory-cache.service";
+import { toSafeDatabaseErrorContext } from "../common/errors/safe-database-error-context.util";
 import { CloudinaryService } from "../cloudinary/cloudinary.service";
 import { PrismaService } from "../database/prisma.service";
 import {
@@ -257,49 +258,73 @@ export class VideosService {
     );
     const orderBy = this.buildVideoOrderBy(params.sortBy, params.sortOrder);
 
-    const [items, total] = await this.prisma.$transaction([
-      this.prisma.videoAsset.findMany({
-        where,
-        orderBy,
-        skip,
-        take: params.limit,
-        include: {
-          binaryAsset: {
-            select: {
-              mimeType: true,
-              sizeBytes: true,
+    let items: VideoAssetWithBinaryMetadata[];
+    let total: number;
+    try {
+      [items, total] = await this.prisma.$transaction([
+        this.prisma.videoAsset.findMany({
+          where,
+          orderBy,
+          skip,
+          take: params.limit,
+          include: {
+            binaryAsset: {
+              select: {
+                mimeType: true,
+                sizeBytes: true,
+              },
+            },
+            localFileAsset: {
+              select: {
+                mimeType: true,
+                sizeBytes: true,
+                checksumSha256: true,
+                originalFilename: true,
+              },
+            },
+            localThumbnailAsset: {
+              select: {
+                mimeType: true,
+                sizeBytes: true,
+                checksumSha256: true,
+                originalFilename: true,
+              },
             },
           },
-          localFileAsset: {
-            select: {
-              mimeType: true,
-              sizeBytes: true,
-              checksumSha256: true,
-              originalFilename: true,
-            },
-          },
-          localThumbnailAsset: {
-            select: {
-              mimeType: true,
-              sizeBytes: true,
-              checksumSha256: true,
-              originalFilename: true,
-            },
-          },
-        },
-      }),
-      this.prisma.videoAsset.count({ where }),
-    ]);
+        }),
+        this.prisma.videoAsset.count({ where }),
+      ]);
+    } catch (error) {
+      this.logAdminVideoListFailure("ADMIN_VIDEO_LIST_QUERY", error);
+      throw error;
+    }
 
-    return {
-      items: items.map((video) => this.toVideoResponse(video)),
-      meta: {
-        page: params.page,
-        limit: params.limit,
-        total,
-        totalPages: Math.ceil(total / params.limit),
-      },
-    };
+    try {
+      return {
+        items: items.map((video) => this.toVideoResponse(video)),
+        meta: {
+          page: params.page,
+          limit: params.limit,
+          total,
+          totalPages: Math.ceil(total / params.limit),
+        },
+      };
+    } catch (error) {
+      this.logAdminVideoListFailure("ADMIN_VIDEO_LIST_MAPPING", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Diagnostic-only: records which stage of the admin video list failed with
+   * allowlisted database context, then rethrows unchanged. Never logs search
+   * values, query args, or secrets; HTTP behavior is unaffected.
+   */
+  private logAdminVideoListFailure(stage: string, error: unknown): void {
+    this.logger.error(
+      { stage, ...toSafeDatabaseErrorContext(error) },
+      "Admin video list stage failed.",
+    );
   }
 
   async getVideo(id: string): Promise<VideoResponse> {

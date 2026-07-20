@@ -7,6 +7,10 @@ import {
   type ExceptionFilter,
 } from "@nestjs/common";
 import type { Request, Response } from "express";
+import {
+  isPrismaError,
+  toSafeDatabaseErrorContext,
+} from "../errors/safe-database-error-context.util";
 
 @Catch()
 export class GlobalExceptionFilter implements ExceptionFilter {
@@ -26,13 +30,22 @@ export class GlobalExceptionFilter implements ExceptionFilter {
         ? exception.getStatus()
         : HttpStatus.INTERNAL_SERVER_ERROR;
     if (status >= 500) {
+      // Attach allowlisted database error context (Prisma code, model,
+      // offending field, driver code, category) so operators can tell schema
+      // drift (P2022) from pool timeout (P2024) etc. The util never exposes
+      // raw messages, SQL, query args, or secrets; the client response below
+      // stays generic.
       this.logger.error(
         {
           requestId: request.id,
           method: request.method,
+          path: request.originalUrl ?? request.url,
           status,
           errorName:
             exception instanceof Error ? exception.name : "UnknownError",
+          ...(isPrismaError(exception)
+            ? { database: toSafeDatabaseErrorContext(exception) }
+            : {}),
         },
         "Request failed.",
       );

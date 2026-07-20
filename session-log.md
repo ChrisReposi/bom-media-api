@@ -12,6 +12,32 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-20 — Diagnostic release for production admin video list/assignment 500
+
+### Goal
+
+- Investigate production 500 on GET /admin/videos (with and without search) and GET /admin/websites/:id/video-assignment-options while local passes and health is 200.
+
+### Findings
+
+- Root cause NOT_PROVEN. Local read-only probe of the EXACT production query shapes on real MySQL 8 (incl. the 4-way `$transaction` and all `checksumSha256` includes) returns 200; both endpoints' real HTTP smoke returns 200. Shared failure surface = `$transaction([...])` + relation includes + MariaDB adapter/pool (health/ready uses only `SELECT 1`, no transaction — explains 200). Equiprobable production-only causes remain: P2022 physical drift vs P2024 pool timeout (default `DB_CONNECTION_LIMIT=5`) vs legacy-row mapping vs stale runtime.
+- PROVEN observability gap: GlobalExceptionFilter logged only errorName for 5xx, so P2022 vs P2024 were indistinguishable in production.
+
+### Changed (diagnostic-only, behavior-preserving; branch hotfix/production-admin-video-list-500)
+
+- NEW `src/common/errors/safe-database-error-context.util.ts` — allowlisted Prisma/driver context (code, model, fields, driverCode, sqlState, category incl. @prisma/adapter-mariadb driver shape); no message/SQL/secret exposure.
+- `global-exception.filter.ts` — 5xx log adds `path` + safe `database` context; client 500 body unchanged.
+- `videos.service.ts` / `admin-websites.service.ts` — stage tags ADMIN_VIDEO_LIST_QUERY|MAPPING and WEBSITE_ASSIGNMENT_OPTIONS_QUERY|MAPPING (log-and-rethrow). No query/DTO/transaction/cache/auth/contract change.
+- NEW `test/safe-database-error-context.test.ts` (7). NEW `docs/incidents/2026-07-20-production-admin-video-list-500.md` (incident report + operator read-only schema SQL + evidence bundle request).
+
+### Verified
+
+- typecheck, lint 0 errors (92 warnings baseline), tests 186/186, build, format, diff-check clean. Real HTTP smoke: all three endpoints 200 after edits.
+
+### Known limitations / next
+
+- Not deployed; production acceptance NOT MET (no prod smoke 200). Next: operator deploys diagnostic release, injects APP_BUILD_SHA/APP_RELEASE_VERSION/APP_BUILD_TIME, reproduces one request, returns X-Request-Id + sanitized log so the corrective release can target the proven cause. Do not guess-fix queries.
+
 ## 2026-07-19 — Atomic bulk website-video assignment management
 
 ### Changed

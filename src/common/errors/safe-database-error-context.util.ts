@@ -138,6 +138,50 @@ export function toSafeDatabaseErrorContext(
   return { errorName: "UnknownError" };
 }
 
+// Non-enumerable, module-private tag so the failing service stage can be
+// carried on the (unchanged) error object to the GlobalExceptionFilter, which
+// emits a single request-correlated log. It never enumerates/serializes and
+// never alters the error's prototype, so Prisma error identity and `.code`
+// are preserved.
+const DATABASE_STAGE = Symbol("databaseStage");
+
+export function tagDatabaseStage<T>(error: T, stage: string): T {
+  if (typeof error === "object" && error !== null) {
+    try {
+      Object.defineProperty(error, DATABASE_STAGE, {
+        value: stage,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+    } catch {
+      // Frozen/sealed error — leave it untagged rather than throw.
+    }
+  }
+  return error;
+}
+
+export function readDatabaseStage(error: unknown): string | undefined {
+  if (typeof error === "object" && error !== null) {
+    const value = (error as Record<symbol, unknown>)[DATABASE_STAGE];
+    return typeof value === "string" ? value : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * `.catch()` handler that tags the rejection with a query stage and rethrows
+ * unchanged. Returns `never`, so the awaited promise keeps its exact inferred
+ * (Prisma) result type — no annotations or casts needed at the call site.
+ */
+export function rethrowWithDatabaseStage(
+  stage: string,
+): (error: unknown) => never {
+  return (error: unknown): never => {
+    throw tagDatabaseStage(error, stage);
+  };
+}
+
 /**
  * True when the error is any Prisma client error — used to decide whether the
  * safe database context is worth attaching to a log line.

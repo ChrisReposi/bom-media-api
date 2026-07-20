@@ -9,7 +9,7 @@ import {
 import { ConfigService } from "@nestjs/config";
 import { buildCacheKey } from "../cache/memory-cache-key.util";
 import { MemoryCacheService } from "../cache/memory-cache.service";
-import { toSafeDatabaseErrorContext } from "../common/errors/safe-database-error-context.util";
+import { rethrowWithDatabaseStage } from "../common/errors/safe-database-error-context.util";
 import { PrismaService } from "../database/prisma.service";
 import { Prisma } from "../generated/prisma/client";
 import {
@@ -134,10 +134,6 @@ type VideoWithAdminMediaMetadata = VideoAsset & {
 
 type WebsiteVideoWithVideo = WebsiteVideo & {
   video: VideoWithAdminMediaMetadata;
-};
-
-type VideoAssignmentOptionRecord = VideoWithAdminMediaMetadata & {
-  websiteVideos: Array<Pick<WebsiteVideo, "id" | "status">>;
 };
 
 type VideoWithBinaryAssetMetadata = VideoAsset & {
@@ -1353,13 +1349,13 @@ export class AdminWebsitesService {
     }
 
     const optionWhere = this.buildVideoAssignmentOptionWhere(websiteId, query);
-    let total: number;
-    let activeAssignments: { videoId: string }[];
-    let eligibleCandidateTotal: number;
-    let videos: unknown[];
-    try {
-      [total, activeAssignments, eligibleCandidateTotal, videos] =
-        await this.prisma.$transaction([
+    // `.catch` tags the failing stage and rethrows (returns `never`), so the
+    // destructured results keep their exact inferred Prisma types — no
+    // `unknown` and no late cast. The single correlated failure log is emitted
+    // by GlobalExceptionFilter from the stage tag.
+    const [total, activeAssignments, eligibleCandidateTotal, videos] =
+      await this.prisma
+        .$transaction([
           this.prisma.videoAsset.count({ where: optionWhere }),
           this.prisma.websiteVideo.findMany({
             where: activeAssignmentWhere,
@@ -1400,18 +1396,12 @@ export class AdminWebsitesService {
             skip: (page - 1) * limit,
             take: limit,
           }),
-        ]);
-    } catch (error) {
-      this.logAssignmentOptionsFailure(
-        "WEBSITE_ASSIGNMENT_OPTIONS_QUERY",
-        error,
-      );
-      throw error;
-    }
+        ])
+        .catch(rethrowWithDatabaseStage("WEBSITE_ASSIGNMENT_OPTIONS_QUERY"));
 
     try {
       return {
-        items: (videos as VideoAssignmentOptionRecord[]).map((video) => {
+        items: videos.map((video) => {
           const assignmentStatus = video.websiteVideos[0]?.status ?? null;
           const isAssigned = assignmentStatus === AssignmentStatus.ACTIVE;
           const isEligible = this.isPublicPlayableVideo(video);
@@ -1442,24 +1432,10 @@ export class AdminWebsitesService {
         },
       };
     } catch (error) {
-      this.logAssignmentOptionsFailure(
-        "WEBSITE_ASSIGNMENT_OPTIONS_MAPPING",
+      throw rethrowWithDatabaseStage("WEBSITE_ASSIGNMENT_OPTIONS_MAPPING")(
         error,
       );
-      throw error;
     }
-  }
-
-  /**
-   * Diagnostic-only: records which stage of the assignment-options endpoint
-   * failed with allowlisted database context, then rethrows unchanged. Never
-   * logs search values, query args, or secrets; HTTP behavior is unaffected.
-   */
-  private logAssignmentOptionsFailure(stage: string, error: unknown): void {
-    this.logger.error(
-      { stage, ...toSafeDatabaseErrorContext(error) },
-      "Website video assignment options stage failed.",
-    );
   }
 
   async assignVideos(

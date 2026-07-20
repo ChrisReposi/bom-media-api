@@ -12,6 +12,22 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-20 — Harden diagnostic request logging (pre-deploy review)
+
+### Changed (branch hotfix/production-admin-video-list-500; no behavior/query change)
+
+- Security: GlobalExceptionFilter no longer logs `originalUrl`/`url`/`path`. New `src/common/http/safe-request-route.util.ts` derives a route TEMPLATE from `request.route.path` (+ static baseUrl) only, so query strings and raw params (share token, media grant, videoId) never reach logs; field omitted when no template.
+- Correlation: service stage loggers (which used app-level `new Logger` without requestId) were removed. Stage is now tagged on the unchanged error via `.catch(rethrowWithDatabaseStage(...))` and read by the filter, producing ONE request-correlated log with requestId + method + route + status + stage + errorName + database. No duplicate logs; Prisma error identity/`.code` preserved (non-enumerable Symbol tag).
+- Type safety: dropped `let videos: unknown[]` + `as VideoAssignmentOptionRecord[]` and the `let items` annotation; `.catch` returns `never` so destructured results keep exact inferred Prisma types. Removed now-dead `VideoAssignmentOptionRecord`.
+
+### Verified
+
+- typecheck, lint 0 errors, tests 194/194, build, format, diff-check clean. Real HTTP smoke: all three endpoints still 200. New `test/global-exception-filter.test.ts` (15) proves admin query-string + public token/videoId/grant + Authorization/Cookie never appear in logs, and requestId+stage+P2022 context correlate in one line.
+
+### Limitations
+
+- Still diagnostic-only; production root cause NOT_PROVEN; not deployed.
+
 ## 2026-07-20 — Diagnostic release for production admin video list/assignment 500
 
 ### Goal

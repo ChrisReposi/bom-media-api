@@ -107,15 +107,20 @@ query/behavior change was made.
   `driverCode`, `sqlState`, `databaseCategory`) incl. the
   `@prisma/adapter-mariadb` `driverAdapterError.cause` shape. Never exposes raw
   message, SQL, query args, or secrets.
-- `src/common/filters/global-exception.filter.ts`: 5xx log now includes `path`
+- `src/common/filters/global-exception.filter.ts`: single 5xx log now includes
+  a safe `route` TEMPLATE (never a raw URL/query string), the failing `stage`,
   and the safe `database` context. Client response stays generic
   `{statusCode, message:"Internal server error", error}`.
-- `src/videos/videos.service.ts`: `loadVideoListFromDatabase` splits QUERY vs
-  MAPPING with stage tags `ADMIN_VIDEO_LIST_QUERY` / `ADMIN_VIDEO_LIST_MAPPING`
-  (log-and-rethrow, unchanged behavior).
-- `src/admin-websites/admin-websites.service.ts`:
-  `listVideoAssignmentOptions` splits `WEBSITE_ASSIGNMENT_OPTIONS_QUERY` /
-  `WEBSITE_ASSIGNMENT_OPTIONS_MAPPING`.
+- `src/common/http/safe-request-route.util.ts` (new): derives the route
+  template from `request.route.path` (+ static `baseUrl`) only; ignores
+  `originalUrl`/`url`/`path`; omits the field when no template is available.
+- `src/videos/videos.service.ts` / `src/admin-websites/admin-websites.service.ts`:
+  the failing stage (`ADMIN_VIDEO_LIST_QUERY|MAPPING`,
+  `WEBSITE_ASSIGNMENT_OPTIONS_QUERY|MAPPING`) is tagged on the unchanged error
+  via `.catch(rethrowWithDatabaseStage(...))`, so the filter emits one
+  request-correlated log with no duplicate service logs. The `.catch` returns
+  `never`, preserving the exact inferred Prisma result types (no `unknown`, no
+  late cast).
 - No query, DTO, transaction, cache, auth, RBAC, or response-contract change.
 
 Release identity (`APP_RELEASE_VERSION`/`APP_BUILD_SHA`/`APP_BUILD_TIME`) is

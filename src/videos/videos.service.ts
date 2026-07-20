@@ -11,7 +11,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, unlink } from "node:fs/promises";
 import { buildCacheKey } from "../cache/memory-cache-key.util";
 import { MemoryCacheService } from "../cache/memory-cache.service";
-import { toSafeDatabaseErrorContext } from "../common/errors/safe-database-error-context.util";
+import { rethrowWithDatabaseStage } from "../common/errors/safe-database-error-context.util";
 import { CloudinaryService } from "../cloudinary/cloudinary.service";
 import { PrismaService } from "../database/prisma.service";
 import {
@@ -258,10 +258,12 @@ export class VideosService {
     );
     const orderBy = this.buildVideoOrderBy(params.sortBy, params.sortOrder);
 
-    let items: VideoAssetWithBinaryMetadata[];
-    let total: number;
-    try {
-      [items, total] = await this.prisma.$transaction([
+    // `.catch` tags the failing stage on the (unchanged) error and rethrows;
+    // it returns `never`, so `items`/`total` keep their exact inferred Prisma
+    // types. The single request-correlated failure log is emitted by
+    // GlobalExceptionFilter, which reads the stage tag.
+    const [items, total] = await this.prisma
+      .$transaction([
         this.prisma.videoAsset.findMany({
           where,
           orderBy,
@@ -293,11 +295,8 @@ export class VideosService {
           },
         }),
         this.prisma.videoAsset.count({ where }),
-      ]);
-    } catch (error) {
-      this.logAdminVideoListFailure("ADMIN_VIDEO_LIST_QUERY", error);
-      throw error;
-    }
+      ])
+      .catch(rethrowWithDatabaseStage("ADMIN_VIDEO_LIST_QUERY"));
 
     try {
       return {
@@ -310,21 +309,8 @@ export class VideosService {
         },
       };
     } catch (error) {
-      this.logAdminVideoListFailure("ADMIN_VIDEO_LIST_MAPPING", error);
-      throw error;
+      throw rethrowWithDatabaseStage("ADMIN_VIDEO_LIST_MAPPING")(error);
     }
-  }
-
-  /**
-   * Diagnostic-only: records which stage of the admin video list failed with
-   * allowlisted database context, then rethrows unchanged. Never logs search
-   * values, query args, or secrets; HTTP behavior is unaffected.
-   */
-  private logAdminVideoListFailure(stage: string, error: unknown): void {
-    this.logger.error(
-      { stage, ...toSafeDatabaseErrorContext(error) },
-      "Admin video list stage failed.",
-    );
   }
 
   async getVideo(id: string): Promise<VideoResponse> {

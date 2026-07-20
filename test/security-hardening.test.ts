@@ -1,6 +1,7 @@
 import "reflect-metadata";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import {
   ForbiddenException,
@@ -13,10 +14,10 @@ import { AdminRolesGuard } from "../src/admin-auth/guards/admin-roles.guard";
 import { ADMIN_ROLES_METADATA } from "../src/admin-auth/decorators/admin-roles.decorator";
 import { AdminWebsitesController } from "../src/admin-websites/admin-websites.controller";
 import { AdminAccountsController } from "../src/admin-accounts/admin-accounts.controller";
-import { redactTokenFromUrl, serializeRequestForLogs } from "../src/app.module";
+import { serializeRequestForLogs } from "../src/app.module";
 import { GlobalExceptionFilter } from "../src/common/filters/global-exception.filter";
 import { getClientIpFromRequest } from "../src/common/utils/request-security.util";
-import type { ApiEnvironmentConfig } from "../src/config/env.config";
+import { apiConfig, type ApiEnvironmentConfig } from "../src/config/env.config";
 import { validateEnv } from "../src/config/env.validation";
 import { AccountStatus, AdminRole } from "../src/generated/prisma/client";
 import { HealthService } from "../src/health/health.service";
@@ -334,24 +335,70 @@ describe("trusted proxy client IP", () => {
 });
 
 describe("request log redaction", () => {
-  it("removes token and grant values without serializing route params", () => {
+  it("serializes only request id, method and the matched route template", () => {
     const rawUrl =
       "/api/v1/public/watch/raw-secret/videos/video-1/local-file?host=example.com&grant=raw-grant";
-    const redacted = redactTokenFromUrl(rawUrl);
-    assert.equal(redacted.includes("raw-secret"), false);
-    assert.equal(redacted.includes("raw-grant"), false);
-
     const serialized = serializeRequestForLogs({
       id: "request-1",
       method: "GET",
       url: rawUrl,
       params: { token: "raw-secret", grant: "raw-grant" },
       query: { host: "example.com", grant: "raw-grant" },
-      headers: {},
+      headers: {
+        authorization: "Bearer raw-jwt",
+        cookie: "session=raw-cookie",
+        "x-forwarded-for": "203.0.113.9",
+      },
+      remoteAddress: "10.0.0.5",
+      remotePort: 44321,
+      raw: {
+        id: "request-1",
+        method: "GET",
+        route: {
+          path: "/api/v1/public/watch/:token/videos/:videoId/local-file",
+        },
+        baseUrl: "",
+      },
     });
-    assert.equal(Object.hasOwn(serialized, "params"), false);
-    assert.equal(JSON.stringify(serialized).includes("raw-secret"), false);
-    assert.equal(JSON.stringify(serialized).includes("raw-grant"), false);
+    assert.deepEqual(serialized, {
+      id: "request-1",
+      method: "GET",
+      route: "/api/v1/public/watch/:token/videos/:videoId/local-file",
+    });
+    const json = JSON.stringify(serialized);
+    for (const forbidden of [
+      "raw-secret",
+      "raw-grant",
+      "raw-jwt",
+      "raw-cookie",
+      "203.0.113.9",
+      "10.0.0.5",
+      "host=",
+      "url",
+      "query",
+      "headers",
+      "remoteAddress",
+    ]) {
+      assert.equal(json.includes(forbidden), false, `leaked: ${forbidden}`);
+    }
+  });
+
+  it("omits route instead of falling back to raw request values", () => {
+    assert.deepEqual(
+      serializeRequestForLogs({
+        id: "request-2",
+        method: "GET",
+        url: "/not-found?token=raw-token",
+        headers: { "x-forwarded-for": "198.51.100.5" },
+      }),
+      { id: "request-2", method: "GET" },
+    );
+  });
+
+  it("does not log a database host or database name during Prisma startup", () => {
+    const source = readFileSync("src/database/prisma.service.ts", "utf8");
+    assert.ok(!source.includes("Database target:"));
+    assert.ok(!source.includes("formatDatabaseTarget"));
   });
 });
 
@@ -463,6 +510,33 @@ describe("production configuration hardening", () => {
             TRUST_PROXY_ENABLED: "true",
           }),
         /TRUSTED_PROXY_CIDRS/,
+      );
+    } finally {
+      process.env = previousEnv;
+    }
+  });
+
+  it("defaults MariaDB to binary protocol and validates the text-protocol switch", () => {
+    const previousEnv = { ...process.env };
+    try {
+      const defaults = validateEnv(productionEnv);
+      assert.equal(defaults.DB_MARIADB_USE_TEXT_PROTOCOL, "false");
+      assert.equal(apiConfig().database.mariaDbUseTextProtocol, false);
+
+      const textProtocol = validateEnv({
+        ...productionEnv,
+        DB_MARIADB_USE_TEXT_PROTOCOL: "true",
+      });
+      assert.equal(textProtocol.DB_MARIADB_USE_TEXT_PROTOCOL, "true");
+      assert.equal(apiConfig().database.mariaDbUseTextProtocol, true);
+
+      assert.throws(
+        () =>
+          validateEnv({
+            ...productionEnv,
+            DB_MARIADB_USE_TEXT_PROTOCOL: "yes",
+          }),
+        /DB_MARIADB_USE_TEXT_PROTOCOL must be a boolean value/,
       );
     } finally {
       process.env = previousEnv;

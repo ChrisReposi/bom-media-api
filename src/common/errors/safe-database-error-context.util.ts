@@ -18,7 +18,19 @@ export type SafeDatabaseErrorContext = {
   fields?: string;
   driverCode?: string;
   sqlState?: string;
+  cause?: SafeDriverAdapterCause;
   databaseCategory?: string;
+};
+
+export type SafeDriverAdapterCause = {
+  kind?: string;
+  originalCode?: string;
+  code?: string | number;
+  sqlState?: string;
+  constraint?: {
+    index?: string;
+    fields?: string[];
+  };
 };
 
 const CATEGORY_BY_PRISMA_CODE: Record<string, string> = {
@@ -31,6 +43,131 @@ const CATEGORY_BY_PRISMA_CODE: Record<string, string> = {
   P2024: "CONNECTION_POOL_TIMEOUT",
   P2025: "RECORD_NOT_FOUND",
 };
+
+const CATEGORY_BY_DRIVER_KIND: Record<string, string> = {
+  AuthenticationFailed: "DATABASE_ACCESS_DENIED",
+  ColumnNotFound: "MISSING_COLUMN",
+  ConnectionClosed: "CONNECTION_CLOSED",
+  DatabaseAccessDenied: "DATABASE_ACCESS_DENIED",
+  DatabaseDoesNotExist: "DATABASE_NOT_FOUND",
+  DatabaseNotReachable: "DATABASE_UNREACHABLE",
+  ForeignKeyConstraintViolation: "CONSTRAINT_VIOLATION",
+  InconsistentColumnData: "DATA_CONVERSION",
+  InvalidInputValue: "DATA_CONVERSION",
+  LengthMismatch: "DATA_CONVERSION",
+  NullConstraintViolation: "CONSTRAINT_VIOLATION",
+  SocketTimeout: "OPERATION_TIMEOUT",
+  TableDoesNotExist: "MISSING_TABLE",
+  TooManyConnections: "CONNECTION_LIMIT",
+  TransactionWriteConflict: "TRANSACTION_CONFLICT",
+  UniqueConstraintViolation: "CONSTRAINT_VIOLATION",
+  ValueOutOfRange: "DATA_CONVERSION",
+};
+
+const CATEGORY_BY_MYSQL_CODE: Record<string, string> = {
+  "1040": "CONNECTION_LIMIT",
+  "1054": "MISSING_COLUMN",
+  "1146": "MISSING_TABLE",
+  "1203": "CONNECTION_LIMIT",
+  "1205": "OPERATION_TIMEOUT",
+  "1213": "TRANSACTION_CONFLICT",
+};
+
+const MAX_DRIVER_KIND_LENGTH = 64;
+const MAX_DRIVER_CODE_LENGTH = 32;
+const MAX_SQL_STATE_LENGTH = 16;
+const MAX_CONSTRAINT_IDENTIFIER_LENGTH = 191;
+const MAX_CONSTRAINT_FIELDS = 16;
+
+function readBoundedString(
+  value: unknown,
+  maximumLength: number,
+): string | undefined {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= maximumLength
+    ? value
+    : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function extractSafeDriverCause(value: unknown): SafeDriverAdapterCause {
+  const cause = asRecord(value);
+  if (cause === undefined) {
+    return {};
+  }
+
+  const kind = readBoundedString(cause.kind, MAX_DRIVER_KIND_LENGTH);
+  const originalCode = readBoundedString(
+    cause.originalCode,
+    MAX_DRIVER_CODE_LENGTH,
+  );
+  const code =
+    typeof cause.code === "number" && Number.isSafeInteger(cause.code)
+      ? cause.code
+      : readBoundedString(cause.code, MAX_DRIVER_CODE_LENGTH);
+  // Adapter 7.8 exposes MariaDB's SQLSTATE as `state` for its generic
+  // `kind: "mysql"` payload. Normalize it to the only public allowlisted key,
+  // `sqlState`, without copying the surrounding driver payload.
+  const sqlState = readBoundedString(
+    cause.sqlState ?? cause.state,
+    MAX_SQL_STATE_LENGTH,
+  );
+  const rawConstraint = asRecord(cause.constraint);
+  const index = readBoundedString(
+    rawConstraint?.index,
+    MAX_CONSTRAINT_IDENTIFIER_LENGTH,
+  );
+  const fields = Array.isArray(rawConstraint?.fields)
+    ? rawConstraint.fields
+        .map((field) =>
+          readBoundedString(field, MAX_CONSTRAINT_IDENTIFIER_LENGTH),
+        )
+        .filter((field): field is string => field !== undefined)
+        .slice(0, MAX_CONSTRAINT_FIELDS)
+    : undefined;
+
+  return {
+    ...(kind ? { kind } : {}),
+    ...(originalCode ? { originalCode } : {}),
+    ...(code !== undefined ? { code } : {}),
+    ...(sqlState ? { sqlState } : {}),
+    ...(index || (fields !== undefined && fields.length > 0)
+      ? {
+          constraint: {
+            ...(index ? { index } : {}),
+            ...(fields !== undefined && fields.length > 0 ? { fields } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+function categoryForDriverCause(cause: SafeDriverAdapterCause): string {
+  if (cause.kind && CATEGORY_BY_DRIVER_KIND[cause.kind]) {
+    return CATEGORY_BY_DRIVER_KIND[cause.kind];
+  }
+
+  const code =
+    cause.originalCode ??
+    (cause.code === undefined ? undefined : String(cause.code));
+  return (code && CATEGORY_BY_MYSQL_CODE[code]) ?? "DRIVER_ADAPTER";
+}
+
+function isTopLevelDriverAdapterError(error: unknown): boolean {
+  const record = asRecord(error);
+  const cause = asRecord(record?.cause);
+  return (
+    error instanceof Error &&
+    error.name === "DriverAdapterError" &&
+    typeof cause?.kind === "string"
+  );
+}
 
 function stringifyFieldTarget(target: unknown): string | undefined {
   if (typeof target === "string") {
@@ -51,40 +188,41 @@ function extractDriverContext(meta: unknown): {
   driverCode?: string;
   sqlState?: string;
   fields?: string;
+  cause?: SafeDriverAdapterCause;
 } {
   if (meta === null || typeof meta !== "object") {
     return {};
   }
-  const cause = (
+  const rawCause = (
     meta as { driverAdapterError?: { cause?: Record<string, unknown> } }
   ).driverAdapterError?.cause;
-  if (cause === undefined || cause === null) {
+  if (rawCause === undefined || rawCause === null) {
     return {};
   }
-
+  const cause = extractSafeDriverCause(rawCause);
   const driverCode =
-    typeof cause.originalCode === "string"
-      ? cause.originalCode
-      : typeof cause.code === "string"
-        ? cause.code
-        : undefined;
-  const sqlState =
-    typeof cause.sqlState === "string" ? cause.sqlState : undefined;
-  const constraint = (cause.constraint ?? {}) as {
-    index?: unknown;
-    fields?: unknown;
-  };
+    cause.originalCode ??
+    (cause.code === undefined ? undefined : String(cause.code));
   const fields =
-    typeof constraint.index === "string"
-      ? constraint.index
-      : stringifyFieldTarget(constraint.fields);
+    cause.constraint?.index ?? stringifyFieldTarget(cause.constraint?.fields);
 
-  return { driverCode, sqlState, fields };
+  return { driverCode, sqlState: cause.sqlState, fields, cause };
 }
 
 export function toSafeDatabaseErrorContext(
   error: unknown,
 ): SafeDatabaseErrorContext {
+  if (isTopLevelDriverAdapterError(error)) {
+    const cause = extractSafeDriverCause(
+      (error as Error & { cause: unknown }).cause,
+    );
+    return {
+      errorName: "DriverAdapterError",
+      cause,
+      databaseCategory: categoryForDriverCause(cause),
+    };
+  }
+
   if (error instanceof Prisma.PrismaClientKnownRequestError) {
     const meta = error.meta as
       | { modelName?: unknown; target?: unknown; column?: unknown }
@@ -105,6 +243,9 @@ export function toSafeDatabaseErrorContext(
       })(),
       ...(driver.driverCode ? { driverCode: driver.driverCode } : {}),
       ...(driver.sqlState ? { sqlState: driver.sqlState } : {}),
+      ...(driver.cause && Object.keys(driver.cause).length > 0
+        ? { cause: driver.cause }
+        : {}),
       ...(CATEGORY_BY_PRISMA_CODE[error.code]
         ? { databaseCategory: CATEGORY_BY_PRISMA_CODE[error.code] }
         : {}),
@@ -194,4 +335,9 @@ export function isPrismaError(error: unknown): boolean {
     error instanceof Prisma.PrismaClientUnknownRequestError ||
     error instanceof Prisma.PrismaClientRustPanicError
   );
+}
+
+/** True for Prisma client errors and direct driver-adapter failures. */
+export function isDatabaseError(error: unknown): boolean {
+  return isPrismaError(error) || isTopLevelDriverAdapterError(error);
 }

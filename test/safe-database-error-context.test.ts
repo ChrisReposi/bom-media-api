@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Prisma } from "../src/generated/prisma/client";
 import {
+  isDatabaseError,
   isPrismaError,
   toSafeDatabaseErrorContext,
 } from "../src/common/errors/safe-database-error-context.util";
@@ -70,7 +71,83 @@ describe("safe database error context", () => {
     assert.equal(context.modelName, "VideoAsset");
     assert.equal(context.driverCode, "1062");
     assert.equal(context.fields, "VideoAsset_slug_key");
+    assert.deepEqual(context.cause, {
+      kind: "UniqueConstraintViolation",
+      originalCode: "1062",
+      constraint: { index: "VideoAsset_slug_key" },
+    });
     assertNoSecrets(context);
+  });
+
+  it("extracts a top-level DriverAdapterError using a strict structural allowlist", () => {
+    const error = Object.assign(new Error(SECRETS.join(" ")), {
+      name: "DriverAdapterError",
+      cause: {
+        kind: "mysql",
+        originalCode: "42000",
+        originalMessage: `${SECRETS[3]} ${SECRETS[0]}`,
+        code: 1064,
+        state: "42000",
+        message: `${SECRETS[3]} ${SECRETS[1]}`,
+        sql: SECRETS[3],
+        parameters: ["private value"],
+        host: "db.example.com",
+        user: "private-user",
+        password: SECRETS[1],
+      },
+    });
+
+    const context = toSafeDatabaseErrorContext(error);
+    assert.deepEqual(context, {
+      errorName: "DriverAdapterError",
+      cause: {
+        kind: "mysql",
+        originalCode: "42000",
+        code: 1064,
+        sqlState: "42000",
+      },
+      databaseCategory: "DRIVER_ADAPTER",
+    });
+    assert.equal(isDatabaseError(error), true);
+    assertNoSecrets(context);
+  });
+
+  it("classifies direct adapter causes without reading raw driver messages", () => {
+    const missingColumn = Object.assign(new Error(SECRETS[3]), {
+      name: "DriverAdapterError",
+      cause: {
+        kind: "ColumnNotFound",
+        originalCode: "1054",
+        originalMessage: SECRETS[3],
+        column: "private_column_from_message",
+      },
+    });
+    const constraint = Object.assign(new Error(SECRETS[3]), {
+      name: "DriverAdapterError",
+      cause: {
+        kind: "UniqueConstraintViolation",
+        originalCode: "1062",
+        constraint: { fields: ["websiteId", "videoId"] },
+        message: SECRETS[3],
+      },
+    });
+
+    assert.deepEqual(toSafeDatabaseErrorContext(missingColumn), {
+      errorName: "DriverAdapterError",
+      cause: { kind: "ColumnNotFound", originalCode: "1054" },
+      databaseCategory: "MISSING_COLUMN",
+    });
+    assert.deepEqual(toSafeDatabaseErrorContext(constraint), {
+      errorName: "DriverAdapterError",
+      cause: {
+        kind: "UniqueConstraintViolation",
+        originalCode: "1062",
+        constraint: { fields: ["websiteId", "videoId"] },
+      },
+      databaseCategory: "CONSTRAINT_VIOLATION",
+    });
+    assertNoSecrets(toSafeDatabaseErrorContext(missingColumn));
+    assertNoSecrets(toSafeDatabaseErrorContext(constraint));
   });
 
   it("handles array meta.target", () => {
@@ -116,5 +193,6 @@ describe("safe database error context", () => {
     );
     assert.equal(isPrismaError(new Error("x")), false);
     assert.equal(isPrismaError("x"), false);
+    assert.equal(isDatabaseError(new Error("x")), false);
   });
 });

@@ -8,7 +8,7 @@ import {
 } from "@nestjs/common";
 import type { Request, Response } from "express";
 import {
-  isPrismaError,
+  isDatabaseError,
   readDatabaseStage,
   toSafeDatabaseErrorContext,
 } from "../errors/safe-database-error-context.util";
@@ -48,7 +48,7 @@ export class GlobalExceptionFilter implements ExceptionFilter {
           ...(stage ? { stage } : {}),
           errorName:
             exception instanceof Error ? exception.name : "UnknownError",
-          ...(isPrismaError(exception)
+          ...(isDatabaseError(exception)
             ? { database: toSafeDatabaseErrorContext(exception) }
             : {}),
         },

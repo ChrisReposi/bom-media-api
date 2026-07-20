@@ -57,6 +57,7 @@ export interface ApiEnvironmentConfig {
     connectTimeoutMs: number;
     acquireTimeoutMs: number;
     idleTimeoutSeconds: number;
+    mariaDbUseTextProtocol: boolean;
   };
   localFileStorage: {
     enabled: boolean;
@@ -322,6 +323,10 @@ export const apiConfig = registerAs("api", (): ApiEnvironmentConfig => {
       idleTimeoutSeconds: parsePositiveInteger(
         process.env.DB_IDLE_TIMEOUT_SECONDS,
         60,
+      ),
+      mariaDbUseTextProtocol: parseBoolean(
+        process.env.DB_MARIADB_USE_TEXT_PROTOCOL,
+        false,
       ),
     },
     localFileStorage: {

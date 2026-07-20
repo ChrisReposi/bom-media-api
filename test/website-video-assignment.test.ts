@@ -2,6 +2,7 @@ import "reflect-metadata";
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { AdminWebsitesService } from "../src/admin-websites/admin-websites.service";
+import { readDatabaseStage } from "../src/common/errors/safe-database-error-context.util";
 import {
   AssignmentStatus,
   AuditStatus,
@@ -98,6 +99,43 @@ describe("website video assignment", () => {
     assert.equal(findManyArgs?.skip, 10);
     assert.equal(findManyArgs?.take, 10);
     assert.equal(result.meta?.page, 2);
+  });
+
+  it("preserves the database error and tags an assigned-list query failure", async () => {
+    const databaseError = new Prisma.PrismaClientKnownRequestError(
+      "query failed",
+      {
+        code: "P2024",
+        clientVersion: "7.8.0",
+        meta: {},
+      },
+    );
+    const prisma = {
+      website: { findUnique: async () => ({ id: "website-1" }) },
+      websiteVideo: {
+        count: async () => 0,
+        findMany: async () => [],
+      },
+      $transaction: async () => {
+        throw databaseError;
+      },
+    };
+
+    let caught: unknown;
+    try {
+      await service(prisma).listAssignedVideos("website-1", {
+        page: 1,
+        limit: 24,
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    assert.equal(caught, databaseError);
+    assert.equal(
+      readDatabaseStage(caught),
+      "WEBSITE_ASSIGNED_VIDEO_LIST_QUERY",
+    );
   });
 
   it("assigns once or reactivates idempotently and writes audit in the transaction", async () => {

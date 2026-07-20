@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, unlink } from "node:fs/promises";
 import { buildCacheKey } from "../cache/memory-cache-key.util";
 import { MemoryCacheService } from "../cache/memory-cache.service";
+import { rethrowWithDatabaseStage } from "../common/errors/safe-database-error-context.util";
 import { CloudinaryService } from "../cloudinary/cloudinary.service";
 import { PrismaService } from "../database/prisma.service";
 import {
@@ -257,49 +258,59 @@ export class VideosService {
     );
     const orderBy = this.buildVideoOrderBy(params.sortBy, params.sortOrder);
 
-    const [items, total] = await this.prisma.$transaction([
-      this.prisma.videoAsset.findMany({
-        where,
-        orderBy,
-        skip,
-        take: params.limit,
-        include: {
-          binaryAsset: {
-            select: {
-              mimeType: true,
-              sizeBytes: true,
+    // `.catch` tags the failing stage on the (unchanged) error and rethrows;
+    // it returns `never`, so `items`/`total` keep their exact inferred Prisma
+    // types. The single request-correlated failure log is emitted by
+    // GlobalExceptionFilter, which reads the stage tag.
+    const [items, total] = await this.prisma
+      .$transaction([
+        this.prisma.videoAsset.findMany({
+          where,
+          orderBy,
+          skip,
+          take: params.limit,
+          include: {
+            binaryAsset: {
+              select: {
+                mimeType: true,
+                sizeBytes: true,
+              },
+            },
+            localFileAsset: {
+              select: {
+                mimeType: true,
+                sizeBytes: true,
+                checksumSha256: true,
+                originalFilename: true,
+              },
+            },
+            localThumbnailAsset: {
+              select: {
+                mimeType: true,
+                sizeBytes: true,
+                checksumSha256: true,
+                originalFilename: true,
+              },
             },
           },
-          localFileAsset: {
-            select: {
-              mimeType: true,
-              sizeBytes: true,
-              checksumSha256: true,
-              originalFilename: true,
-            },
-          },
-          localThumbnailAsset: {
-            select: {
-              mimeType: true,
-              sizeBytes: true,
-              checksumSha256: true,
-              originalFilename: true,
-            },
-          },
-        },
-      }),
-      this.prisma.videoAsset.count({ where }),
-    ]);
+        }),
+        this.prisma.videoAsset.count({ where }),
+      ])
+      .catch(rethrowWithDatabaseStage("ADMIN_VIDEO_LIST_QUERY"));
 
-    return {
-      items: items.map((video) => this.toVideoResponse(video)),
-      meta: {
-        page: params.page,
-        limit: params.limit,
-        total,
-        totalPages: Math.ceil(total / params.limit),
-      },
-    };
+    try {
+      return {
+        items: items.map((video) => this.toVideoResponse(video)),
+        meta: {
+          page: params.page,
+          limit: params.limit,
+          total,
+          totalPages: Math.ceil(total / params.limit),
+        },
+      };
+    } catch (error) {
+      throw rethrowWithDatabaseStage("ADMIN_VIDEO_LIST_MAPPING")(error);
+    }
   }
 
   async getVideo(id: string): Promise<VideoResponse> {

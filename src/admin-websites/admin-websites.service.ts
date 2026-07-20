@@ -9,6 +9,7 @@ import {
 import { ConfigService } from "@nestjs/config";
 import { buildCacheKey } from "../cache/memory-cache-key.util";
 import { MemoryCacheService } from "../cache/memory-cache.service";
+import { rethrowWithDatabaseStage } from "../common/errors/safe-database-error-context.util";
 import { PrismaService } from "../database/prisma.service";
 import { Prisma } from "../generated/prisma/client";
 import {
@@ -133,10 +134,6 @@ type VideoWithAdminMediaMetadata = VideoAsset & {
 
 type WebsiteVideoWithVideo = WebsiteVideo & {
   video: VideoWithAdminMediaMetadata;
-};
-
-type VideoAssignmentOptionRecord = VideoWithAdminMediaMetadata & {
-  websiteVideos: Array<Pick<WebsiteVideo, "id" | "status">>;
 };
 
 type VideoWithBinaryAssetMetadata = VideoAsset & {
@@ -1352,81 +1349,93 @@ export class AdminWebsitesService {
     }
 
     const optionWhere = this.buildVideoAssignmentOptionWhere(websiteId, query);
+    // `.catch` tags the failing stage and rethrows (returns `never`), so the
+    // destructured results keep their exact inferred Prisma types — no
+    // `unknown` and no late cast. The single correlated failure log is emitted
+    // by GlobalExceptionFilter from the stage tag.
     const [total, activeAssignments, eligibleCandidateTotal, videos] =
-      await this.prisma.$transaction([
-        this.prisma.videoAsset.count({ where: optionWhere }),
-        this.prisma.websiteVideo.findMany({
-          where: activeAssignmentWhere,
-          orderBy: [{ sortOrder: "asc" }, { videoId: "asc" }],
-          select: { videoId: true },
-        }),
-        this.prisma.videoAsset.count({ where: eligibleCandidateWhere }),
-        this.prisma.videoAsset.findMany({
-          where: optionWhere,
-          include: {
-            websiteVideos: {
-              where: { websiteId },
-              select: { id: true, status: true },
-              take: 1,
-            },
-            binaryAsset: { select: { mimeType: true, sizeBytes: true } },
-            localFileAsset: {
-              select: {
-                mimeType: true,
-                sizeBytes: true,
-                checksumSha256: true,
-                originalFilename: true,
+      await this.prisma
+        .$transaction([
+          this.prisma.videoAsset.count({ where: optionWhere }),
+          this.prisma.websiteVideo.findMany({
+            where: activeAssignmentWhere,
+            orderBy: [{ sortOrder: "asc" }, { videoId: "asc" }],
+            select: { videoId: true },
+          }),
+          this.prisma.videoAsset.count({ where: eligibleCandidateWhere }),
+          this.prisma.videoAsset.findMany({
+            where: optionWhere,
+            include: {
+              websiteVideos: {
+                where: { websiteId },
+                select: { id: true, status: true },
+                take: 1,
+              },
+              binaryAsset: { select: { mimeType: true, sizeBytes: true } },
+              localFileAsset: {
+                select: {
+                  mimeType: true,
+                  sizeBytes: true,
+                  checksumSha256: true,
+                  originalFilename: true,
+                },
+              },
+              localThumbnailAsset: {
+                select: {
+                  mimeType: true,
+                  sizeBytes: true,
+                  checksumSha256: true,
+                  originalFilename: true,
+                },
               },
             },
-            localThumbnailAsset: {
-              select: {
-                mimeType: true,
-                sizeBytes: true,
-                checksumSha256: true,
-                originalFilename: true,
-              },
-            },
-          },
-          orderBy: [
-            { [query.sortBy ?? "createdAt"]: query.sortOrder ?? "desc" },
-            { id: "asc" },
-          ],
-          skip: (page - 1) * limit,
-          take: limit,
+            orderBy: [
+              { [query.sortBy ?? "createdAt"]: query.sortOrder ?? "desc" },
+              { id: "asc" },
+            ],
+            skip: (page - 1) * limit,
+            take: limit,
+          }),
+        ])
+        .catch(rethrowWithDatabaseStage("WEBSITE_ASSIGNMENT_OPTIONS_QUERY"));
+
+    try {
+      return {
+        items: videos.map((video) => {
+          const assignmentStatus = video.websiteVideos[0]?.status ?? null;
+          const isAssigned = assignmentStatus === AssignmentStatus.ACTIVE;
+          const isEligible = this.isPublicPlayableVideo(video);
+
+          return {
+            video: this.toAdminVideoResponse(video),
+            isAssigned,
+            assignmentStatus,
+            canAssign: !isAssigned && isEligible,
+            canUnassign: isAssigned,
+            blockedReason: isEligible
+              ? null
+              : video.status !== VideoStatus.READY
+                ? "VIDEO_NOT_READY"
+                : "VIDEO_NOT_PLAYABLE",
+          };
         }),
-      ]);
-
-    return {
-      items: (videos as VideoAssignmentOptionRecord[]).map((video) => {
-        const assignmentStatus = video.websiteVideos[0]?.status ?? null;
-        const isAssigned = assignmentStatus === AssignmentStatus.ACTIVE;
-        const isEligible = this.isPublicPlayableVideo(video);
-
-        return {
-          video: this.toAdminVideoResponse(video),
-          isAssigned,
-          assignmentStatus,
-          canAssign: !isAssigned && isEligible,
-          canUnassign: isAssigned,
-          blockedReason: isEligible
-            ? null
-            : video.status !== VideoStatus.READY
-              ? "VIDEO_NOT_READY"
-              : "VIDEO_NOT_PLAYABLE",
-        };
-      }),
-      meta: {
-        page,
-        limit,
-        total,
-        totalPages: total === 0 ? 0 : Math.ceil(total / limit),
-        activeAssignmentTotal: activeAssignments.length,
-        eligibleCandidateTotal,
-        activeAssignedVideoIds: activeAssignments.map(
-          (assignment) => assignment.videoId,
-        ),
-      },
-    };
+        meta: {
+          page,
+          limit,
+          total,
+          totalPages: total === 0 ? 0 : Math.ceil(total / limit),
+          activeAssignmentTotal: activeAssignments.length,
+          eligibleCandidateTotal,
+          activeAssignedVideoIds: activeAssignments.map(
+            (assignment) => assignment.videoId,
+          ),
+        },
+      };
+    } catch (error) {
+      throw rethrowWithDatabaseStage("WEBSITE_ASSIGNMENT_OPTIONS_MAPPING")(
+        error,
+      );
+    }
   }
 
   async assignVideos(

@@ -7,6 +7,12 @@ import {
   type ExceptionFilter,
 } from "@nestjs/common";
 import type { Request, Response } from "express";
+import {
+  isPrismaError,
+  readDatabaseStage,
+  toSafeDatabaseErrorContext,
+} from "../errors/safe-database-error-context.util";
+import { safeRequestRoute } from "../http/safe-request-route.util";
 
 @Catch()
 export class GlobalExceptionFilter implements ExceptionFilter {
@@ -26,13 +32,25 @@ export class GlobalExceptionFilter implements ExceptionFilter {
         ? exception.getStatus()
         : HttpStatus.INTERNAL_SERVER_ERROR;
     if (status >= 500) {
+      // One request-correlated failure log. `route` is a safe template (never
+      // a raw URL/query string). `stage` is read from a tag the service put on
+      // the error, so a single line ties requestId + route + stage + Prisma
+      // context together. The util never exposes raw messages, SQL, query
+      // args, or secrets; the client response below stays generic.
+      const route = safeRequestRoute(request);
+      const stage = readDatabaseStage(exception);
       this.logger.error(
         {
           requestId: request.id,
           method: request.method,
+          ...(route ? { route } : {}),
           status,
+          ...(stage ? { stage } : {}),
           errorName:
             exception instanceof Error ? exception.name : "UnknownError",
+          ...(isPrismaError(exception)
+            ? { database: toSafeDatabaseErrorContext(exception) }
+            : {}),
         },
         "Request failed.",
       );

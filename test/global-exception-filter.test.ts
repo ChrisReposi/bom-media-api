@@ -181,6 +181,59 @@ describe("GlobalExceptionFilter diagnostic logging", () => {
     assert.equal(database.modelName, "VideoAsset");
   });
 
+  it("logs only allowlisted structure for a top-level DriverAdapterError", () => {
+    const rawSql = "SELECT secret_value FROM VideoAsset";
+    const error = tagDatabaseStage(
+      Object.assign(new Error(rawSql), {
+        name: "DriverAdapterError",
+        cause: {
+          kind: "mysql",
+          originalCode: "1064",
+          code: 1064,
+          state: "42000",
+          originalMessage: rawSql,
+          message: rawSql,
+          sql: rawSql,
+          parameters: ["secret_value"],
+        },
+      }),
+      "ADMIN_VIDEO_LIST_QUERY",
+    );
+
+    const { log } = runFilter(error, {
+      id: "req-driver",
+      method: "GET",
+      route: { path: "/api/v1/admin/videos" },
+      baseUrl: "",
+      originalUrl: "/api/v1/admin/videos?search=secret_value",
+      headers: { authorization: "Bearer raw-token" },
+    });
+
+    assert.ok(log);
+    assert.equal(log.payload.errorName, "DriverAdapterError");
+    assert.equal(log.payload.stage, "ADMIN_VIDEO_LIST_QUERY");
+    assert.deepEqual(log.payload.database, {
+      errorName: "DriverAdapterError",
+      cause: {
+        kind: "mysql",
+        originalCode: "1064",
+        code: 1064,
+        sqlState: "42000",
+      },
+      databaseCategory: "DRIVER_ADAPTER",
+    });
+    const serialized = JSON.stringify(log.payload);
+    for (const forbidden of [
+      rawSql,
+      "secret_value",
+      "raw-token",
+      "search=",
+      "parameters",
+    ]) {
+      assert.ok(!serialized.includes(forbidden), `leaked: ${forbidden}`);
+    }
+  });
+
   it("omits stage/database for non-database errors", () => {
     const { log } = runFilter(new Error("plain"), {
       id: "req-plain",

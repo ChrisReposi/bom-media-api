@@ -1,0 +1,27 @@
+services:
+  mariadb-test:
+    image: mariadb:11.8.8
+    container_name: bom_media_api_mariadb_118_test
+    restart: "no"
+    command:
+      - --max-allowed-packet=256M
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MARIADB_ROOT_PASSWORD: bom_media_root_test
+      MARIADB_DATABASE: video_share_cms_mariadb_test
+      MARIADB_USER: bom_media_test
+      MARIADB_PASSWORD: bom_media_test
+      TZ: UTC
+    ports:
+      - "3308:3306"
+    volumes:
+      - bom_media_api_mariadb_118_test_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  bom_media_api_mariadb_118_test_data:

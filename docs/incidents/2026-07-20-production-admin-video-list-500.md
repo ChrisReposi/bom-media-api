@@ -1,7 +1,7 @@
 # Incident: Production admin video list & assignment-options 500
 
 - Date opened: 2026-07-20
-- Status: **Root cause NOT_PROVEN — diagnostic release deployed; corrective evidence pending**
+- Status: **Root cause NOT_PROVEN — query stage proven; adapter cause pending after diagnostic hardening**
 - Active diagnostic release: `main @ 579becd`
 - Investigation branch: `hotfix/production-video-query-500-root-cause`
 
@@ -30,6 +30,19 @@ surface and cannot be treated as the sole root cause. `/health` and
   `2026-07-20T03:04:56.655Z`.
 - 2026-07-20 — second read-only local operation matrix passes every individual
   query, array transaction, service mapper and serialization path.
+- 2026-07-20 — three Production failures are now request-correlated. Global
+  search fails at `ADMIN_VIDEO_LIST_QUERY` in 14 ms and assignment options
+  fails at `WEBSITE_ASSIGNMENT_OPTIONS_QUERY` in 33 ms; both are top-level
+  `DriverAdapterError`. Response mapping is ruled out. The original extractor
+  did not understand that top-level shape, so its safe `cause` is not yet known.
+- 2026-07-20 — operator verified MariaDB `11.8.8-MariaDB-log`, all 19 migration
+  rows finished, all critical physical columns/tables present, 236 LOCAL_FILE
+  videos with matching file/thumbnail relations, zero WebsiteVideo rows, valid
+  metadata, and direct SQL `LIKE '%sml%'` success.
+- 2026-07-20 — isolated MariaDB 11.8.8 proof ran the production-built Nest API
+  over real HTTP with 236 run-scoped LOCAL_FILE fixtures. Binary and text
+  protocols both passed every failing query shape, mapper and HTTP/BigInt
+  serialization. All fixtures were deleted.
 
 ## 3. Known production evidence
 
@@ -37,9 +50,18 @@ surface and cannot be treated as the sole root cause. `/health` and
 - Migration history complete (19), no pending → pending-migration RULED_OUT.
 - Health 200; ready 200 (`database=ok`, `storage=disabled`).
 - Release identity is PROVEN: health reports commit `579becd`.
-- The diagnostic filter is deployed, but no sanitized request-correlated runtime
-  log has been supplied to this investigation environment. Exact Prisma/driver
-  code and failing Production stage remain NOT_VERIFIED.
+- Production stage/error identity is proven from correlated logs:
+  - `dcc104ad-87d3-44d1-97ab-fdcdd77da5a1` → global search,
+    `ADMIN_VIDEO_LIST_QUERY`, `DriverAdapterError`, 14 ms.
+  - `70e7898f-1cd8-43d4-9407-c1822050f788` → assignment options,
+    `WEBSITE_ASSIGNMENT_OPTIONS_QUERY`, `DriverAdapterError`, 33 ms.
+- Mapping/serialization is therefore ruled out for those requests. Missing
+  table/column and pending migration are ruled out by migration and physical
+  schema evidence. P2024/slow-query explanations are low probability because
+  the direct adapter errors arrive in 14–33 ms, but the exact driver cause is
+  still unavailable from the deployed extractor.
+- Locked dependency versions are: `prisma=7.8.0`, `@prisma/client=7.8.0`,
+  `@prisma/adapter-mariadb=7.8.0`, and transitive `mariadb=3.4.5`.
 
 ## 4. Call graph (shared failure surface)
 
@@ -60,20 +82,23 @@ not prove that the transaction or connection pool is defective.
 
 | Hypothesis                                         | Status                           | Evidence for                                                                                                                                | Remaining gap                                       |
 | -------------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
-| Search/title/LIKE defect                           | POSSIBLE for global search only  | global no-search passes                                                                                                                     | cannot explain no-search assignment-options failure |
-| Pending migration                                  | RULED_OUT                        | migrate status clean                                                                                                                        | —                                                   |
-| Code/query-shape/array-transaction defect          | RULED_OUT (local)                | exact prod shapes return 200 on real MySQL 8 incl. 4-way `$transaction`                                                                     | prod adapter/runtime unverified                     |
-| Response mapping / legacy null row                 | POSSIBLE                         | mappers pass current data                                                                                                                   | prod may hold rows that throw; no prod row dump     |
-| Physical schema drift (P2022 missing column/table) | POSSIBLE                         | migrate history ≠ physical schema is possible                                                                                               | needs `information_schema` output                   |
-| Connection-pool timeout (P2024)                    | POSSIBLE (leading env candidate) | both failing endpoints use `$transaction` (holds a connection); health uses none; default `DB_CONNECTION_LIMIT=5` on shared Hostinger MySQL | needs runtime P2024 in logs                         |
-| Stale runtime                                      | RULED_OUT                        | health reports expected `579becd`                                                                                                           | —                                                   |
-| Wrong database                                     | POSSIBLE                         | runtime DB identity is not in health                                                                                                        | needs same-context schema/status evidence           |
-| Observability gap                                  | CLOSED IN RUNTIME                | `579becd` contains allowlisted database context                                                                                             | operator still must return the correlated log       |
+| Search/title/LIKE defect                           | RULED_OUT as common cause        | assignment options fails without search; direct Production LIKE succeeds                                                                    | —                                                   |
+| Pending migration / physical schema drift          | RULED_OUT                        | 19/19 finished; critical physical tables/columns verified                                                                                    | —                                                   |
+| Response mapping / HTTP serialization              | RULED_OUT for captured requests  | failure stage is QUERY; MariaDB 11.8 HTTP proof maps/serializes all shapes                                                                    | —                                                   |
+| Slow query / pool acquisition timeout              | LOW PROBABILITY                  | adapter failures arrive in 14–33 ms; controlled 236-row concurrency passes                                                                  | exact `cause.kind` still needed                     |
+| Binary prepared protocol defect                    | RULED_OUT in controlled MariaDB  | MariaDB 11.8.8 binary and text both pass identical built-API HTTP matrix                                                                      | Production A/B not run                              |
+| MariaDB adapter/driver environment-specific defect | POSSIBLE                         | Production alone emits top-level `DriverAdapterError`                                                                                        | deploy safe cause extractor, capture cause          |
+| Relation-join strategy                             | RULED_OUT                        | generator has no preview feature/override; adapter 7.8 reports `supportsRelationJoins=false` for MariaDB                                      | —                                                   |
+| Stale runtime                                      | RULED_OUT                        | health reports expected `579becd`                                                                                                            | —                                                   |
+| Wrong database/runtime environment                 | LOW PROBABILITY                  | same-context Production schema/data identity supplied                                                                                        | exact application env binding should remain audited |
+| Observability gap                                  | FIX IMPLEMENTED, NOT DEPLOYED    | top-level DriverAdapterError extraction and safe Pino request serializer added                                                               | requires a diagnostic deployment                    |
 
 ## 6. Local reproduction results
 
 Read-only probe of the exact Production query shapes against local MySQL 8 via
-`@prisma/adapter-mariadb` (dev DB, 19 migrations):
+`@prisma/adapter-mariadb` (dev DB, 19 migrations) passed. A second, isolated
+proof then used `mariadb:11.8.8`, 19 migrations, a production build, real Nest
+HTTP, one test admin/website and 236 run-scoped LOCAL_FILE videos:
 
 ```
 global no-search service/mapping                 -> 20 / 26
@@ -86,6 +111,9 @@ assignment option 4-way transaction + mapper     -> 26 / 24, PASS
 non-production Promise.all comparison            -> PASS
 local SQL mode NO_BACKSLASH_ESCAPES               -> false
 title/slug/filterKey collation                    -> utf8mb4_unicode_ci
+MariaDB binary: all 4 HTTP cases + mapping/BigInt  -> PASS
+MariaDB text:   all 4 HTTP cases + mapping/BigInt  -> PASS
+run-scoped cleanup                                -> 0 leftovers
 ```
 
 Local `EXPLAIN` chooses `VideoAsset_status_createdAt_idx` for the no-search
@@ -95,18 +123,22 @@ the VideoAsset primary key. The dataset is only 26 videos/5 assignments, so
 this is not representative Production performance evidence. No index migration
 is justified until Production error code and plan/cardinality are captured.
 
-All 194 baseline tests and the previous real HTTP smoke pass. Local cannot
-reproduce the Production 500.
+The MariaDB fixture deliberately matches the key Production cardinality:
+236 VideoAsset + 236 VideoLocalFileAsset + 236 VideoLocalThumbnailAsset,
+zero WebsiteVideo, `search=sml`, and BigInt values above JavaScript's safe
+integer range. Local still cannot reproduce the Production 500.
 
 ## 7. Production evidence still required (one bundle)
 
-For a single fresh failing request, operator provides:
+Deploy the follow-up diagnostic commit with
+`DB_MARIADB_USE_TEXT_PROTOCOL=false`, then provide one fresh failing request:
 
 ```
 endpoint + HTTP status + timestamp (UTC) + X-Request-Id
 sanitized runtime log line for that requestId, now including:
-  errorName, database.errorCode, database.modelName, database.fields,
-  database.driverCode, database.databaseCategory, stage
+  errorName, database.cause.kind, database.cause.originalCode,
+  database.cause.code, database.cause.sqlState,
+  database.cause.constraint.index/fields, database.databaseCategory, stage
 ```
 
 Redact: Authorization, Cookie, DATABASE_URL, password, tokens, raw SQL values.
@@ -131,13 +163,13 @@ rows, SQL, raw messages or connection details.
 
 ## 8–9. Root cause
 
-**NOT_PROVEN.** Cannot reproduce locally and no Production runtime exception is
-available in this workspace. P2022 physical drift, P2024/pool pressure,
-Production-only relation/cardinality, and legacy-row mapping remain possible.
-Stale runtime is ruled out. Per incident discipline, no speculative query,
-index, transaction, cache or mapping change was made.
+**NOT_PROVEN.** The failing layer is proven (`DriverAdapterError` in query
+stages), but its safe driver cause has not yet been captured. Schema drift,
+mapping, relation joins, and a generally broken MariaDB binary protocol are
+ruled out. A Hostinger/Production-specific adapter-driver condition remains.
+No speculative query, index, transaction, cache or mapping change was made.
 
-## 10. Code changes (diagnostic release — behavior-preserving)
+## 10. Code changes (follow-up diagnostic hardening — behavior-preserving)
 
 - `src/common/errors/safe-database-error-context.util.ts` (new): extracts
   allowlisted Prisma/driver context (`errorCode`, `modelName`, `fields`,
@@ -165,49 +197,77 @@ index, transaction, cache or mapping change was made.
   per-operation probe with a Production confirmation guard and redacted output.
   Concurrency comparison is non-Production-only.
 - No query, DTO, transaction, cache, auth, RBAC, or response-contract change.
+- Top-level `DriverAdapterError` now emits only a bounded structural allowlist:
+  `cause.kind`, `originalCode`, numeric/string `code`, normalized `sqlState`,
+  and constraint index/fields plus a coarse category. Raw messages, stack,
+  SQL, parameters and connection identity are never copied.
+- Automatic Pino request logs now contain only request ID, method and a safe
+  route template. They no longer serialize request URL, query object, headers,
+  forwarded/client IP or remote port. Global exception logs keep their exact
+  matched safe route template and stage.
+- Prisma startup no longer logs the database host, port or database name in
+  any environment.
+- Added validated `DB_MARIADB_USE_TEXT_PROTOCOL` (default `false`) and passed it
+  as the adapter option. This is an operator-controlled A/B switch, not a
+  claimed fix. The guarded read-only diagnostic reports which protocol it used.
+- Added isolated MariaDB 11.8.8 Docker/API proof. It is opt-in, exact-test-DB
+  guarded, not part of normal unit tests, and cleans only run-scoped fixtures.
+- Prisma generator preview features are empty and application source has no
+  `relationLoadStrategy`; adapter 7.8 explicitly disables relation joins for
+  MariaDB, so no relation strategy was changed.
 
 Release identity injection is now verified in Production health.
 
 ## 11. Tests
 
-- `test/safe-database-error-context.test.ts` (7): P2022→MISSING_COLUMN,
+- `test/safe-database-error-context.test.ts`: P2022→MISSING_COLUMN,
   P2024→CONNECTION_POOL_TIMEOUT, MariaDB driver shape (no `meta.target`),
-  array target, init error URL redaction, graceful degrade, `isPrismaError`.
+  top-level `DriverAdapterError` generic/column/constraint shapes, array target,
+  init error URL redaction, graceful degrade and database-error recognition.
+- Global filter tests prove top-level driver cause extraction while malicious
+  message/SQL/parameters/token/query values are absent. Pino serializer tests
+  prove URL/query/header/forwarded IP/client IP are absent.
+- Protocol proof safety tests require the exact local isolated database and
+  confirmation, verify run-scoped identities and both protocol branches.
 - Diagnostic safety coverage proves the Production confirmation/website guard,
   no concurrent probe in Production, allowlisted error serialization, absence
   of database mutation primitives, and assigned-list query/mapping tags.
 - Baseline before this branch: 194/194 tests in 53 suites.
-- Final branch verification: 199/199 tests in 54 suites; Prisma
-  generate/validate/status, typecheck, lint (0 errors/92 existing warnings),
-  build, format, focused diagnostic typecheck and diff-check all pass.
+- Final branch verification: 208/208 tests in 55 suites; typecheck, lint
+  (0 errors/92 existing warnings), build, format, focused MariaDB 11.8.8
+  binary/text integration proof and diff-check all pass.
 
-## 12. Deployment plan (two-stage)
+## 12. Deployment plan and controlled Production A/B
 
-1. **Evidence completion**: capture one correlated log for each failing surface,
-   or run the guarded probe once in the deployed runtime context. Do not deploy
-   another behavioral build first.
-2. **Corrective release**: only after runtime evidence pins the cause —
-   - P2022/P2021 → §16 schema comparison + reviewed additive repair migration
-     (backup first; no unreviewed ALTER, no `db push`, no reset).
-   - P2024 → raise `DB_CONNECTION_LIMIT` to match Hostinger MySQL limit and/or
-     reduce per-request connection hold; re-test under concurrency.
-   - mapping/legacy row → targeted backward-compatible normalization + fixture.
-   - wrong DB → correct Hostinger environment binding before any migration.
+1. Deploy this diagnostic-only commit with
+   `DB_MARIADB_USE_TEXT_PROTOCOL=false`, build, restart, and verify release SHA.
+2. Reproduce the three requests and capture the new safe `database.cause`.
+3. Only if the captured cause points to prepared execution/protocol behavior,
+   set `DB_MARIADB_USE_TEXT_PROTOCOL=true`, restart the same artifact, repeat
+   the exact request matrix, and compare request IDs/status/cause. Change no
+   other variable during the A/B.
+4. Binary fail + text pass in Production would prove a protocol-specific
+   mitigation; keep text temporarily and raise the exact cause/version matrix
+   upstream. Both fail means revert to false and investigate that cause.
+5. Do not replace `$transaction`, alter schema/data, or tune the pool until the
+   captured structural cause supports that action.
 
 ## 13. Rollback plan
 
-This branch is diagnostic-only and additive → rollback = redeploy `579becd`.
-No DB reset, migration rollback, or data mutation is involved.
+Code rollback is redeploy `579becd`. Protocol rollback is set
+`DB_MARIADB_USE_TEXT_PROTOCOL=false` and restart the same artifact. No schema,
+migration or Production data change is involved.
 
 ## 14. Remaining risks
 
-- If the cause is P2024, admin concurrency may keep intermittently failing
-  until the pool limit is corrected.
-- Physical drift, if present, needs a reviewed repair migration + backup.
+- Exact driver `cause.kind/code/sqlState` remains unknown until deployment.
+- Controlled MariaDB passed both protocols, so enabling text in Production
+  without A/B evidence could mask or relocate the real problem.
 
 ## 15. Final production acceptance status
 
-**NOT MET** — no production smoke returned 200 yet. Do not declare fixed.
+**NOT MET** — no corrective artifact or Production protocol A/B has been
+deployed; the failing endpoints have not returned 200 in Production.
 
 ## 16. Operator read-only SQL bundle (run only if evidence points to schema)
 

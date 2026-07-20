@@ -593,6 +593,11 @@ export function validateEnv(
   validated.DB_IDLE_TIMEOUT_SECONDS = String(
     readPositiveInteger(config, "DB_IDLE_TIMEOUT_SECONDS", 60),
   );
+  validated.DB_MARIADB_USE_TEXT_PROTOCOL = readBoolean(
+    config,
+    "DB_MARIADB_USE_TEXT_PROTOCOL",
+    false,
+  );
 
   if (typeof config.VIDEO_UPLOAD_MAX_MB === "string") {
     const uploadMaxMb = Number(config.VIDEO_UPLOAD_MAX_MB.trim());

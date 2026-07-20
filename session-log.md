@@ -12,6 +12,60 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-20 — MariaDB DriverAdapter diagnostics and protocol-control follow-up
+
+### Production evidence and conclusion
+
+- Release `579becd` is still the affected Production runtime. Operator evidence
+  proves all 19 migrations and critical physical schema objects exist; 236
+  LOCAL_FILE videos have matching file/thumbnail rows, metadata is valid,
+  `WebsiteVideo=0`, and direct SQL LIKE works.
+- Correlated failures are query-stage top-level `DriverAdapterError`:
+  `ADMIN_VIDEO_LIST_QUERY` (14 ms) and
+  `WEBSITE_ASSIGNMENT_OPTIONS_QUERY` (33 ms). Mapping is ruled out; the
+  deployed extractor could not safely expose the direct adapter `cause`.
+- Locked stack: Prisma CLI/client/adapter 7.8.0 and MariaDB driver 3.4.5.
+  Generator preview features are empty; no application `relationLoadStrategy`
+  exists; adapter 7.8 disables relation joins for MariaDB.
+- Root cause remains NOT_PROVEN. A generally broken binary protocol is ruled
+  out by controlled reproduction, but a Production-specific driver condition
+  still requires the newly allowlisted `cause` from a diagnostic deployment.
+
+### Changed
+
+- Direct `DriverAdapterError` is now recognized as a database error. Logging
+  copies only bounded `cause.kind`, `originalCode`, `code`, normalized
+  `sqlState`, constraint index/fields, and a coarse category. Message, stack,
+  SQL, parameters, URL/credentials and arbitrary driver fields are excluded.
+- Pino's automatic request serializer now emits only request ID, method and a
+  safe route template; raw URL/query, headers, forwarded/client IP and remote
+  port are omitted. Prisma startup no longer logs host/port/database identity.
+- Added typed `DB_MARIADB_USE_TEXT_PROTOCOL` (boolean, default false), wired to
+  the adapter's second options argument and reported by the guarded diagnostic.
+- Added opt-in MariaDB 11.8.8 Docker + built-Nest HTTP proof with exact-test-DB
+  guard, 236 run-scoped fixtures, binary/text matrix, BigInt serialization and
+  mandatory cleanup. No query, transaction, schema, migration, auth/RBAC,
+  canonical, assignment mutation or response contract changed.
+
+### Verification
+
+- Isolated MariaDB 11.8.8, 19 migrations: binary PASS and text PASS for global
+  no-search, `search=sml`, assigned list with zero assignments, assignment
+  options with 236 candidates, mapper/HTTP serialization and BigInt values.
+- Cleanup verified zero admin/session/website/video/local-file/thumbnail/
+  assignment leftovers; the container and test volume were removed.
+- Unit suite PASS: 208/208 across 55 suites. Typecheck, build, format and
+  diff-check PASS; lint PASS with 0 errors and 92 existing import-style
+  warnings.
+- Production was not mutated, restarted, redeployed or A/B tested.
+
+### Next exact step
+
+- Deploy this diagnostic commit with protocol=false, reproduce all failing
+  surfaces, and capture the new structural driver cause. Run a same-artifact
+  protocol=true A/B only if that cause supports prepared-protocol behavior.
+  Do not change `$transaction`, schema/data or pool settings speculatively.
+
 ## 2026-07-20 — Production video-query root-cause isolation continuation
 
 ### Evidence

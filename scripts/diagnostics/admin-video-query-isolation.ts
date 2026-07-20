@@ -119,6 +119,7 @@ function createDiagnosticClient(): {
   connectionLimit: number;
   acquireTimeoutMs: number;
   connectTimeoutMs: number;
+  useTextProtocol: boolean;
 } {
   const rawDatabaseUrl = process.env.DATABASE_URL?.trim();
   if (!rawDatabaseUrl) {
@@ -138,24 +139,34 @@ function createDiagnosticClient(): {
     process.env.DB_CONNECT_TIMEOUT_MS,
     10_000,
   );
+  const useTextProtocol =
+    process.env.DB_MARIADB_USE_TEXT_PROTOCOL?.trim().toLowerCase() === "true" ||
+    process.env.DB_MARIADB_USE_TEXT_PROTOCOL?.trim() === "1";
   return {
     prisma: new PrismaClient({
-      adapter: new PrismaMariaDb({
-        host: url.hostname,
-        port: Number(url.port || 3306),
-        user: decodeURIComponent(url.username),
-        password: decodeURIComponent(url.password),
-        database,
-        connectionLimit,
-        acquireTimeout: acquireTimeoutMs,
-        connectTimeout: connectTimeoutMs,
-        idleTimeout: positiveInteger(process.env.DB_IDLE_TIMEOUT_SECONDS, 300),
-        allowPublicKeyRetrieval: true,
-      }),
+      adapter: new PrismaMariaDb(
+        {
+          host: url.hostname,
+          port: Number(url.port || 3306),
+          user: decodeURIComponent(url.username),
+          password: decodeURIComponent(url.password),
+          database,
+          connectionLimit,
+          acquireTimeout: acquireTimeoutMs,
+          connectTimeout: connectTimeoutMs,
+          idleTimeout: positiveInteger(
+            process.env.DB_IDLE_TIMEOUT_SECONDS,
+            300,
+          ),
+          allowPublicKeyRetrieval: true,
+        },
+        { useTextProtocol },
+      ),
     }),
     connectionLimit,
     acquireTimeoutMs,
     connectTimeoutMs,
+    useTextProtocol,
   };
 }
 
@@ -163,8 +174,13 @@ async function main(): Promise<number> {
   loadApiEnv();
   const options = readAdminVideoDiagnosticOptions(process.env, process.argv);
   writeSafeResult({ diagnosticStage: "ENVIRONMENT_VALIDATED" });
-  const { prisma, connectionLimit, acquireTimeoutMs, connectTimeoutMs } =
-    createDiagnosticClient();
+  const {
+    prisma,
+    connectionLimit,
+    acquireTimeoutMs,
+    connectTimeoutMs,
+    useTextProtocol,
+  } = createDiagnosticClient();
   await prisma.$connect();
   writeSafeResult({ diagnosticStage: "DATABASE_CONNECTED" });
 
@@ -212,6 +228,7 @@ async function main(): Promise<number> {
       connectionLimit,
       acquireTimeoutMs,
       connectTimeoutMs,
+      protocol: useTextProtocol ? "text" : "binary",
       concurrencyComparison: options.includeConcurrencyComparison,
     });
 

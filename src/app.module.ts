@@ -18,67 +18,26 @@ import { PublicModule } from "./public/public.module";
 import { SecurityModule } from "./security/security.module";
 import { buildThrottlerOptions } from "./security/throttle.config";
 import { VideosModule } from "./videos/videos.module";
+import { safeRequestRoute } from "./common/http/safe-request-route.util";
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Request } from "express";
 
 loadApiEnv();
-
-export function redactTokenFromUrl(value: string): string {
-  const [rawPath, queryString] = value.split("?");
-  const path = (rawPath ?? "").replace(
-    /(\/public\/watch\/)[^/?#]+/i,
-    "$1[Redacted]",
-  );
-
-  if (queryString === undefined) {
-    return path;
-  }
-
-  const searchParams = new URLSearchParams(queryString);
-  if (searchParams.has("token")) {
-    searchParams.set("token", "[Redacted]");
-  }
-  if (searchParams.has("grant")) {
-    searchParams.set("grant", "[Redacted]");
-  }
-
-  const nextQueryString = searchParams.toString();
-
-  return nextQueryString ? `${path}?${nextQueryString}` : path;
-}
-
-function redactQueryToken(value: unknown): unknown {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return value;
-  }
-
-  const query = value as Record<string, unknown>;
-
-  return {
-    ...query,
-    ...(Object.prototype.hasOwnProperty.call(query, "token")
-      ? { token: "[Redacted]" }
-      : {}),
-    ...(Object.prototype.hasOwnProperty.call(query, "grant")
-      ? { grant: "[Redacted]" }
-      : {}),
-  };
-}
 
 export function serializeRequestForLogs(
   request: Record<string, unknown>,
 ): Record<string, unknown> {
+  const rawRequest =
+    request.raw !== null && typeof request.raw === "object"
+      ? (request.raw as Record<string, unknown>)
+      : request;
+  const route = safeRequestRoute(rawRequest as unknown as Request);
+
   return {
-    id: request.id,
-    method: request.method,
-    url:
-      typeof request.url === "string"
-        ? redactTokenFromUrl(request.url)
-        : request.url,
-    query: redactQueryToken(request.query),
-    headers: request.headers,
-    remoteAddress: request.remoteAddress,
-    remotePort: request.remotePort,
+    id: request.id ?? rawRequest.id,
+    method: request.method ?? rawRequest.method,
+    ...(route ? { route } : {}),
   };
 }
 

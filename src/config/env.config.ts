@@ -59,6 +59,9 @@ export interface ApiEnvironmentConfig {
     idleTimeoutSeconds: number;
     mariaDbUseTextProtocol: boolean;
   };
+  diagnostics: {
+    mariaDbCollationProbeEnabled: boolean;
+  };
   localFileStorage: {
     enabled: boolean;
     root: string | null;
@@ -328,6 +331,11 @@ export const apiConfig = registerAs("api", (): ApiEnvironmentConfig => {
         process.env.DB_MARIADB_USE_TEXT_PROTOCOL,
         false,
       ),
+    },
+    diagnostics: {
+      mariaDbCollationProbeEnabled:
+        process.env.DIAG_MARIADB_COLLATION_PROBE ===
+        "I_UNDERSTAND_THIS_ONLY_READS_SESSION_METADATA",
     },
     localFileStorage: {
       enabled: parseBoolean(process.env.LOCAL_FILE_STORAGE_ENABLED, false),

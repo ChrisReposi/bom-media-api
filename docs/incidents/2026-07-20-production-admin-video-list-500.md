@@ -1,9 +1,9 @@
 # Incident: Production admin video list & assignment-options 500
 
 - Date opened: 2026-07-20
-- Status: **Root cause NOT_PROVEN — query stage proven; adapter cause pending after diagnostic hardening**
-- Active diagnostic release: `main @ 579becd`
-- Investigation branch: `hotfix/production-video-query-500-root-cause`
+- Status: **MariaDB 1267 PROVEN — exact collation/coercibility pair NOT_VERIFIED**
+- Active diagnostic release: `main @ 0cc41e2`
+- Investigation branch: `diagnostic/production-mariadb-collation-probe`
 
 ## 1. Incident summary
 
@@ -43,13 +43,20 @@ surface and cannot be treated as the sole root cause. `/health` and
   over real HTTP with 236 run-scoped LOCAL_FILE fixtures. Binary and text
   protocols both passed every failing query shape, mapper and HTTP/BigInt
   serialization. All fixtures were deleted.
+- 2026-07-20 — release `0cc41e2` captured `DriverAdapterError` code `1267`,
+  SQLSTATE `HY000`, at all three query stages. The shared failing SQL shape is
+  `LIKE CONCAT(literal, bound parameter, literal)`. All audited physical
+  columns and phpMyAdmin/server session variables are `utf8mb4_unicode_ci`,
+  but the actual Prisma pool session and bound-parameter collation remain
+  unverified.
 
 ## 3. Known production evidence
 
 - Build OK; earlier `proxy-addr` TS errors already resolved (unrelated to runtime 500).
 - Migration history complete (19), no pending → pending-migration RULED_OUT.
 - Health 200; ready 200 (`database=ok`, `storage=disabled`).
-- Release identity is PROVEN: health reports commit `579becd`.
+- Release identity is PROVEN: the current diagnostic release reports commit
+  `0cc41e2`.
 - Production stage/error identity is proven from correlated logs:
   - `dcc104ad-87d3-44d1-97ab-fdcdd77da5a1` → global search,
     `ADMIN_VIDEO_LIST_QUERY`, `DriverAdapterError`, 14 ms.
@@ -62,6 +69,11 @@ surface and cannot be treated as the sole root cause. `/health` and
   still unavailable from the deployed extractor.
 - Locked dependency versions are: `prisma=7.8.0`, `@prisma/client=7.8.0`,
   `@prisma/adapter-mariadb=7.8.0`, and transitive `mariadb=3.4.5`.
+- Current request-correlated Production evidence is identical across all three
+  failure surfaces: top-level `DriverAdapterError`, MariaDB code `1267`,
+  SQLSTATE `HY000`. This proves illegal collation aggregation as the common
+  database failure class, but not the two participating collations or their
+  coercibilities.
 
 ## 4. Call graph (shared failure surface)
 
@@ -82,12 +94,14 @@ not prove that the transaction or connection pool is defective.
 
 | Hypothesis                                         | Status                           | Evidence for                                                                                                                                | Remaining gap                                       |
 | -------------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
-| Search/title/LIKE defect                           | RULED_OUT as common cause        | assignment options fails without search; direct Production LIKE succeeds                                                                    | —                                                   |
+| MariaDB illegal collation aggregation              | PROVEN                           | all three Production query stages return 1267/HY000                                                                                           | exact pair/coercibility still unknown                |
+| Prisma `LIKE CONCAT` expression                    | PROVEN shared surface            | generated SQL uses literal + bound parameter CONCAT for title/slug/mimeType predicates                                                       | actual parameter/literal metadata not verified       |
+| Physical column collation mismatch                 | RULED_OUT                        | 25 relevant physical columns and join pairs are utf8mb4/utf8mb4_unicode_ci                                                                    | —                                                   |
 | Pending migration / physical schema drift          | RULED_OUT                        | 19/19 finished; critical physical tables/columns verified                                                                                    | —                                                   |
 | Response mapping / HTTP serialization              | RULED_OUT for captured requests  | failure stage is QUERY; MariaDB 11.8 HTTP proof maps/serializes all shapes                                                                    | —                                                   |
 | Slow query / pool acquisition timeout              | LOW PROBABILITY                  | adapter failures arrive in 14–33 ms; controlled 236-row concurrency passes                                                                  | exact `cause.kind` still needed                     |
 | Binary prepared protocol defect                    | RULED_OUT in controlled MariaDB  | MariaDB 11.8.8 binary and text both pass identical built-API HTTP matrix                                                                      | Production A/B not run                              |
-| MariaDB adapter/driver environment-specific defect | POSSIBLE                         | Production alone emits top-level `DriverAdapterError`                                                                                        | deploy safe cause extractor, capture cause          |
+| Prisma connection/parameter collation mismatch     | POSSIBLE                         | Production-only 1267 and generated CONCAT shape                                                                                              | run guarded post-listen metadata probe               |
 | Relation-join strategy                             | RULED_OUT                        | generator has no preview feature/override; adapter 7.8 reports `supportsRelationJoins=false` for MariaDB                                      | —                                                   |
 | Stale runtime                                      | RULED_OUT                        | health reports expected `579becd`                                                                                                            | —                                                   |
 | Wrong database/runtime environment                 | LOW PROBABILITY                  | same-context Production schema/data identity supplied                                                                                        | exact application env binding should remain audited |
@@ -128,46 +142,37 @@ The MariaDB fixture deliberately matches the key Production cardinality:
 zero WebsiteVideo, `search=sml`, and BigInt values above JavaScript's safe
 integer range. Local still cannot reproduce the Production 500.
 
-## 7. Production evidence still required (one bundle)
+The new probe was also executed against the same disposable MariaDB 11.8.8
+through the production-built `dist/main.js`, binary protocol and an empty
+19-migration schema. It completed after listen with session, parameter,
+literal and CONCAT all `utf8mb4_unicode_ci`; parameter/literal/CONCAT
+coercibility was `6` and CONCAT passed. This validates the probe syntax and
+safe event contract but does not substitute for the Hostinger pool result.
 
-Deploy the follow-up diagnostic commit with
-`DB_MARIADB_USE_TEXT_PROTOCOL=false`, then provide one fresh failing request:
+## 7. Production evidence still required
 
-```
-endpoint + HTTP status + timestamp (UTC) + X-Request-Id
-sanitized runtime log line for that requestId, now including:
-  errorName, database.cause.kind, database.cause.originalCode,
-  database.cause.code, database.cause.sqlState,
-  database.cause.constraint.index/fields, database.databaseCategory, stage
-```
+Deploy the guarded post-listen collation probe with binary protocol retained:
 
-Redact: Authorization, Cookie, DATABASE_URL, password, tokens, raw SQL values.
-
-If `databaseCategory=MISSING_COLUMN/MISSING_TABLE` → run the schema SQL in §16.
-
-If runtime log access is unavailable, run the opt-in read-only isolation command
-from the exact deployed source and environment. Set the website/search inputs in
-environment variables so the script never echoes them:
-
-```bash
-export ADMIN_VIDEO_DIAGNOSTIC_WEBSITE_ID='<target website id>'
-export ADMIN_VIDEO_DIAGNOSTIC_SEARCH='sml'
-export ALLOW_READ_ONLY_PRODUCTION_DIAGNOSTICS='I_UNDERSTAND_THIS_ONLY_READS_PRODUCTION_DATA'
-NODE_ENV=production APP_ENV=production yarn diagnose:admin-video-queries
+```env
+DIAG_MARIADB_COLLATION_PROBE=I_UNDERSTAND_THIS_ONLY_READS_SESSION_METADATA
+DB_MARIADB_USE_TEXT_PROTOCOL=false
 ```
 
-Do not use `--include-concurrency` in Production; the guard rejects it. The
-command uses `SELECT`/Prisma read methods only and prints aggregate counts,
-durations, stage names and allowlisted error context. It never prints inputs,
-rows, SQL, raw messages or connection details.
+Collect exactly one `MARIADB_COLLATION_PROBE_RESULT` event. It contains only
+session charset/collation metadata, bound-parameter/literal/CONCAT metadata and,
+when MariaDB returns 1267, bounded collation/coercibility/operation tokens.
+It contains no SQL, values, connection identity, request data or raw message.
+Disable the probe and restart immediately after evidence collection.
 
 ## 8–9. Root cause
 
-**NOT_PROVEN.** The failing layer is proven (`DriverAdapterError` in query
-stages), but its safe driver cause has not yet been captured. Schema drift,
-mapping, relation joins, and a generally broken MariaDB binary protocol are
-ruled out. A Hostinger/Production-specific adapter-driver condition remains.
-No speculative query, index, transaction, cache or mapping change was made.
+**PARTIALLY PROVEN.** MariaDB 1267 illegal collation aggregation and the shared
+`LIKE CONCAT(literal, bound parameter, literal)` expression are proven. The
+exact collation pair and coercibilities are not proven because phpMyAdmin does
+not establish the Prisma pool session/parameter metadata. Schema drift,
+physical-column mismatch, mapping, relation joins and a generally broken
+MariaDB binary protocol are ruled out. No corrective query, driver-collation,
+index, transaction, cache or mapping change was made.
 
 ## 10. Code changes (follow-up diagnostic hardening — behavior-preserving)
 
@@ -215,6 +220,13 @@ No speculative query, index, transaction, cache or mapping change was made.
 - Prisma generator preview features are empty and application source has no
   `relationLoadStrategy`; adapter 7.8 explicitly disables relation joins for
   MariaDB, so no relation strategy was changed.
+- Added a disabled-by-default, exact-confirmation, post-listen collation probe.
+  It uses the singleton `PrismaService`, three static tagged `$queryRaw`
+  metadata queries, a four-second whole-probe timeout and one run per process.
+  It never affects health/readiness and never queries Production row values.
+- Added a bounded MariaDB 1267 parser. Raw driver messages are inspected only
+  in memory; output is restricted to the two collation/coercibility pairs and
+  operation token.
 
 Release identity injection is now verified in Production health.
 
@@ -233,36 +245,34 @@ Release identity injection is now verified in Production health.
   no concurrent probe in Production, allowlisted error serialization, absence
   of database mutation primitives, and assigned-list query/mapping tags.
 - Baseline before this branch: 194/194 tests in 53 suites.
-- Final branch verification: 208/208 tests in 55 suites; typecheck, lint
+- Final probe-branch verification: 220/220 tests in 59 suites; typecheck, lint
   (0 errors/92 existing warnings), build, format, focused MariaDB 11.8.8
-  binary/text integration proof and diff-check all pass.
+  binary/text integration proof, built-API probe smoke and diff-check all pass.
 
-## 12. Deployment plan and controlled Production A/B
+## 12. Deployment plan for the final read-only probe
 
-1. Deploy this diagnostic-only commit with
-   `DB_MARIADB_USE_TEXT_PROTOCOL=false`, build, restart, and verify release SHA.
-2. Reproduce the three requests and capture the new safe `database.cause`.
-3. Only if the captured cause points to prepared execution/protocol behavior,
-   set `DB_MARIADB_USE_TEXT_PROTOCOL=true`, restart the same artifact, repeat
-   the exact request matrix, and compare request IDs/status/cause. Change no
-   other variable during the A/B.
-4. Binary fail + text pass in Production would prove a protocol-specific
-   mitigation; keep text temporarily and raise the exact cause/version matrix
-   upstream. Both fail means revert to false and investigate that cause.
-5. Do not replace `$transaction`, alter schema/data, or tune the pool until the
-   captured structural cause supports that action.
+1. Deploy the probe commit with the exact confirmation value and
+   `DB_MARIADB_USE_TEXT_PROTOCOL=false`.
+2. Verify listen, health and readiness normally; the probe starts only after
+   `app.listen()` and cannot change their status.
+3. Extract the single `MARIADB_COLLATION_PROBE_RESULT` event.
+4. Set `DIAG_MARIADB_COLLATION_PROBE=DISABLED` and restart/redeploy.
+5. Choose a corrective fix only after the event proves the actual
+   session/parameter/literal/CONCAT collation and coercibility combination.
 
 ## 13. Rollback plan
 
-Code rollback is redeploy `579becd`. Protocol rollback is set
-`DB_MARIADB_USE_TEXT_PROTOCOL=false` and restart the same artifact. No schema,
-migration or Production data change is involved.
+Environment rollback is set `DIAG_MARIADB_COLLATION_PROBE=DISABLED` and
+restart. Code rollback is redeploy `0cc41e2`. Keep
+`DB_MARIADB_USE_TEXT_PROTOCOL=false`. No schema, migration or Production data
+change is involved.
 
 ## 14. Remaining risks
 
-- Exact driver `cause.kind/code/sqlState` remains unknown until deployment.
-- Controlled MariaDB passed both protocols, so enabling text in Production
-  without A/B evidence could mask or relocate the real problem.
+- The exact two collations/coercibilities remain unknown until the Production
+  probe event is collected.
+- MariaDB 1267 is proven, but changing driver collation or query behavior before
+  that event would still be speculative.
 
 ## 15. Final production acceptance status
 

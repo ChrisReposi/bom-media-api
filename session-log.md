@@ -12,6 +12,45 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-20 — Guarded post-listen MariaDB collation probe
+
+### Production evidence and goal
+
+- Production `0cc41e2` returns MariaDB `1267` / `HY000` at all three video
+  query stages. Physical columns/join pairs and the phpMyAdmin/server session
+  are `utf8mb4_unicode_ci`; generated failing SQL shares
+  `LIKE CONCAT(literal, bound parameter, literal)`.
+- Exact Prisma pool session, bound-parameter/literal collation/coercibility and
+  the conflicting pair remain NOT_VERIFIED. No corrective fix is included.
+
+### Changed
+
+- Added exact-gated `DIAG_MARIADB_COLLATION_PROBE`, default `DISABLED`.
+- Added a singleton-Prisma, post-`app.listen()` run-once probe for session,
+  parameter/literal and CONCAT metadata, with a four-second timeout and no row
+  reads, health impact or startup blocking.
+- Added a bounded 1267 parser that inspects raw driver messages only in memory
+  and returns only collation/coercibility/operation tokens. Output is one
+  structured `MARIADB_COLLATION_PROBE_RESULT` event with no SQL, parameters,
+  raw message, connection identity, request data or credentials.
+
+### Verification and limitation
+
+- Focused typecheck and 12 probe/parser/startup/security tests PASS. The built
+  API probe ran after listen on disposable MariaDB 11.8.8/binary protocol and
+  safely reported `utf8mb4_unicode_ci`, coercibility 6 and CONCAT PASS; the
+  container/volume were removed. Full suite PASS: 220/220 across 59 suites;
+  typecheck, build, format and diff-check PASS; lint PASS with 0 errors and the
+  unchanged 92-warning runtime-metadata/import-style baseline.
+- Production was not accessed. Exact root cause remains NOT_PROVEN until the
+  sanitized Production probe result is collected.
+
+### Next exact step
+
+- Review and deploy the diagnostic commit with the exact confirmation and
+  binary protocol, collect one event, disable the probe, then design the
+  smallest corrective fix supported by the observed pair.
+
 ## 2026-07-20 — MariaDB DriverAdapter diagnostics and protocol-control follow-up
 
 ### Production evidence and conclusion

@@ -19,6 +19,7 @@ import { SecurityModule } from "./security/security.module";
 import { buildThrottlerOptions } from "./security/throttle.config";
 import { VideosModule } from "./videos/videos.module";
 import { safeRequestRoute } from "./common/http/safe-request-route.util";
+import { MariaDbCollationProbeService } from "./common/diagnostics/mariadb-collation-probe.service";
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Request } from "express";
@@ -97,6 +98,7 @@ export function serializeRequestForLogs(
   controllers: [AppController],
   providers: [
     AppService,
+    MariaDbCollationProbeService,
     {
       provide: APP_GUARD,
       useClass: ThrottlerGuard,

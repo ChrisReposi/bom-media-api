@@ -8,6 +8,9 @@ import proxyaddr from "proxy-addr";
 import { Logger } from "nestjs-pino";
 import type { NextFunction, Request, Response } from "express";
 import { SWAGGER_PATH } from "./common/constants/api.constants";
+import { MARIADB_COLLATION_PROBE_EVENT } from "./common/diagnostics/mariadb-collation-probe.constants";
+import { launchMariaDbCollationProbeAfterListen } from "./common/diagnostics/launch-mariadb-collation-probe";
+import { MariaDbCollationProbeService } from "./common/diagnostics/mariadb-collation-probe.service";
 import { GlobalExceptionFilter } from "./common/filters/global-exception.filter";
 import type { ApiEnvironmentConfig } from "./config/env.config";
 import { AppModule } from "./app.module";
@@ -18,7 +21,8 @@ async function bootstrap(): Promise<void> {
     bufferLogs: true,
   });
 
-  app.useLogger(app.get(Logger));
+  const logger = app.get(Logger);
+  app.useLogger(logger);
 
   const configService = app.get(ConfigService);
   const apiEnvironment = configService.getOrThrow<ApiEnvironmentConfig>("api");
@@ -88,6 +92,17 @@ async function bootstrap(): Promise<void> {
   }
 
   await app.listen(apiEnvironment.port, apiEnvironment.host);
+  launchMariaDbCollationProbeAfterListen(
+    app.get(MariaDbCollationProbeService),
+    () =>
+      logger.error(
+        {
+          event: MARIADB_COLLATION_PROBE_EVENT,
+          status: "FAILED",
+        },
+        MARIADB_COLLATION_PROBE_EVENT,
+      ),
+  );
 }
 
 void bootstrap();

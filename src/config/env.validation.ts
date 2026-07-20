@@ -5,6 +5,10 @@ import {
   DEFAULT_API_PREFIX,
 } from "../common/constants/api.constants";
 import { normalizePrefix } from "../common/utils/normalize-prefix";
+import {
+  MARIADB_COLLATION_PROBE_CONFIRMATION,
+  MARIADB_COLLATION_PROBE_DISABLED,
+} from "../common/diagnostics/mariadb-collation-probe.constants";
 import { isAbsolute } from "node:path";
 import proxyaddr from "proxy-addr";
 
@@ -101,6 +105,31 @@ function readOptionalProtocol(
 
   process.env[key] = protocol;
   return protocol;
+}
+
+function readMariaDbCollationProbeMode(
+  config: Record<string, unknown>,
+): string {
+  const key = "DIAG_MARIADB_COLLATION_PROBE";
+  const value = config[key];
+  const mode =
+    value === undefined || value === null || value === ""
+      ? MARIADB_COLLATION_PROBE_DISABLED
+      : typeof value === "string"
+        ? value
+        : "";
+
+  if (
+    mode !== MARIADB_COLLATION_PROBE_DISABLED &&
+    mode !== MARIADB_COLLATION_PROBE_CONFIRMATION
+  ) {
+    throw new Error(
+      `${key} must be ${MARIADB_COLLATION_PROBE_DISABLED} or the exact read-only confirmation value`,
+    );
+  }
+
+  process.env[key] = mode;
+  return mode;
 }
 
 function readPositiveInteger(
@@ -598,6 +627,8 @@ export function validateEnv(
     "DB_MARIADB_USE_TEXT_PROTOCOL",
     false,
   );
+  validated.DIAG_MARIADB_COLLATION_PROBE =
+    readMariaDbCollationProbeMode(config);
 
   if (typeof config.VIDEO_UPLOAD_MAX_MB === "string") {
     const uploadMaxMb = Number(config.VIDEO_UPLOAD_MAX_MB.trim());

@@ -12,6 +12,33 @@ This file is the persistent implementation log for Codex and future assistants.
 
 ---
 
+## 2026-07-20 — Production video-query root-cause isolation continuation
+
+### Evidence
+
+- Production health/readiness are 200 and now prove release identity: version `diag-2026.07.20-admin-video-list-500`, commit `579becd`, build `2026-07-20T03:04:56.655Z`; stale runtime is ruled out.
+- Updated behavior differs from the first incident snapshot: global no-search succeeds (200/cache-valid 304), while global `search=sml`, website assigned list and assignment options without search return 500. Search alone cannot explain all failures.
+- No Hostinger SSH/log connector is configured in this workspace and no request-correlated Production log was supplied. Exact Prisma/driver error and failing Production operation remain NOT_PROVEN; no behavioral query/index/pool change was made.
+- Read-only local MySQL 8 + Prisma 7/MariaDB-adapter isolation passes: global count/IDs/scalars/each relation/full include/transaction/mapper, assigned count/IDs/full include/transaction/mapper, and assignment-options A/B/C/D/transaction/mapper. Non-Production Promise.all comparison also passes. Local SQL mode has no `NO_BACKSLASH_ESCAPES`; search columns use `utf8mb4_unicode_ci`.
+- Local EXPLAIN uses `VideoAsset_status_createdAt_idx` for no-search. Leading-wildcard `contains` scans/filesorts and assigned sorting uses a temporary/filesort on the tiny 26-video/5-assignment fixture; this is not representative Production evidence and does not justify an index migration.
+
+### Changed (diagnostic-only)
+
+- Added `WEBSITE_ASSIGNED_VIDEO_LIST_QUERY|MAPPING` error-stage tags without changing the assigned-list query, transaction, mapping or response.
+- Added guarded `yarn diagnose:admin-video-queries`: exact per-operation read-only isolation against the selected runtime DB. Production requires explicit confirmation plus website scope and rejects concurrency comparison. Output contains only operation/duration/aggregate counts and allowlisted error context; no input values, rows, SQL, raw messages or connection details.
+- Added safety/stage tests and updated the incident report/operator evidence workflow. No schema, migration, DTO, API, cache, RBAC, assignment or canonical behavior changed.
+
+### Verification
+
+- `yarn install --frozen-lockfile`, Prisma generate/validate/status (19 migrations, local up to date), typecheck, build, format and diff-check PASS.
+- Lint PASS with 0 errors and 92 existing `consistent-type-imports` warnings.
+- Full tests PASS: 199/199 across 54 suites (baseline 194/194). Focused script typecheck and read-only local diagnostic PASS.
+
+### Limitation / next exact step
+
+- Root cause and Production restoration remain NOT_PROVEN. Operator must return the allowlisted log for one fresh request per failing surface or run the guarded diagnostic in the exact Hostinger runtime environment. Only then choose P2021/P2022 schema remediation, P2024 pool/query remediation, legacy mapping normalization, or wrong-database correction.
+- No Production mutation, migration, deploy, restart, assignment change or canonical change occurred.
+
 ## 2026-07-20 — Harden diagnostic request logging (pre-deploy review)
 
 ### Changed (branch hotfix/production-admin-video-list-500; no behavior/query change)

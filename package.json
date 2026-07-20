@@ -15,6 +15,7 @@
     "lint": "eslint \"src/**/*.ts\" \"prisma/**/*.ts\"",
     "lint:fix": "eslint \"src/**/*.ts\" \"prisma/**/*.ts\" --fix",
     "test": "tsx --import ./test/test-env.ts --test test/*.test.ts",
+    "diagnose:admin-video-queries": "tsx scripts/diagnostics/admin-video-query-isolation.ts",
     "audit:share-link-assignments": "tsx scripts/audit/share-link-assignment-audit.ts",
     "audit:admin-accounts": "tsx scripts/audit/admin-account-audit.ts",
     "audit:canonical-share-links": "cross-env APP_ENV=local DOTENV_CONFIG_PATH=.env.local tsx scripts/audit/canonical-share-link-audit.ts",

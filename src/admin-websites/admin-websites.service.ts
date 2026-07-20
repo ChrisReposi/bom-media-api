@@ -1251,59 +1251,67 @@ export class AdminWebsitesService {
 
     const where = this.buildWebsiteVideoListWhere(websiteId, query);
     const [total, activeAssignmentTotal, eligibleAssignmentTotal, assignments] =
-      await this.prisma.$transaction([
-        this.prisma.websiteVideo.count({ where }),
-        this.prisma.websiteVideo.count({
-          where: { websiteId, status: AssignmentStatus.ACTIVE },
-        }),
-        this.prisma.websiteVideo.count({ where: eligibleWhere }),
-        this.prisma.websiteVideo.findMany({
-          where,
-          include: {
-            video: {
-              include: {
-                binaryAsset: { select: { mimeType: true, sizeBytes: true } },
-                localFileAsset: {
-                  select: {
-                    mimeType: true,
-                    sizeBytes: true,
-                    checksumSha256: true,
-                    originalFilename: true,
+      await this.prisma
+        .$transaction([
+          this.prisma.websiteVideo.count({ where }),
+          this.prisma.websiteVideo.count({
+            where: { websiteId, status: AssignmentStatus.ACTIVE },
+          }),
+          this.prisma.websiteVideo.count({ where: eligibleWhere }),
+          this.prisma.websiteVideo.findMany({
+            where,
+            include: {
+              video: {
+                include: {
+                  binaryAsset: { select: { mimeType: true, sizeBytes: true } },
+                  localFileAsset: {
+                    select: {
+                      mimeType: true,
+                      sizeBytes: true,
+                      checksumSha256: true,
+                      originalFilename: true,
+                    },
                   },
-                },
-                localThumbnailAsset: {
-                  select: {
-                    mimeType: true,
-                    sizeBytes: true,
-                    checksumSha256: true,
-                    originalFilename: true,
+                  localThumbnailAsset: {
+                    select: {
+                      mimeType: true,
+                      sizeBytes: true,
+                      checksumSha256: true,
+                      originalFilename: true,
+                    },
                   },
                 },
               },
             },
-          },
-          orderBy: this.buildWebsiteVideoOrderBy(
-            query.sortBy ?? "sortOrder",
-            query.sortOrder ?? "asc",
-          ),
-          skip: (page - 1) * limit,
-          take: limit,
-        }),
-      ]);
+            orderBy: this.buildWebsiteVideoOrderBy(
+              query.sortBy ?? "sortOrder",
+              query.sortOrder ?? "asc",
+            ),
+            skip: (page - 1) * limit,
+            take: limit,
+          }),
+        ])
+        .catch(rethrowWithDatabaseStage("WEBSITE_ASSIGNED_VIDEO_LIST_QUERY"));
 
-    return {
-      items: assignments.map((assignment) =>
-        this.toAssignedVideoResponse(assignment),
-      ),
-      meta: {
-        page,
-        limit,
-        total,
-        totalPages: total === 0 ? 0 : Math.ceil(total / limit),
-        activeAssignmentTotal,
-        eligibleAssignmentTotal,
-      },
-    };
+    try {
+      return {
+        items: assignments.map((assignment) =>
+          this.toAssignedVideoResponse(assignment),
+        ),
+        meta: {
+          page,
+          limit,
+          total,
+          totalPages: total === 0 ? 0 : Math.ceil(total / limit),
+          activeAssignmentTotal,
+          eligibleAssignmentTotal,
+        },
+      };
+    } catch (error) {
+      throw rethrowWithDatabaseStage("WEBSITE_ASSIGNED_VIDEO_LIST_MAPPING")(
+        error,
+      );
+    }
   }
 
   async listVideoAssignmentOptions(

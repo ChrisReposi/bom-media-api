@@ -12,7 +12,10 @@ Use this after deploying auth/security changes, rotating secrets, changing Cloud
 - [ ] Two concurrent refresh requests produce at most one rotation and revoke the replayed session/token family.
 - [ ] Refresh-token replay creates a safe audit event without raw token values.
 - [ ] Logout is idempotent and generic.
-- [ ] Logout revokes the active server-side admin session.
+- [ ] Logout revokes the active server-side admin session. **Verify via a direct
+      API call with a Bearer access token**, not via the Admin SPA — the SPA's
+      logout omits the header and is rejected with `401`, so the session is not
+      revoked (`../KNOWN_ISSUES.md` KI-016).
 - [ ] An access token issued before logout fails on protected admin endpoints.
 - [ ] Password change succeeds for an active admin.
 - [ ] Password change revokes active sessions and refresh tokens.

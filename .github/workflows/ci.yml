@@ -1,29 +1,52 @@
-name: CI
+# Backend validation. Validation only — this workflow never deploys, never
+# reaches a production database, and never needs a secret.
+#
+# Intended required status check: "backend / validate" (the job's `name:`).
+# Confirm the emitted check context on the first real pull request before
+# configuring it in a Ruleset.
+name: backend
 
 on:
-  push:
-    branches: ["**"]
   pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # Future compatibility with GitHub Merge Queue. This does NOT enable a merge
+  # queue; it only means the check still runs if one is turned on later.
+  merge_group:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Pull request: one group per PR, so a superseded run for the SAME PR is
+  # cancelled.
+  # push to main / merge_group: github.run_id makes every run its own group, so
+  # no validation run can displace another. Release evidence is never lost.
+  group: backend-validate-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   validate:
+    name: backend / validate
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
     env:
-      # Config-validation placeholder only. The unit suite preloads
-      # test/test-env.ts and never opens a connection to this URL; no job in
-      # this workflow starts a database.
+      # Config-validation placeholder only. test/test-env.ts supplies the same
+      # value, the unit suite never opens a connection to it, and no job in this
+      # workflow starts a database.
       DATABASE_URL: mysql://test_user:test_password@127.0.0.1:3307/video_share_cms_test
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          # Pinned, not floating. Kept in step with the other two repositories.
+          node-version: 22.22.2
           cache: yarn
 
       - name: Install dependencies
@@ -41,8 +64,34 @@ jobs:
       - name: Lint
         run: yarn lint
 
-      - name: Test
+      # ---------------------------------------------------------------------
+      # EXECUTION GATE — Wave A share-link compatibility.
+      # Runs the compatibility files directly and by name. A compatibility
+      # regression fails here, and a change to the full-suite glob cannot hide
+      # a skipped compatibility file. No output parsing is involved: the exit
+      # code is the proof.
+      # ---------------------------------------------------------------------
+      - name: Share-link compatibility suites (Wave A)
+        run: npx tsx --import ./test/test-env.ts --test test/share-link-compat-*.test.ts
+
+      # EXECUTION GATE — the complete backend suite. Re-runs the compatibility
+      # files as part of it; the duplicate costs a couple of seconds and is
+      # worth the clarity.
+      - name: Test (full suite)
         run: yarn test
+
+      # ---------------------------------------------------------------------
+      # MANIFEST CONSISTENCY GATE — documentation/inventory drift only.
+      # Compares the ids named in test/share-link-compat-*.test.ts with the ids
+      # documented in docs/SHARE_LINK_COMPATIBILITY_TESTS.md. It proves nothing
+      # about execution or passing; the two steps above do that.
+      # ---------------------------------------------------------------------
+      - name: Compatibility manifest consistency
+        run: node scripts/ci/check-compat-manifest.mjs
+
+      # NOTE: the mutation runner (scripts/test/share-link-compat-mutations) is
+      # deliberately NOT run. It rewrites src/ while it executes and is manual
+      # audit tooling, not PR validation.
 
       - name: Format check
         run: yarn format:check

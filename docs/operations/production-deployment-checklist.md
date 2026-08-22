@@ -67,7 +67,11 @@ Use this checklist with:
 - [ ] `/docs` is not publicly available.
 - [ ] Admin login works.
 - [ ] Refresh works.
-- [ ] Logout revokes session.
+- [ ] Logout revokes session. **Expected to FAIL today** when tested through the
+      Admin SPA: the SPA sends logout without a Bearer token, so the guarded
+      endpoint returns `401` and the session survives
+      (`../KNOWN_ISSUES.md` KI-016). Test the endpoint directly with a valid
+      access token to verify the backend behaviour.
 - [ ] Password change revokes sessions.
 - [ ] Old access token fails after logout/password change.
 - [ ] Repeated bad login attempts trigger throttling.

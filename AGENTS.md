@@ -1,283 +1,165 @@
-# apps/api/AGENTS.md — NestJS API Rules
+# AGENTS.md — bom-media-api
 
-## Scope
+Status: CURRENT
+Last verified: 2026-08-21
+Verified against: `package.json`, `src/**`, `prisma/schema.prisma`, `.github/workflows/ci.yml`
 
-This app is the central backend API for the entire platform.
+Concise repository map for Codex and other reviewing agents. Detailed knowledge
+lives in `docs/`. This file must stay short.
 
-## Stack
+## Release-Blocking Compatibility Rule
 
-- NestJS
-- Prisma
-- MySQL/MariaDB
-- JWT
-- class-validator DTOs
-- Swagger
-- Pino logger
-- Helmet
-- CORS
-- ValidationPipe
-- Global exception filter
+Changes affecting share links, public watch APIs, host/domain resolution,
+WebsiteVideo/ShareLinkVideo authorization, media grants, or playback
+must preserve existing valid production share links.
 
-## Required API Modules
+Authoritative contract:
 
-Implement modules in this general direction:
+`../project-docs/SHARE_LINK_COMPATIBILITY.md`
 
-```txt
-auth
-admins
-videos
-websites
-website-domains
-website-videos
-share-links
-public-watch
-access-logs
-admin-audit-logs
-health
-```
+Codex reviews must classify an unintended break of existing valid
+production share links as HIGH or CRITICAL depending on blast radius.
 
-## API Prefix
+## Repository responsibility
 
-Use:
+Standalone NestJS backend for BOM Media / Video Share CMS. Sole owner of admin
+authentication and authorization, the MySQL/MariaDB schema, video assets and
+storage, websites/domains/domain groups, share links, public share-link
+resolution, protected media streaming, access logs and admin audit logs.
 
-```txt
-/api/v1
-```
+Consumers: `bom-media-admin` (admin SPA) and `public_website` (static public
+SPA). Public websites are display-only and hold no admin capability.
 
-Swagger path:
+## Important directories
 
-```txt
-/docs
-```
+| Path                  | Contents                                                                                               |
+| --------------------- | ------------------------------------------------------------------------------------------------------ |
+| `src/admin-auth/`     | Login, refresh rotation, logout, password change, sessions, `AdminAccessTokenGuard`, `AdminRolesGuard` |
+| `src/admin-accounts/` | OWNER-only admin account CRUD, temporary passwords                                                     |
+| `src/admin-websites/` | Websites, domains, domain groups, video assignment, share links, canonical share links                 |
+| `src/videos/`         | Video CRUD, Cloudinary upload, embed, DB blob, chunked local-file upload, purge, view growth           |
+| `src/videos/storage/` | `LOCAL_FILE` filesystem storage + HTTP Range streaming                                                 |
+| `src/public/`         | Public watch/exchange, protected media streaming, HMAC media grants                                    |
+| `src/security/`       | Dynamic CORS origin resolution, throttle profiles                                                      |
+| `src/cache/`          | Process-local in-memory cache                                                                          |
+| `src/config/`         | Env loading, `registerAs("api")` config, strict env validation                                         |
+| `src/common/`         | Global exception filter, request-security utils, MariaDB diagnostics                                   |
+| `prisma/`             | `schema.prisma`, 19 migrations, seed                                                                   |
+| `test/`               | 28 `node:test` suites (no DB required)                                                                 |
+| `scripts/`            | Audits, diagnostics, remediation, smoke, DB-backed integration proofs                                  |
+| `docs/`               | Authoritative documentation (see below)                                                                |
 
-Swagger should be enabled only when allowed by env.
+## Authoritative documentation
 
-## Security Requirements
+- `docs/README.md` — index and reading order
+- `docs/ARCHITECTURE.md` — modules, request lifecycle, traced flows
+- `docs/REPO_MAP.md` — file-level entry-point map
+- `docs/ENGINEERING_STANDARDS.md` — code conventions, PR expectations
+- `docs/SECURITY_MODEL.md` — trust boundaries and security invariants
+- `docs/DATA_MODEL.md` — domain model, relations, invariants, migrations
+- `docs/API_CONTRACTS.md` — contracts consumed by admin and public clients
+- `docs/ENVIRONMENT.md` — every env var, purpose, default, required-in-prod
+- `docs/TESTING.md`, `docs/DEPLOYMENT.md`, `docs/OBSERVABILITY.md`
+- `docs/KNOWN_ISSUES.md` — evidence-backed current issues
+- `docs/adr/`, `docs/features/`, `docs/runbooks/`
+- `../project-docs/` — cross-application documentation
 
-- Hash admin passwords.
-- Never return passwordHash.
-- Never log tokens.
-- Never store raw share token.
-- Store share token hash.
-- Public token validation must be constant enough for MVP and not leak detailed reasons.
-- Rate-limit login and public watch endpoints.
-- Verify hostname/domain on public watch.
+Source-of-truth order when documents disagree: **live source code** →
+`docs/` → `AGENTS.md` / `CLAUDE.md` → `PLAN.md` → `session-log.md` → older
+markdown. Never implement from stale notes when the code says otherwise.
 
-## Prisma Requirements
-
-- Use MySQL provider.
-- Add useful indexes.
-- Prefer soft disable/status over hard delete for important records.
-- Use migrations.
-- Add seed script for initial admin.
-
-## Response Style
-
-Prefer consistent response shape:
-
-```ts
-{
-  success: boolean;
-  data?: unknown;
-  error?: {
-    code: string;
-    message: string;
-  };
-  meta?: unknown;
-}
-```
-
-Keep public errors generic.
-
-## Public Watch Flow
-
-Input:
-
-```txt
-host
-token
-```
-
-Output if valid:
-
-```txt
-website
-videos
-```
-
-Output if invalid:
-
-```txt
-valid: false
-videos: []
-```
-
-Do not reveal whether the token existed, expired, revoked, or belonged to another website.
-
-## Video Provider
-
-Use an abstraction:
-
-```ts
-interface VideoProviderService {
-  resolvePlayback(input): Promise<ResolvedPlayback>;
-  createSignedPlaybackUrl?(input): Promise<SignedPlayback>;
-}
-```
-
-MVP can start with manual URL mode.
-
-## Testing
-
-At minimum, add tests around:
-
-- token hashing and validation
-- domain mismatch rejection
-- expired link rejection
-- max views rejection
-- revoked link rejection
-
-# BOM Media API — Codex Agent Rules
-
-## Scope
-
-This repository is the standalone backend API for BOM Media / Video Share CMS.
-
-The current product direction is:
-
-- One centralized NestJS API.
-- One MySQL/MariaDB database.
-- One React Admin Web production admin surface.
-- Many custom static public websites.
-- Public websites must not ship mini-admin production logic.
-- Admin Web is the only production admin UI for upload, video management, websites, domains, and share links.
-- Large production videos must not be stored in MySQL.
-- Hostinger NVMe local file storage may be used for production video files when customers do not want third-party media storage.
-- MySQL stores metadata, permissions, paths, share links, access logs, and audit logs.
-
-## Stack
-
-- NestJS
-- Prisma 7
-- MySQL/MariaDB
-- @prisma/adapter-mariadb
-- JWT access tokens
-- Opaque refresh tokens
-- bcryptjs password hashing in the current live source tree
-- class-validator DTOs
-- Swagger
-- Pino logger
-- Helmet
-- CORS
-- ValidationPipe
-- Yarn only
-
-## Source of Truth Order
-
-When context conflicts, use this order:
-
-1. Current live source code.
-2. `AGENTS.md`.
-3. `PLAN.md`.
-4. `docs/*`.
-5. `session-log.md`.
-6. Historical markdown, old prompts, or chat summaries.
-
-Never blindly implement from old session notes if current code says otherwise.
-
-## Commands
-
-Use Yarn only. Do not use npm or pnpm. Do not create `package-lock.json` or `pnpm-lock.yaml`.
-
-Common checks:
+## Verified setup / build / test commands
 
 ```bash
-yarn typecheck
-yarn build
-yarn lint
-yarn format:check
+yarn install --frozen-lockfile
 ```
 
-If this is a workspace repo, prefer workspace scripts:
+| Purpose                           | Command                                                           |
+| --------------------------------- | ----------------------------------------------------------------- |
+| Typecheck                         | `yarn typecheck`                                                  |
+| Lint                              | `yarn lint`                                                       |
+| Unit tests                        | `yarn test`                                                       |
+| Build                             | `yarn build` (runs `prisma generate` then `nest build`)           |
+| Format check                      | `yarn format:check`                                               |
+| Typecheck + lint + format + build | `yarn check` — **does NOT run tests**; run `yarn test` separately |
+| Prisma validate                   | `yarn db:validate` (local env)                                    |
+| Prisma client                     | `yarn prisma generate`                                            |
 
-```bash
-yarn workspace @video-share/api typecheck
-yarn workspace @video-share/api build
-yarn workspace @video-share/api lint
-yarn workspace @video-share/api format:check
-yarn workspace @video-share/api db:generate
-yarn workspace @video-share/api db:validate
-yarn workspace @video-share/api db:migrate:dev
-yarn workspace @video-share/api db:migrate:deploy
-yarn workspace @video-share/api db:seed
-```
+`yarn build` and `yarn test` require `prisma generate` to have run at least once
+(`src/generated/prisma` is gitignored). Yarn only — never npm or pnpm.
 
-## Security Rules
+## Architectural invariants
 
-- Never commit real secrets.
-- Never print real `.env` secret values in summaries.
-- Never log passwords, raw refresh tokens, raw JWTs, raw share tokens, cookie values, authorization headers, Cloudinary secrets, or pepper values.
-- Never store raw share tokens.
-- Never store raw refresh tokens.
-- Public token errors must remain generic.
-- Do not reveal whether a public token existed, expired, was revoked, or belonged to another website.
-- Keep DTO validation strict.
-- Keep production Swagger disabled unless explicitly and safely gated.
-- Add tests for auth/session/security changes whenever practical.
-- Prefer soft-disable/status fields over destructive deletes for important data.
-- Permanent deletes must be guarded, audited, and explicit.
+- Backend authorization is authoritative; client-side checks are cosmetic.
+- `AdminRolesGuard` denies handlers without `@AdminRoles*()` metadata.
+- Access tokens carry `sid`; every request re-validates the `AdminSession` row.
+  Revoking a session invalidates unexpired access tokens immediately. Note the
+  SPA logout integration currently fails to reach that revocation —
+  `docs/KNOWN_ISSUES.md` KI-016.
+- Refresh tokens are opaque, single-use and rotated. Reuse of a revoked token
+  revokes the whole session (`ADMIN_REFRESH_REPLAY`).
+- Share tokens and refresh tokens exist in the database only as peppered
+  SHA-256 hashes. The raw share token is returned exactly once, at creation.
+- Public watch requires: `ACTIVE` domain → `ACTIVE` website → `ACTIVE` share
+  link (not expired, under `maxViews`) → `ShareLinkVideo` membership → `ACTIVE`
+  `WebsiteVideo` assignment → `VideoStatus.READY` → playable asset.
+- That chain governs **backend-served media only** (`DB_BLOB`, `LOCAL_FILE`,
+  local thumbnails). `DIRECT_URL`, Cloudinary and `EMBED` URLs are returned
+  verbatim and are outside it. Details and caching caveats:
+  `docs/SECURITY_MODEL.md` sections 4.1 and 4.2.
+- View-limited share links additionally require a valid HMAC media grant on
+  backend-served media routes; unlimited links neither carry nor require one.
+- Every public denial returns the identical `INVALID_LINK` body. The specific
+  reason exists only in `AccessLog`.
+- `CanonicalVideoShareLink` relations are `onDelete: Restrict` by design.
+- The in-memory cache is process-local, not shared, and cleared on restart.
 
-## Production Security Direction
+## Security constraints
 
-Prioritize:
+- Never commit or print real secret values; document secrets by name only.
+- Never log tokens, peppers, Authorization headers, cookies or raw client IPs.
+- Keep public share errors generic and non-enumerable.
+- Keep `ValidationPipe` strict (`whitelist` + `forbidNonWhitelisted`).
+- Keep Swagger disabled in production.
+- Add or update tests for any auth, session, role or share-link change.
 
-1. Session-bound admin access token invalidation.
-2. Backend logout that revokes refresh token and active session.
-3. Password change that revokes all active sessions.
-4. NestJS throttling for auth/public-watch endpoints.
-5. Cloudflare WAF/rate-limit runbook.
-6. Proxy-aware IP handling behind Cloudflare/Hostinger.
-7. Prisma pool tuning for Hostinger MySQL.
-8. Secret rotation runbooks.
-9. Off-site DB backups and restore tests.
-10. Admin Web as the only admin surface.
+## Migration constraints
 
-Do not work on DRM, Cloudinary/R2/S3 migration, or full upload redesign unless explicitly requested.
+- Migrations only via `prisma/migrations/`. Never `prisma db push` on a shared
+  database. Never `migrate reset` or `DROP` on production.
+- Migrations must be additive and compatible with the running build; the deploy
+  order is build → `yarn db:migrate:deploy` → restart.
+- Destructive test scripts are gated by
+  `scripts/safety/assert-destructive-test-database.ts`. Do not bypass it.
 
-## Video Storage Direction
+## Definition of done
 
-Production default:
+- `yarn typecheck`, `yarn lint`, `yarn test`, `yarn build` pass.
+- Tests cover the changed security/authorization behaviour.
+- Relevant `docs/` pages updated in the same change.
+- No secrets anywhere in the diff.
 
-- `VIDEO_DB_STORAGE_ENABLED=false`
-- `DB_BLOB` is fallback only for small test/internal files.
-- Large production videos should use Hostinger private NVMe file storage when avoiding third-party costs, or Cloudinary/Cloudflare Stream/R2 later when scaling.
+## Code review instructions
 
-For Hostinger NVMe storage:
+Review for, in order: (1) authorization correctness — guard/role metadata,
+session revalidation, ownership and assignment checks; (2) data-integrity
+invariants — unique constraints, delete behaviour, transaction isolation;
+(3) information leakage — error specificity on public routes, logging,
+response shaping; (4) contract compatibility — does this break
+`bom-media-admin` or `public_website` (`docs/API_CONTRACTS.md`)?;
+(5) migration safety; (6) documentation drift.
 
-- Store physical files outside public web root.
-- MySQL stores metadata/path/permission only.
-- Backend streams through token/session-protected endpoints.
-- Support HTTP Range requests.
-- Default limit: 500MB/file.
-- Optional hard max: 1GB/file via env after testing.
-- DB_BLOB fallback should stay around 100MB by default.
+Flag any change that documents planned behaviour as if it already exists.
+**No Bunny-specific integration exists** — no service, API client, TUS upload,
+webhook, signed playback, metadata sync or provider-specific purge. The enum
+member is persistable and plays back generically; see
+`docs/features/bunny-stream.md` for the exact CURRENT vs NOT IMPLEMENTED split.
+Treat both "Bunny is implemented" and "Bunny has zero code paths" as
+inaccurate.
 
-## Codex Workflow
+## Reporting tests
 
-Before implementation:
-
-1. Inspect live files.
-2. Summarize current behavior.
-3. Identify risks and gaps.
-4. List exact files to change.
-5. Mention migration/API/admin-web impact.
-6. State verification plan.
-
-After implementation:
-
-1. Summarize exact changes.
-2. List files changed.
-3. List commands run.
-4. State what passed/failed.
-5. Note manual actions still required.
-6. Update `session-log.md`.
+State one of `PASS`, `FAIL`, `NOT RUN`, `BLOCKED` per command, with the exact
+command. If a command was not executed, report **NOT RUN**. Never infer a pass.
+If a command fails for environmental reasons, report `FAIL` or `BLOCKED` and
+name the environmental cause; do not modify unrelated code to force a pass.

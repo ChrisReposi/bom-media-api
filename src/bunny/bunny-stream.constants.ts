@@ -63,3 +63,17 @@ export const MAX_BUNNY_TUS_TTL_SECONDS = 24 * 60 * 60;
 export const DEFAULT_BUNNY_EMBED_TOKEN_TTL_SECONDS = 5 * 60;
 export const MIN_BUNNY_EMBED_TOKEN_TTL_SECONDS = 60;
 export const MAX_BUNNY_EMBED_TOKEN_TTL_SECONDS = 60 * 60;
+
+/**
+ * Default `thumbnailTime` sent with every Bunny Create Video, in milliseconds.
+ *
+ * Bunny documents this as "video time in ms to extract the main video
+ * thumbnail". One second in is far enough past a black or fade-in first frame
+ * to be recognisable, and early enough to exist in even a very short clip -
+ * which matters because these are reviewer evidence videos.
+ *
+ * Deliberately a constant, not configuration: it is a sensible product default,
+ * not something an operator needs to tune, and it is overridden entirely
+ * whenever a custom thumbnail is uploaded.
+ */
+export const DEFAULT_BUNNY_THUMBNAIL_TIME_MS = 1000;

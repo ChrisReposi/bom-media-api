@@ -18,22 +18,10 @@ import {
   VIDEO_FILTER_KEY_MAX_LENGTH,
   normalizeVideoFilterKey,
 } from "../utils/video-filter-key.util";
-
-function toOptionalNumericString(value: unknown): string | undefined {
-  if (value === undefined || value === null || value === "") {
-    return undefined;
-  }
-
-  if (typeof value === "number" || typeof value === "bigint") {
-    return String(value);
-  }
-
-  if (typeof value === "string") {
-    return value.trim();
-  }
-
-  return String(value);
-}
+import {
+  IsCanonicalViewCount,
+  normalizeCanonicalViewCount,
+} from "../utils/view-count.util";
 
 function toOptionalInteger(value: unknown): number | undefined {
   if (value === undefined || value === null || value === "") {
@@ -103,12 +91,14 @@ export class CreateEmbedVideoDto {
   durationSeconds?: number;
 
   @ApiPropertyOptional({
+    type: String,
     example: "360000",
-    description: "Non-negative integer. Returned as a string by the API.",
+    description:
+      "Non-negative integer as a DECIMAL DIGIT STRING. A JSON number is rejected.",
   })
   @IsOptional()
-  @Transform(({ value }) => toOptionalNumericString(value))
-  @Matches(/^\d+$/, { message: "viewCount must be a non-negative integer" })
+  @Transform(({ value }) => normalizeCanonicalViewCount(value))
+  @IsCanonicalViewCount()
   viewCount?: string;
 
   @ApiPropertyOptional({

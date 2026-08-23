@@ -15,13 +15,20 @@ import {
   BUNNY_STREAM_REQUEST_TIMEOUT_MS,
   BUNNY_STREAM_TUS_ENDPOINT,
   DEFAULT_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+  DEFAULT_BUNNY_THUMBNAIL_TIME_MS,
   DEFAULT_BUNNY_TUS_TTL_SECONDS,
   MAX_BUNNY_EMBED_TOKEN_TTL_SECONDS,
   MAX_BUNNY_TUS_TTL_SECONDS,
   MIN_BUNNY_EMBED_TOKEN_TTL_SECONDS,
   MIN_BUNNY_TUS_TTL_SECONDS,
 } from "./bunny-stream.constants";
+import {
+  isBunnyPullZoneHostname,
+  isSafeBunnyFileName,
+  isSafeBunnyPathSegment,
+} from "./bunny-thumbnail.util";
 import type {
+  BunnyEmbedPlayerParams,
   BunnyProcessingState,
   BunnySignedEmbed,
   BunnyTusUploadCredentials,
@@ -32,6 +39,13 @@ type BunnyRequestInit = {
   method: "GET" | "POST" | "DELETE";
   path: string;
   body?: Record<string, unknown>;
+  /**
+   * Raw bytes to send as `application/octet-stream` instead of a JSON body.
+   *
+   * Used by Set Thumbnail, which takes the image file itself. Mutually
+   * exclusive with `body`; the bytes are never logged.
+   */
+  binaryBody?: Buffer;
 };
 
 /** Internal marker for a Bunny 404. Never surfaced to a client. */
@@ -81,14 +95,26 @@ export class BunnyStreamService {
     return this.readRequiredString("BUNNY_STREAM_LIBRARY_ID");
   }
 
-  /** POST /library/{libraryId}/videos */
-  async createVideo(title: string): Promise<BunnyVideo> {
+  /**
+   * POST /library/{libraryId}/videos
+   *
+   * `thumbnailTime` is Bunny's documented "video time in ms to extract the main
+   * video thumbnail". Sending it means every Bunny upload gets an automatic
+   * poster during encoding, so a video with no operator-supplied image is never
+   * left without one. Callers that pass nothing get the project default.
+   */
+  async createVideo(
+    title: string,
+    options: { thumbnailTimeMs?: number } = {},
+  ): Promise<BunnyVideo> {
     this.ensureEnabled();
     const libraryId = this.getLibraryId();
+    const thumbnailTime =
+      options.thumbnailTimeMs ?? DEFAULT_BUNNY_THUMBNAIL_TIME_MS;
     const payload = await this.request({
       method: "POST",
       path: `/library/${encodeURIComponent(libraryId)}/videos`,
-      body: { title },
+      body: { title, thumbnailTime },
     });
 
     return this.toBunnyVideo(payload);
@@ -173,6 +199,7 @@ export class BunnyStreamService {
   createSignedEmbedUrl(
     videoId: string,
     now: Date = new Date(),
+    playerParams: BunnyEmbedPlayerParams = {},
   ): BunnySignedEmbed {
     const libraryId = this.getLibraryId();
     const tokenSecurityKey = this.readRequiredString(
@@ -183,9 +210,19 @@ export class BunnyStreamService {
     const token = createHash("sha256")
       .update(`${tokenSecurityKey}${videoId}${expires}`)
       .digest("hex");
+    // Player parameters are appended AFTER the credential pair and are not part
+    // of the hash - the token covers `videoId` and `expires` only. Callers that
+    // pass none produce a byte-identical URL to before this parameter existed,
+    // which is what keeps public watch resolution unchanged.
+    const playerQuery = Object.entries(playerParams)
+      .map(
+        ([key, value]) =>
+          `&${encodeURIComponent(key)}=${encodeURIComponent(value)}`,
+      )
+      .join("");
     const embedUrl = `${BUNNY_STREAM_EMBED_BASE_URL}/${encodeURIComponent(
       libraryId,
-    )}/${encodeURIComponent(videoId)}?token=${token}&expires=${expires}`;
+    )}/${encodeURIComponent(videoId)}?token=${token}&expires=${expires}${playerQuery}`;
 
     return { embedUrl, token, expires };
   }
@@ -214,6 +251,100 @@ export class BunnyStreamService {
     return `${BUNNY_STREAM_EMBED_BASE_URL}/${encodeURIComponent(
       this.getLibraryId(),
     )}/${encodeURIComponent(videoId)}`;
+  }
+
+  /**
+   * POST /library/{libraryId}/videos/{videoId}/thumbnail
+   *
+   * Sets the video's main thumbnail from raw image bytes, per Bunny's Set
+   * Thumbnail endpoint: `Content-Type: application/octet-stream` with the file
+   * itself as the body.
+   *
+   * The `thumbnailUrl` query mode is deliberately NOT used. It would require the
+   * image to be publicly hosted first, and accepting a caller-supplied URL here
+   * would turn this backend into an SSRF fetcher. Binary upload only.
+   *
+   * ORDERING. Call this only once Bunny reports the video READY. `thumbnailTime`
+   * makes Bunny extract its own main thumbnail *during* encoding, so an image
+   * written earlier can be replaced by that extraction.
+   *
+   * Bunny's response does not carry the resulting file name, so the caller must
+   * re-read `getVideo()` to learn the authoritative `thumbnailFileName`. A
+   * failure propagates truthfully - this never reports a success Bunny did not
+   * give. The API key is an internal header and is never returned or logged.
+   */
+  async setVideoThumbnail(
+    videoId: string,
+    thumbnail: Buffer,
+  ): Promise<void> {
+    this.ensureEnabled();
+    const libraryId = this.getLibraryId();
+
+    await this.request({
+      method: "POST",
+      path: `/library/${encodeURIComponent(libraryId)}/videos/${encodeURIComponent(
+        videoId,
+      )}/thumbnail`,
+      binaryBody: thumbnail,
+    });
+  }
+
+  /**
+   * The Stream CDN hostname the library's pull zone serves from, or null.
+   *
+   * `BUNNY_STREAM_PULL_ZONE_HOSTNAME`, normalised to lower case. A **hostname
+   * only** - `vz-xxxxxxxx.b-cdn.net` - never a URL. Not a secret.
+   *
+   * Returns null rather than throwing so a deployment that has not configured
+   * it yet degrades to "no poster" instead of failing playback. Boot-time
+   * validation is what makes that state loud when Bunny is enabled.
+   */
+  getPullZoneHostname(): string | null {
+    const value = this.configService
+      .get<string>("BUNNY_STREAM_PULL_ZONE_HOSTNAME")
+      ?.trim()
+      .toLowerCase();
+
+    return value !== undefined && isBunnyPullZoneHostname(value) ? value : null;
+  }
+
+  /**
+   * Builds the poster delivery URL from Bunny's documented storage structure:
+   *
+   *     https://{pull_zone_hostname}/{videoId}/{thumbnailFileName}
+   *
+   * Bunny's Get Video response provides `thumbnailFileName`; the hostname comes
+   * from configuration. Nothing here is derived from a pre-built URL field, and
+   * no extra Bunny request is made.
+   *
+   * Returns null - never a guess - when the poster cannot be addressed:
+   * no configured hostname, no `thumbnailFileName` yet (still encoding), or a
+   * component that fails validation. A default file name is never invented.
+   *
+   * PATH SAFETY. Both components are matched against a strict allowlist before
+   * use, so a traversal (`../secret`), a nested path (`foo/bar.jpg`,
+   * `foo\bar.jpg`), a scheme, a query or a fragment can never reach the URL.
+   * Percent-encoding is applied as a second layer.
+   */
+  buildThumbnailUrl(
+    videoId: string,
+    thumbnailFileName: string | null,
+  ): string | null {
+    const hostname = this.getPullZoneHostname();
+    if (hostname === null) {
+      return null;
+    }
+
+    const id = videoId.trim();
+    const fileName = thumbnailFileName?.trim() ?? "";
+
+    if (!isSafeBunnyPathSegment(id) || !isSafeBunnyFileName(fileName)) {
+      return null;
+    }
+
+    return `https://${hostname}/${encodeURIComponent(id)}/${encodeURIComponent(
+      fileName,
+    )}`;
   }
 
   /**
@@ -276,11 +407,17 @@ export class BunnyStreamService {
         headers: {
           AccessKey: apiKey,
           Accept: "application/json",
-          ...(init.body === undefined
-            ? {}
-            : { "Content-Type": "application/json" }),
+          ...(init.binaryBody !== undefined
+            ? { "Content-Type": "application/octet-stream" }
+            : init.body === undefined
+              ? {}
+              : { "Content-Type": "application/json" }),
         },
-        ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+        ...(init.binaryBody !== undefined
+          ? { body: new Uint8Array(init.binaryBody) }
+          : init.body === undefined
+            ? {}
+            : { body: JSON.stringify(init.body) }),
         signal: AbortSignal.timeout(BUNNY_STREAM_REQUEST_TIMEOUT_MS),
       });
     } catch (error) {

@@ -217,7 +217,16 @@ added. See [features/bunny-stream.md](./features/bunny-stream.md).
 | `BUNNY_STREAM_TOKEN_SECURITY_KEY` | unset | **Required when enabled.** Embed view token signing key. **Secret — backend only** |
 | `BUNNY_STREAM_TUS_TTL_SECONDS` | `3600` | Bounded 300–86400. Out-of-range **fails at boot** rather than clamping |
 | `BUNNY_STREAM_EMBED_TOKEN_TTL_SECONDS` | `300` | Bounded 60–3600. Same fail-fast behaviour |
-| `BUNNY_STREAM_PULL_ZONE_HOSTNAME` | unset | **Still unread.** Reserved for CDN token authentication, which is out of MVP scope |
+| `BUNNY_STREAM_PULL_ZONE_HOSTNAME` | unset | **Required when enabled.** Stream CDN hostname of the library's pull zone, e.g. `vz-xxxxxxxx.b-cdn.net`. Hostname only — no scheme, port, path or trailing slash; a bare pull-zone *name* is rejected. Thumbnail delivery is built from it. **Not a secret** |
+
+> **`BUNNY_STREAM_PULL_ZONE_HOSTNAME` became required on 2026-08-23.** Bunny's
+> Get Video response provides `thumbnailFileName`, and the documented storage
+> structure is `https://{pull_zone}/{videoId}/{thumbnailFileName}` — so the
+> hostname is genuinely needed to address a poster at all. Boot **fails fast**
+> when it is missing or malformed while Bunny is enabled, rather than silently
+> serving videos with no thumbnail. Nothing is required while
+> `BUNNY_STREAM_ENABLED=false`. See
+> [features/bunny-stream.md](./features/bunny-stream.md) §4.4.
 
 > `BUNNY_STREAM_SIGNING_KEY` was a never-read placeholder. It is superseded by
 > `BUNNY_STREAM_TOKEN_SECURITY_KEY` and has been removed from the templates.
@@ -235,15 +244,13 @@ landed. Method: collect every `NAME=` declared in `.env.example`, `.env`,
 `src/`, `prisma/`, `scripts/` and `test/`. Re-run the check when adding or
 removing a variable rather than trusting the table below.
 
-> **Changed on 2026-08-23.** `BUNNY_STREAM_LIBRARY_ID`, `BUNNY_STREAM_API_KEY`
-> and the new `BUNNY_STREAM_ENABLED` / `BUNNY_STREAM_TOKEN_SECURITY_KEY` /
-> `BUNNY_STREAM_TUS_TTL_SECONDS` / `BUNNY_STREAM_EMBED_TOKEN_TTL_SECONDS` are
-> now read (§14), and `BUNNY_STREAM_SIGNING_KEY` was removed from the templates.
-> Only `BUNNY_STREAM_PULL_ZONE_HOSTNAME` remains from that family.
+> **Changed on 2026-08-23.** The whole `BUNNY_*` family is now read (§14) —
+> including `BUNNY_STREAM_PULL_ZONE_HOSTNAME`, which thumbnail delivery is built
+> from and which is **required when Bunny is enabled**. No `BUNNY_*` variable
+> remains inert. `BUNNY_STREAM_SIGNING_KEY` was removed from the templates.
 
 | Variable | Status | Note |
 |---|---|---|
-| `BUNNY_STREAM_PULL_ZONE_HOSTNAME` | reserved | The rest of the `BUNNY_*` family is now **read** — see §14. This one stays unread: CDN token authentication is out of MVP scope |
 | `MUX_TOKEN_ID`, `MUX_TOKEN_SECRET`, `MUX_SIGNING_KEY_ID`, `MUX_SIGNING_PRIVATE_KEY_BASE64` | `PLANNED` | Reserved for a future Mux provider |
 | `VIDEO_PROVIDER` | inert | Provider is chosen per video by the creation endpoint, not by this variable |
 | `API_PUBLIC_BASE_URL` | inert | Documentation value only |

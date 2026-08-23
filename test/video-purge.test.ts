@@ -4,7 +4,11 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { BadRequestException, ConflictException } from "@nestjs/common";
+import {
+  BadRequestException,
+  ConflictException,
+  ServiceUnavailableException,
+} from "@nestjs/common";
 import type { ApiEnvironmentConfig } from "../src/config/env.config";
 import {
   AssignmentStatus,
@@ -16,7 +20,11 @@ import {
 } from "../src/generated/prisma/client";
 import { BunnyStreamService } from "../src/bunny/bunny-stream.service";
 import { LocalVideoStorageService } from "../src/videos/storage/local-video-storage.service";
-import { VideosService } from "../src/videos/videos.service";
+import {
+  BUNNY_STREAM_UNAVAILABLE_FOR_PURGE,
+  BUNNY_STREAM_UNAVAILABLE_FOR_PURGE_MESSAGE,
+  VideosService,
+} from "../src/videos/videos.service";
 
 type FakeVideoRecord = {
   id: string;
@@ -100,6 +108,28 @@ class FakePrismaService {
   };
 
   websiteVideo = {
+    deleteMany: async (args: {
+      where: { videoId: string };
+    }): Promise<{ count: number }> => {
+      const before = this.websiteVideos.length;
+      const remaining = this.websiteVideos.filter(
+        (assignment) => assignment.videoId !== args.where.videoId,
+      );
+      this.websiteVideos.length = 0;
+      this.websiteVideos.push(...remaining);
+      // Mirrors the real cascade/deleteMany: rows of EVERY status go, and the
+      // synthetic counter used by fixtures that never populate the array is
+      // cleared too so a later count() reflects the deletion.
+      const deleted = before - remaining.length;
+      if (deleted === 0 && this.websiteAssignmentCount > 0) {
+        const synthetic = this.websiteAssignmentCount;
+        this.websiteAssignmentCount = 0;
+        return { count: synthetic };
+      }
+
+      return { count: deleted };
+    },
+
     count: async (args?: {
       where?: { videoId?: string; status?: AssignmentStatus };
     }): Promise<number> => {
@@ -368,7 +398,13 @@ describe("VideosService purge reclaim behavior", () => {
     assert.deepEqual(prisma.deletedVideoIds, []);
   });
 
-  it("rejects purge while assigned to a website", async () => {
+  it("PURGES a DISABLED video that is still assigned to an ACTIVE website", async () => {
+    // CHANGED DELIBERATELY. This used to throw "Video cannot be permanently
+    // deleted while it is assigned to active websites.", which forced an
+    // operator to visit every website and unassign by hand before removing a
+    // video they had ALREADY disabled. The DISABLED requirement below is the
+    // real safety property; an assignment is relationship state the purge
+    // cleans up, exactly like ShareLinkVideo.
     const { prisma, service } = createVideosService();
     prisma.videos.set("video-1", createVideo());
     prisma.websiteVideos.push({
@@ -376,11 +412,92 @@ describe("VideosService purge reclaim behavior", () => {
       status: AssignmentStatus.ACTIVE,
     });
 
+    const response = await service.purgeVideo(
+      "video-1",
+      { confirmVideoId: "video-1" },
+      "admin-1",
+    );
+
+    assert.deepEqual(prisma.deletedVideoIds, ["video-1"]);
+    // Reported truthfully rather than zeroed out now that it no longer blocks.
+    assert.equal(response.safety.hadWebsiteAssignments, true);
+    assert.equal(response.safety.activeWebsiteAssignmentCount, 1);
+    assert.equal(response.safety.detachedWebsiteAssignmentCount, 1);
+    assert.deepEqual(
+      prisma.websiteVideos,
+      [],
+      "the assignment row must be cleaned up by the purge transaction",
+    );
+  });
+
+  it("cleans up EVERY assignment, whatever its status, for a purged video", async () => {
+    const { prisma, service } = createVideosService();
+    prisma.videos.set("video-1", createVideo());
+    prisma.websiteVideos.push(
+      { videoId: "video-1", status: AssignmentStatus.ACTIVE },
+      { videoId: "video-1", status: AssignmentStatus.ACTIVE },
+      { videoId: "video-1", status: AssignmentStatus.DISABLED },
+      // A different video's assignment must survive untouched.
+      { videoId: "video-other", status: AssignmentStatus.ACTIVE },
+    );
+
+    const response = await service.purgeVideo(
+      "video-1",
+      { confirmVideoId: "video-1" },
+      "admin-1",
+    );
+
+    assert.equal(response.safety.activeWebsiteAssignmentCount, 2);
+    assert.equal(response.safety.detachedWebsiteAssignmentCount, 3);
+    assert.deepEqual(
+      prisma.websiteVideos.map((assignment) => assignment.videoId),
+      ["video-other"],
+      "only the purged video's assignments may be removed",
+    );
+  });
+
+  it("STILL rejects a READY video that is assigned, because it is not DISABLED", async () => {
+    // The relaxation is scoped to the assignment blocker only. The DISABLED
+    // precondition is untouched and is what still protects a live video.
+    const { prisma, service } = createVideosService();
+    prisma.videos.set("video-1", createVideo({ status: VideoStatus.READY }));
+    prisma.websiteVideos.push({
+      videoId: "video-1",
+      status: AssignmentStatus.ACTIVE,
+    });
+
     await assert.rejects(
       service.purgeVideo("video-1", { confirmVideoId: "video-1" }, "admin-1"),
-      BadRequestException,
+      (error: unknown) => {
+        assert.ok(error instanceof BadRequestException);
+        assert.match(String(error.message), /must be disabled/i);
+        return true;
+      },
     );
     assert.deepEqual(prisma.deletedVideoIds, []);
+    assert.equal(
+      prisma.websiteVideos.length,
+      1,
+      "a rejected purge must not touch the assignment",
+    );
+  });
+
+  it("STILL rejects a DISABLED video that anchors canonical provenance", async () => {
+    // Canonical protection is explicitly NOT weakened by this change.
+    const { prisma, service } = createVideosService();
+    prisma.videos.set("video-1", createVideo());
+    prisma.websiteVideos.push({
+      videoId: "video-1",
+      status: AssignmentStatus.ACTIVE,
+    });
+    prisma.canonicalLinkCount = 1;
+
+    await assert.rejects(
+      service.purgeVideo("video-1", { confirmVideoId: "video-1" }, "admin-1"),
+      ConflictException,
+    );
+    assert.deepEqual(prisma.deletedVideoIds, []);
+    assert.equal(prisma.websiteVideos.length, 1);
   });
 
   it("rejects purge unless the video is already disabled", async () => {
@@ -452,6 +569,7 @@ describe("VideosService purge reclaim behavior", () => {
       activeWebsiteAssignmentCount: 0,
       disabledShareLinkCount: 0,
       detachedShareLinkVideoCount: 0,
+      detachedWebsiteAssignmentCount: 0,
     });
     assert.deepEqual(result.storage, {
       localVideoDeleteAttempted: true,
@@ -482,6 +600,7 @@ describe("VideosService purge reclaim behavior", () => {
       activeWebsiteAssignmentCount: 0,
       disabledShareLinkCount: 0,
       detachedShareLinkVideoCount: 0,
+      detachedWebsiteAssignmentCount: 0,
       deleteRemoteAsset: false,
       remoteAssetDeleteAttempted: false,
       remoteAssetDeleted: false,
@@ -618,15 +737,35 @@ describe("LocalVideoStorageService delete safety", () => {
 const BUNNY_GUID = "11111111-2222-3333-4444-555555555555";
 
 function createBunnyStreamStub(
-  options: { result?: boolean; throws?: boolean } = {},
+  options: {
+    result?: boolean;
+    throws?: boolean;
+    notFound?: boolean;
+    /**
+     * Models `BUNNY_STREAM_ENABLED`. The real service exposes `isEnabled()` and
+     * the purge availability guard calls it before any remote delete, so the
+     * stub has to model it or it would not represent production.
+     */
+    enabled?: boolean;
+  } = {},
 ) {
   const stub = {
     deletedVideoIds: [] as string[],
+    isEnabled(): boolean {
+      return options.enabled ?? true;
+    },
     async deleteVideo(videoId: string): Promise<boolean> {
       stub.deletedVideoIds.push(videoId);
 
       if (options.throws === true) {
         throw new Error("bunny unreachable");
+      }
+
+      // `BunnyStreamService.deleteVideo()` swallows a 404 and resolves true -
+      // the remote asset is gone either way. Modelled here so the purge path
+      // is exercised exactly as production sees it.
+      if (options.notFound === true) {
+        return true;
       }
 
       return options.result ?? true;
@@ -688,28 +827,117 @@ describe("VideosService purge — Bunny Stream", () => {
     assert.equal(response.remote.remoteAssetDeleted, false);
   });
 
-  it("reports the failure instead of claiming Bunny deleted the asset", async () => {
+  it("treats an EXPLICIT deleteRemoteAsset:false exactly like omitting it", async () => {
+    // The admin console now always sends the field rather than omitting it when
+    // false, so the explicit form is part of the contract this suite defends.
+    // Both spellings must mean "local-only purge, Bunny untouched".
+    const bunnyStream = createBunnyStreamStub();
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: false },
+      "admin-1",
+    );
+
+    assert.deepEqual(
+      bunnyStream.deletedVideoIds,
+      [],
+      "an explicit false must issue no Bunny DELETE",
+    );
+    assert.equal(response.remote.remoteAssetDeleteAttempted, false);
+    assert.equal(response.remote.remoteAssetDeleted, false);
+    // The local-only purge still completes - that compatibility is preserved.
+    assert.deepEqual(prisma.deletedVideoIds, ["video-bunny"]);
+  });
+
+  it("performs the remote-first DELETE for an EXPLICIT deleteRemoteAsset:true", async () => {
+    // The other half of the contract, and the payload the admin console now
+    // sends by default for every Bunny video.
+    const bunnyStream = createBunnyStreamStub();
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+      "admin-1",
+    );
+
+    assert.deepEqual(bunnyStream.deletedVideoIds, [BUNNY_GUID]);
+    assert.equal(response.remote.remoteAssetDeleted, true);
+    assert.deepEqual(prisma.deletedVideoIds, ["video-bunny"]);
+  });
+
+  it("ABORTS the local purge when Bunny does not confirm the delete", async () => {
+    // REMOTE FIRST. An unconfirmed remote delete must leave the local row
+    // intact: "remote gone + local row here" is reconcilable, "local row gone
+    // + remote here" is an invisible billable orphan.
     const bunnyStream = createBunnyStreamStub({ result: false });
     const { prisma, service } = createVideosService({ bunnyStream });
     prisma.videos.set("video-bunny", createBunnyVideo());
 
-    const response = await service.purgeVideo(
-      "video-bunny",
-      { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
-      "admin-1",
+    await assert.rejects(
+      service.purgeVideo(
+        "video-bunny",
+        { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+        "admin-1",
+      ),
+      ServiceUnavailableException,
     );
 
-    assert.equal(response.remote.remoteAssetDeleteAttempted, true);
-    assert.equal(response.remote.remoteAssetDeleted, false);
-
-    const storageAudit = prisma.audits.find(
-      (audit) => audit.action === "VIDEO_PURGE_STORAGE",
+    assert.deepEqual(
+      prisma.deletedVideoIds,
+      [],
+      "the local row must survive an unconfirmed remote delete",
     );
-    assert.equal(storageAudit?.status, AuditStatus.FAIL);
+    assert.ok(
+      prisma.videos.has("video-bunny"),
+      "the record must still be present and reconcilable",
+    );
+    assert.equal(
+      prisma.audits.find(
+        (audit) => audit.action === "VIDEO_BUNNY_REMOTE_DELETE",
+      )?.status,
+      AuditStatus.FAIL,
+      "the aborted remote delete must be audited truthfully",
+    );
+    assert.equal(
+      prisma.audits.some((audit) => audit.action === "VIDEO_PURGE_COMMIT"),
+      false,
+      "no purge may be recorded as committed",
+    );
   });
 
-  it("reports the failure when Bunny throws rather than answering", async () => {
+  it("ABORTS the local purge when Bunny throws rather than answering", async () => {
     const bunnyStream = createBunnyStreamStub({ throws: true });
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+
+    await assert.rejects(
+      service.purgeVideo(
+        "video-bunny",
+        { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+        "admin-1",
+      ),
+      ServiceUnavailableException,
+    );
+
+    assert.deepEqual(prisma.deletedVideoIds, []);
+    assert.ok(prisma.videos.has("video-bunny"));
+    assert.equal(
+      prisma.audits.find(
+        (audit) => audit.action === "VIDEO_BUNNY_REMOTE_DELETE",
+      )?.status,
+      AuditStatus.FAIL,
+    );
+  });
+
+  it("treats a Bunny 404 as already-deleted and completes the local purge", async () => {
+    // This is what makes a retry work after a local transaction failure: the
+    // second attempt sees 404, counts it as confirmed, and finishes the job.
+    const bunnyStream = createBunnyStreamStub({ notFound: true });
     const { prisma, service } = createVideosService({ bunnyStream });
     prisma.videos.set("video-bunny", createBunnyVideo());
 
@@ -719,11 +947,74 @@ describe("VideosService purge — Bunny Stream", () => {
       "admin-1",
     );
 
-    assert.equal(response.remote.remoteAssetDeleted, false);
+    assert.deepEqual(bunnyStream.deletedVideoIds, [BUNNY_GUID]);
+    assert.equal(response.remote.remoteAssetDeleted, true);
+    assert.deepEqual(prisma.deletedVideoIds, ["video-bunny"]);
+  });
+
+  it("deletes the Bunny asset BEFORE the local row, never after", async () => {
+    // ORDERING PROOF. The remote delete has to be observable strictly before
+    // the local delete, because the whole safety argument rests on it.
+    const order: string[] = [];
+    const prisma = new FakePrismaService();
+    const originalDelete = prisma.videoAsset.delete;
+    prisma.videoAsset.delete = async (args: { where: { id: string } }) => {
+      order.push("local-delete");
+      return originalDelete.call(prisma, args);
+    };
+    const bunnyStream = {
+      deletedVideoIds: [] as string[],
+      // Models the real service: the purge availability guard calls this
+      // before any remote delete, so an order-of-operations stub needs it too.
+      isEnabled(): boolean {
+        return true;
+      },
+      async deleteVideo(videoId: string): Promise<boolean> {
+        order.push("remote-delete");
+        bunnyStream.deletedVideoIds.push(videoId);
+        return true;
+      },
+    };
+    const { service } = createVideosService({ prisma, bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+
+    await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+      "admin-1",
+    );
+
+    assert.deepEqual(order, ["remote-delete", "local-delete"]);
+  });
+
+  it("keeps the local row when the purge transaction fails after a confirmed remote delete", async () => {
+    // The honest partial-failure state. Bunny is gone, the row survives, and
+    // nothing claims success - the operator retries and the 404 path finishes.
+    const prisma = new FakePrismaService();
+    prisma.videoAsset.delete = async () => {
+      throw new Error("local purge transaction failed");
+    };
+    const bunnyStream = createBunnyStreamStub();
+    const { service } = createVideosService({ prisma, bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+
+    await assert.rejects(
+      service.purgeVideo(
+        "video-bunny",
+        { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+        "admin-1",
+      ),
+    );
+
+    assert.deepEqual(bunnyStream.deletedVideoIds, [BUNNY_GUID]);
+    assert.ok(
+      prisma.videos.has("video-bunny"),
+      "the local record must remain so it can be reconciled and retried",
+    );
     assert.equal(
-      prisma.audits.find((audit) => audit.action === "VIDEO_PURGE_STORAGE")
-        ?.status,
-      AuditStatus.FAIL,
+      prisma.audits.some((audit) => audit.action === "VIDEO_PURGE_COMMIT"),
+      false,
+      "a failed transaction must not record a committed purge",
     );
   });
 
@@ -791,13 +1082,127 @@ describe("VideosService purge — Bunny Stream", () => {
     assert.deepEqual(prisma.deletedVideoIds, []);
   });
 
-  it("refuses to purge a Bunny asset that is still assigned to an active website", async () => {
+  it("PURGE ISOLATION: a Bunny purge attempts no local file deletion", async () => {
+    // A valid Bunny asset owns no NVMe bytes, so the local-storage branch must
+    // be structurally unreachable for it - not merely unused by accident.
     const bunnyStream = createBunnyStreamStub();
+    const { prisma, localStorage, service } = createVideosService({
+      bunnyStream,
+    });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+      "admin-1",
+    );
+
+    assert.deepEqual(bunnyStream.deletedVideoIds, [BUNNY_GUID]);
+    assert.equal(response.storage.localVideoDeleteAttempted, false);
+    assert.equal(response.storage.localThumbnailDeleteAttempted, false);
+    assert.equal(response.storage.bytesReclaimed, "0");
+    assert.deepEqual(
+      localStorage.deleteCalls.filter(Boolean),
+      [],
+      "no storage key may be handed to local deletion for a Bunny asset",
+    );
+  });
+
+  it("PURGE ISOLATION: a LOCAL_FILE purge issues zero Bunny calls", async () => {
+    const bunnyStream = createBunnyStreamStub();
+    const { prisma, localStorage, service } = createVideosService({
+      bunnyStream,
+    });
+    prisma.videos.set("video-1", createVideo());
+
+    const response = await service.purgeVideo(
+      "video-1",
+      // Even with remote deletion explicitly requested, a non-Bunny, non-
+      // Cloudinary asset must not reach either provider branch.
+      { confirmVideoId: "video-1", deleteRemoteAsset: true },
+      "admin-1",
+    );
+
+    assert.deepEqual(
+      bunnyStream.deletedVideoIds,
+      [],
+      "a LOCAL_FILE purge must never call Bunny",
+    );
+    assert.equal(response.remote.remoteAssetDeleteAttempted, false);
+    assert.equal(response.storage.localVideoDeleteAttempted, true);
+    assert.equal(response.storage.localThumbnailDeleteAttempted, true);
+    assert.deepEqual(localStorage.deleteCalls.filter(Boolean), [
+      "videos/video-1/source/video.mp4",
+      "videos/video-1/thumbnails/thumb.jpg",
+    ]);
+  });
+
+  it("purges a DISABLED, still-assigned Bunny asset REMOTE FIRST", async () => {
+    // The assignment no longer blocks, so this must now reach Bunny - and the
+    // remote delete must still happen strictly BEFORE the local cleanup.
+    const order: string[] = [];
+    const prisma = new FakePrismaService();
+    const originalDelete = prisma.videoAsset.delete;
+    prisma.videoAsset.delete = async (args: { where: { id: string } }) => {
+      order.push("local-delete");
+      return originalDelete.call(prisma, args);
+    };
+    const originalDetach = prisma.websiteVideo.deleteMany;
+    prisma.websiteVideo.deleteMany = async (args: {
+      where: { videoId: string };
+    }) => {
+      order.push("assignment-cleanup");
+      return originalDetach.call(prisma.websiteVideo, args);
+    };
+    const bunnyStream = {
+      deletedVideoIds: [] as string[],
+      // Models the real service: the purge availability guard calls this
+      // before any remote delete, so an order-of-operations stub needs it too.
+      isEnabled(): boolean {
+        return true;
+      },
+      async deleteVideo(videoId: string): Promise<boolean> {
+        order.push("remote-delete");
+        bunnyStream.deletedVideoIds.push(videoId);
+        return true;
+      },
+    };
+    const { service } = createVideosService({ prisma, bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+    prisma.websiteVideos.push({
+      videoId: "video-bunny",
+      status: AssignmentStatus.ACTIVE,
+    });
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+      "admin-1",
+    );
+
+    assert.deepEqual(bunnyStream.deletedVideoIds, [BUNNY_GUID]);
+    assert.deepEqual(
+      order,
+      ["remote-delete", "assignment-cleanup", "local-delete"],
+      "the assignment must be cleaned INSIDE the transaction, after Bunny confirmed",
+    );
+    assert.deepEqual(prisma.deletedVideoIds, ["video-bunny"]);
+    assert.equal(response.safety.detachedWebsiteAssignmentCount, 1);
+  });
+
+  it("keeps the assignment when the Bunny remote delete is not confirmed", async () => {
+    // Remote-first failure preservation must survive the relaxation: nothing
+    // local may be mutated while the remote delete is unproven.
+    const bunnyStream = createBunnyStreamStub({ throws: true });
     const { prisma, service } = createVideosService({ bunnyStream });
     prisma.videos.set("video-bunny", createBunnyVideo());
     prisma.websiteVideos.push({
       videoId: "video-bunny",
       status: AssignmentStatus.ACTIVE,
+    });
+    addShareLinkRelation(prisma, {
+      shareLinkId: "share-1",
+      videoId: "video-bunny",
     });
 
     await assert.rejects(
@@ -806,9 +1211,25 @@ describe("VideosService purge — Bunny Stream", () => {
         { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
         "admin-1",
       ),
-      BadRequestException,
+      ServiceUnavailableException,
     );
-    assert.deepEqual(bunnyStream.deletedVideoIds, []);
+
+    assert.deepEqual(prisma.deletedVideoIds, []);
+    assert.equal(
+      prisma.websiteVideos.length,
+      1,
+      "the WebsiteVideo assignment must survive an unconfirmed remote delete",
+    );
+    assert.equal(
+      prisma.shareLinkVideos.length,
+      1,
+      "ShareLinkVideo relations must survive too - no partial local cleanup",
+    );
+    assert.equal(
+      prisma.shareLinks.get("share-1")?.status,
+      ShareLinkStatus.ACTIVE,
+      "share links must not be disabled by an aborted purge",
+    );
   });
 });
 
@@ -858,27 +1279,30 @@ describe("VideosService purge — Bunny disabled", () => {
     const { prisma, service } = createVideosService({ bunnyStream });
     prisma.videos.set("video-bunny", createBunnyVideo());
 
-    const response = await service.purgeVideo(
-      "video-bunny",
-      { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
-      "admin-1",
+    // The disabled gate now ABORTS the purge rather than deleting the local
+    // row and orphaning the Bunny asset. `ensureEnabled()` throws before any
+    // network read, so no HTTP request is issued either way.
+    await assert.rejects(
+      service.purgeVideo(
+        "video-bunny",
+        { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+        "admin-1",
+      ),
     );
 
     assert.deepEqual(fetchCalls, [], "no Bunny HTTP request may be issued");
-    assert.notEqual(
-      response.remote.remoteAssetDeleted,
-      true,
-      "a disabled deployment must never claim remote deletion succeeded",
+    assert.deepEqual(
+      prisma.deletedVideoIds,
+      [],
+      "a disabled deployment must not purge the row and orphan the Bunny asset",
     );
-    assert.equal(response.remote.remoteAssetDeleteAttempted, true);
     assert.equal(
-      prisma.audits.find((audit) => audit.action === "VIDEO_PURGE_STORAGE")
-        ?.status,
+      prisma.audits.find(
+        (audit) => audit.action === "VIDEO_BUNNY_REMOTE_DELETE",
+      )?.status,
       AuditStatus.FAIL,
-      "the existing purge convention must record the cleanup failure",
+      "the refusal must be audited truthfully",
     );
-    // The database row is still purged; only the remote cleanup failed.
-    assert.deepEqual(prisma.deletedVideoIds, ["video-bunny"]);
   });
 
   it("still enforces every purge safeguard while Bunny is disabled", async () => {
@@ -933,5 +1357,298 @@ describe("VideosService purge — Bunny disabled", () => {
     // FakeCloudinaryService confirms the delete, unaffected by the Bunny gate.
     assert.equal(response.remote.remoteAssetDeleted, true);
     assert.deepEqual(fetchCalls, []);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * RUNTIME BLOCKER — a remote-deleting purge when Bunny cannot confirm
+ *
+ * The reported failure: a DISABLED Bunny video with an ACTIVE WebsiteVideo
+ * assignment returned 400 "Bunny Stream is not enabled." on a server where
+ * Bunny WAS enabled. The cause was DI, not configuration — the collaborator
+ * was imported with `import type`, so Nest silently injected `undefined`
+ * (pinned by `test/bunny-di-wiring.test.ts`).
+ *
+ * These tests pin the BEHAVIOUR either side of that: what a purge does when
+ * the collaborator is present, and what it must do when it is not. The
+ * remote-first invariant is unchanged throughout — nothing local is ever
+ * destroyed before Bunny confirms.
+ * ------------------------------------------------------------------ */
+
+describe("VideosService purge — Bunny availability for remote deletion", () => {
+  /** The reported combination: DISABLED, still assigned to an ACTIVE website. */
+  function seedDisabledAssignedBunnyVideo(prisma: FakePrismaService): void {
+    prisma.videos.set("video-bunny", createBunnyVideo());
+    prisma.websiteVideos.push({
+      videoId: "video-bunny",
+      status: AssignmentStatus.ACTIVE,
+    });
+    // A REAL related share link, so "an aborted purge touched nothing" is a
+    // meaningful assertion rather than a vacuous one over an empty set.
+    prisma.shareLinks.set("share-link-1", {
+      id: "share-link-1",
+      status: ShareLinkStatus.ACTIVE,
+    });
+    prisma.shareLinkVideos.push({
+      shareLinkId: "share-link-1",
+      videoId: "video-bunny",
+    });
+  }
+
+  /** Asserts the whole local record survived an aborted purge. */
+  function assertLocalStatePreserved(prisma: FakePrismaService): void {
+    assert.deepEqual(
+      prisma.deletedVideoIds,
+      [],
+      "the VideoAsset must survive an unconfirmed remote delete",
+    );
+    assert.equal(
+      prisma.websiteVideos.length,
+      1,
+      "the WebsiteVideo assignment must survive",
+    );
+    assert.equal(
+      prisma.shareLinks.get("share-link-1")?.status,
+      ShareLinkStatus.ACTIVE,
+      "share-link rows must not be disabled by an aborted purge",
+    );
+    assert.equal(
+      prisma.shareLinkVideos.length,
+      1,
+      "ShareLinkVideo membership must survive an aborted purge",
+    );
+    assert.equal(
+      prisma.audits.some((audit) => audit.action === "VIDEO_PURGE_COMMIT"),
+      false,
+      "no VIDEO_PURGE_COMMIT may be written for an aborted purge",
+    );
+  }
+
+  /* TEST A — the reported case, working. */
+  it("A: DISABLED + ACTIVE assignment + Bunny available -> remote first, then local purge", async () => {
+    const bunnyStream = createBunnyStreamStub();
+    const { prisma, service } = createVideosService({ bunnyStream });
+    seedDisabledAssignedBunnyVideo(prisma);
+
+    // Order is the invariant, so it is observed rather than assumed: the
+    // remote delete must already have happened when the local delete runs.
+    const observedOrder: string[] = [];
+    const originalDeleteVideo = bunnyStream.deleteVideo.bind(bunnyStream);
+    bunnyStream.deleteVideo = async (videoId: string) => {
+      observedOrder.push("remote-delete");
+      return originalDeleteVideo(videoId);
+    };
+    const originalDelete = prisma.videoAsset.delete;
+    prisma.videoAsset.delete = async (args: { where: { id: string } }) => {
+      observedOrder.push("local-delete");
+      return originalDelete.call(prisma.videoAsset, args);
+    };
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+      "admin-1",
+    );
+
+    assert.deepEqual(observedOrder, ["remote-delete", "local-delete"]);
+    assert.deepEqual(bunnyStream.deletedVideoIds, [BUNNY_GUID]);
+    assert.equal(response.remote.remoteAssetDeleted, true);
+    assert.deepEqual(prisma.deletedVideoIds, ["video-bunny"]);
+
+    // The former blocker is gone: an ACTIVE assignment no longer refuses the
+    // purge, it is cleaned up inside the local transaction.
+    assert.equal(response.safety.detachedWebsiteAssignmentCount, 1);
+    assert.equal(prisma.websiteVideos.length, 0);
+  });
+
+  /* TEST B — the collaborator is not wired at all (the reported defect). */
+  it("B: Bunny collaborator missing -> actionable refusal, nothing local destroyed", async () => {
+    // `undefined` is exactly what Nest injected while the import was erased.
+    const { prisma, service } = createVideosService({ bunnyStream: undefined });
+    seedDisabledAssignedBunnyVideo(prisma);
+
+    await assert.rejects(
+      service.purgeVideo(
+        "video-bunny",
+        { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+        "admin-1",
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof BadRequestException);
+        const body = error.getResponse() as {
+          code?: string;
+          reason?: string;
+          message?: string;
+        };
+        assert.equal(body.code, BUNNY_STREAM_UNAVAILABLE_FOR_PURGE);
+        assert.equal(body.reason, "NOT_WIRED");
+        assert.equal(body.message, BUNNY_STREAM_UNAVAILABLE_FOR_PURGE_MESSAGE);
+        // The operator must be told the video survived and what to do next.
+        assert.match(String(body.message), /local video was kept/i);
+        assert.match(String(body.message), /local-only purge/i);
+        return true;
+      },
+    );
+
+    assertLocalStatePreserved(prisma);
+    assert.equal(
+      prisma.audits.find(
+        (audit) => audit.action === "VIDEO_BUNNY_REMOTE_DELETE",
+      )?.status,
+      AuditStatus.FAIL,
+      "the refusal must be audited truthfully",
+    );
+  });
+
+  /* TEST B2 — the feature is switched off. Same refusal, different reason. */
+  it("B2: Bunny disabled -> same stable code, reason NOT_ENABLED, no remote call", async () => {
+    const bunnyStream = createBunnyStreamStub({ enabled: false });
+    const { prisma, service } = createVideosService({ bunnyStream });
+    seedDisabledAssignedBunnyVideo(prisma);
+
+    await assert.rejects(
+      service.purgeVideo(
+        "video-bunny",
+        { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+        "admin-1",
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof BadRequestException);
+        const body = error.getResponse() as { code?: string; reason?: string };
+        assert.equal(body.code, BUNNY_STREAM_UNAVAILABLE_FOR_PURGE);
+        assert.equal(body.reason, "NOT_ENABLED");
+        return true;
+      },
+    );
+
+    assert.deepEqual(
+      bunnyStream.deletedVideoIds,
+      [],
+      "a disabled deployment must issue no remote delete",
+    );
+    assertLocalStatePreserved(prisma);
+  });
+
+  /* TEST C — explicit local-only purge still works with Bunny unavailable. */
+  it("C: deleteRemoteAsset:false + Bunny unavailable -> ZERO Bunny calls, local purge succeeds", async () => {
+    const bunnyStream = createBunnyStreamStub({ enabled: false });
+    const { prisma, service } = createVideosService({ bunnyStream });
+    seedDisabledAssignedBunnyVideo(prisma);
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: false },
+      "admin-1",
+    );
+
+    // The availability guard is never consulted: prepareBunnyRemoteDelete()
+    // returns null first, so an opted-out purge cannot be blocked by Bunny.
+    assert.deepEqual(bunnyStream.deletedVideoIds, []);
+    assert.equal(response.remote.remoteAssetDeleteAttempted, false);
+    assert.equal(response.remote.remoteAssetDeleted, false);
+
+    // Every other safeguard still applied, and cleanup still happened.
+    assert.deepEqual(prisma.deletedVideoIds, ["video-bunny"]);
+    assert.equal(response.safety.detachedWebsiteAssignmentCount, 1);
+    assert.equal(prisma.websiteVideos.length, 0);
+  });
+
+  it("C2: local-only purge still refuses a video that is not DISABLED", async () => {
+    const bunnyStream = createBunnyStreamStub({ enabled: false });
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set(
+      "video-bunny",
+      createBunnyVideo({ status: VideoStatus.READY }),
+    );
+
+    await assert.rejects(
+      service.purgeVideo(
+        "video-bunny",
+        { confirmVideoId: "video-bunny", deleteRemoteAsset: false },
+        "admin-1",
+      ),
+      BadRequestException,
+    );
+    assert.deepEqual(prisma.deletedVideoIds, []);
+    assert.deepEqual(bunnyStream.deletedVideoIds, []);
+  });
+
+  /* TEST D — Bunny answers 404. Already gone counts as confirmed. */
+  it("D: remote DELETE 404 -> treated as already deleted, local purge proceeds", async () => {
+    const bunnyStream = createBunnyStreamStub({ notFound: true });
+    const { prisma, service } = createVideosService({ bunnyStream });
+    seedDisabledAssignedBunnyVideo(prisma);
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+      "admin-1",
+    );
+
+    assert.deepEqual(bunnyStream.deletedVideoIds, [BUNNY_GUID]);
+    assert.equal(response.remote.remoteAssetDeleted, true);
+    assert.deepEqual(prisma.deletedVideoIds, ["video-bunny"]);
+    assert.equal(prisma.websiteVideos.length, 0);
+  });
+
+  /* TEST E — transient Bunny failure. Retriable, nothing local destroyed. */
+  it("E: remote DELETE 5xx/timeout -> retriable failure, all local state preserved", async () => {
+    const bunnyStream = createBunnyStreamStub({ throws: true });
+    const { prisma, service } = createVideosService({ bunnyStream });
+    seedDisabledAssignedBunnyVideo(prisma);
+
+    await assert.rejects(
+      service.purgeVideo(
+        "video-bunny",
+        { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+        "admin-1",
+      ),
+      (error: unknown) => {
+        // A transient failure is NOT the unavailable-for-purge code: retrying
+        // is the right response, and the message says the record was kept.
+        assert.ok(error instanceof ServiceUnavailableException);
+        assert.match(String(error.message), /retry the purge/i);
+        return true;
+      },
+    );
+
+    assert.deepEqual(bunnyStream.deletedVideoIds, [BUNNY_GUID]);
+    assertLocalStatePreserved(prisma);
+  });
+
+  /* TEST F / G — what the Admin console actually sends. */
+  it("F: the Admin default request (deleteRemoteAsset:true) deletes remotely", async () => {
+    const bunnyStream = createBunnyStreamStub();
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+      "admin-1",
+    );
+
+    assert.deepEqual(bunnyStream.deletedVideoIds, [BUNNY_GUID]);
+    assert.equal(response.remote.remoteAssetDeleteAttempted, true);
+  });
+
+  it("G: an explicit opt-out (deleteRemoteAsset:false) retains the Bunny asset", async () => {
+    const bunnyStream = createBunnyStreamStub();
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: false },
+      "admin-1",
+    );
+
+    assert.deepEqual(
+      bunnyStream.deletedVideoIds,
+      [],
+      "an opt-out must never reach Bunny",
+    );
+    assert.equal(response.remote.remoteAssetDeleteAttempted, false);
+    assert.deepEqual(prisma.deletedVideoIds, ["video-bunny"]);
   });
 });

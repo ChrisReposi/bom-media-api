@@ -1,17 +1,52 @@
 import {
   BadRequestException,
   ConflictException,
+  HttpException,
   Injectable,
   Logger,
   NotFoundException,
   Optional,
+  ServiceUnavailableException,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { randomUUID } from "node:crypto";
 import { readFile, unlink } from "node:fs/promises";
 import { BUNNY_STREAM_METADATA_KEY } from "../bunny/bunny-stream.constants";
-import { BunnyStreamService } from "../bunny/bunny-stream.service";
-import { readBunnyVideoAsset } from "../bunny/bunny-video-asset.util";
+// BOTH OF THESE MUST BE VALUE IMPORTS. `BunnyNotFoundError` is the
+// `instanceof` marker that separates an authoritative 404 from a transient
+// Bunny failure.
+//
+// `BunnyStreamService` is a VALUE because Nest resolves the constructor
+// parameter below from the `design:paramtypes` metadata TypeScript emits, and
+// that metadata can only name a class that still exists at runtime. Writing
+// `import type { BunnyStreamService }` erases it, the emitted parameter type
+// degrades to a bare `Function`, and Nest cannot match it to the provider
+// exported by `BunnyStreamModule`. Because the parameter is `@Optional()`, that
+// failure is SILENT: `undefined` is injected instead of the service and the
+// container still boots. Every Bunny path on this service then failed at
+// runtime with "Bunny Stream is not enabled." even though Bunny was fully
+// configured and enabled - see `test/bunny-di-wiring.test.ts`, which pins this.
+//
+// `consistent-type-imports` sees `BunnyStreamService` used only in type
+// position and offers to "fix" it back to `import type`. Applying that fix is
+// what caused the outage described above, so the rule is disabled for this one
+// import DELIBERATELY. Nest needs the runtime value; the type annotation is
+// incidental.
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import {
+  BunnyNotFoundError,
+  BunnyStreamService,
+} from "../bunny/bunny-stream.service";
+import {
+  applyBunnyRemoteMissingMarker,
+  classifyBunnyVideoAsset,
+  clearBunnyRemoteMissingMarker,
+  isBunnyRemoteMissing,
+  readBunnyVideoAsset,
+  resolveBunnyLocalStatus,
+  resolveBunnyRemoteMissingStatus,
+} from "../bunny/bunny-video-asset.util";
+import type { BunnyVideo } from "../bunny/types/bunny-stream.type";
 import { buildCacheKey } from "../cache/memory-cache-key.util";
 import { MemoryCacheService } from "../cache/memory-cache.service";
 import { rethrowWithDatabaseStage } from "../common/errors/safe-database-error-context.util";
@@ -47,6 +82,8 @@ import type { UploadLocalVideoChunkDto } from "./dto/upload-local-video-chunk.dt
 import type { UpdateVideoDto } from "./dto/update-video.dto";
 import type { UploadVideoDto } from "./dto/upload-video.dto";
 import type {
+  BunnyVideoPreviewResponse,
+  BunnyVideoThumbnailResponse,
   CancelLocalVideoUploadResponse,
   DisableVideoResponse,
   InitBunnyVideoUploadResponse,
@@ -60,6 +97,10 @@ import type {
 } from "./types/video-response.type";
 import { buildCloudinaryVideoThumbnailUrl } from "./utils/cloudinary-video.util";
 import {
+  BUNNY_THUMBNAIL_ALLOWED_MIME_TYPES,
+  hasThumbnailMagicBytes,
+} from "./utils/thumbnail-magic-bytes.util";
+import {
   isValidVideoFilterKey,
   normalizeVideoFilterKey,
 } from "./utils/video-filter-key.util";
@@ -68,6 +109,11 @@ import {
   isShortAdminVideoSearch,
   normalizeAdminVideoSearch,
 } from "./utils/video-search.util";
+import {
+  VIEW_COUNT_INVALID_MESSAGE,
+  isCanonicalViewCount,
+  toViewCountBigInt,
+} from "./utils/view-count.util";
 import {
   DEFAULT_VIDEO_EMBED_ALLOW,
   DEFAULT_VIDEO_EMBED_ALLOWED_HOSTS,
@@ -99,7 +145,37 @@ type VideoMutationAction =
   | "VIDEO_PURGE_STORAGE"
   | "VIDEO_BUNNY_UPLOAD_INIT"
   | "VIDEO_BUNNY_UPLOAD_INIT_ORPHAN"
-  | "VIDEO_BUNNY_STATUS_SYNC";
+  | "VIDEO_BUNNY_STATUS_SYNC"
+  | "VIDEO_BUNNY_THUMBNAIL_SET"
+  | "VIDEO_BUNNY_REMOTE_MISSING"
+  | "VIDEO_BUNNY_REMOTE_RECOVERED"
+  | "VIDEO_BUNNY_REMOTE_DELETE";
+
+/**
+ * Player overrides applied to the ADMIN Bunny preview embed only.
+ *
+ * `autoplay=false` is Bunny's documented per-embed override of the library's
+ * global Player setting. Admin preview must open paused; public watch
+ * resolution deliberately passes nothing so reviewer playback keeps whatever
+ * the library is configured to do.
+ */
+const ADMIN_PREVIEW_PLAYER_PARAMS = { autoplay: "false" } as const;
+
+/**
+ * Stable error code for a purge that asked for remote deletion on a
+ * Bunny-backed video while Bunny cannot confirm it.
+ *
+ * Exported so clients and tests branch on the code rather than on the prose.
+ * The purge is ABORTED when this is raised: the video, its website
+ * assignments and its share-link memberships are all still there.
+ */
+export const BUNNY_STREAM_UNAVAILABLE_FOR_PURGE =
+  "BUNNY_STREAM_UNAVAILABLE_FOR_PURGE";
+
+export const BUNNY_STREAM_UNAVAILABLE_FOR_PURGE_MESSAGE =
+  "Bunny Stream is not enabled on this server, so remote deletion cannot be " +
+  "confirmed. The local video was kept. Enable Bunny Stream and retry, or " +
+  "explicitly choose local-only purge if that is intentional.";
 
 const DEFAULT_DB_UPLOAD_MAX_MB = 50;
 const MAX_DB_UPLOAD_MAX_MB = 100;
@@ -583,6 +659,15 @@ export class VideosService {
    *
    * `encodeProgress` is returned for display and never persisted; polling must
    * not write to the database on every tick.
+   *
+   * TRANSIENT FAILURE vs AUTHORITATIVE 404. These are different events and are
+   * handled differently on purpose:
+   *
+   * - A timeout, a network error, a 401/403, a 429 or a 5xx propagates as a
+   *   truthful error and changes NOTHING locally. `READY` is not demoted, and
+   *   no remote-missing marker is written.
+   * - A 404 is Bunny stating the video does not exist. That is reconciled here
+   *   rather than surfaced as a generic 500 - see `reconcileMissingBunnyVideo`.
    */
   async syncBunnyVideoStatus(
     id: string,
@@ -603,6 +688,9 @@ export class VideosService {
         // `classifyBunnyVideoAsset()`.
         playbackId: true,
         durationSeconds: true,
+        // Read so a sync can fill an empty poster without ever overwriting one
+        // an operator already set.
+        thumbnailUrl: true,
         metadataJson: true,
       },
     });
@@ -616,29 +704,96 @@ export class VideosService {
       throw new BadRequestException("Video is not backed by Bunny Stream.");
     }
 
-    const remote = await bunny.getVideo(bunnyAsset.bunnyVideoId);
+    let remote: BunnyVideo;
+    try {
+      remote = await bunny.getVideo(bunnyAsset.bunnyVideoId);
+    } catch (error) {
+      // ONLY an authoritative 404 means "the remote asset is gone". Every other
+      // Bunny failure is transient and must leave the local record untouched.
+      if (error instanceof BunnyNotFoundError) {
+        return this.reconcileMissingBunnyVideo({
+          id,
+          adminId,
+          currentStatus: existing.status,
+          metadataJson: existing.metadataJson,
+          bunnyVideoId: bunnyAsset.bunnyVideoId,
+        });
+      }
+
+      throw error;
+    }
+
     const nextStatus = this.resolveBunnyLocalStatus(
       existing.status,
       bunny.mapProcessingState(remote.status),
     );
     const statusChanged = nextStatus !== existing.status;
+    // RECOVERY. Bunny answered for this asset, so any marker left by an earlier
+    // 404 is stale and is cleared. An asset is never permanently poisoned by a
+    // single past 404: with the marker gone, `resolveBunnyLocalStatus()` is free
+    // to promote the (now FAILED) record back to READY under the normal rules.
+    const recoveredMetadata = isBunnyRemoteMissing(existing.metadataJson)
+      ? clearBunnyRemoteMissingMarker(existing.metadataJson)
+      : null;
     const durationSeconds =
       existing.durationSeconds === null &&
       remote.length !== null &&
       remote.length > 0
         ? Math.round(remote.length)
         : null;
+    // POSTER PERSISTENCE. Bunny only produces a thumbnail once encoding has
+    // run, so the record created by `initBunnyVideoUpload()` has none. Sync is
+    // the point where authoritative Bunny metadata is already in hand, so the
+    // poster is stored here rather than re-fetched from Bunny on every page
+    // load - and without a second Bunny request.
+    //
+    // The URL is BUILT from Bunny's documented storage structure
+    // (`https://{pull_zone}/{videoId}/{thumbnailFileName}`) using the
+    // `thumbnailFileName` this Get Video response returned. It is deliberately
+    // not taken from any pre-built URL field.
+    //
+    // `buildThumbnailUrl()` returns null - never a guess - when Bunny has no
+    // thumbnail yet, when no pull-zone hostname is configured, or when a
+    // component fails path validation. Null simply leaves the column alone, so
+    // a missing poster can never demote the status or break playback.
+    //
+    // Only fills a genuinely empty value: an operator-supplied thumbnail is
+    // never overwritten, and an asset that already has one is not rewritten on
+    // every poll. This is a poster URL, never a short-lived playback token.
+    const thumbnailUrl =
+      (existing.thumbnailUrl ?? "").trim() === ""
+        ? bunny.buildThumbnailUrl(
+            bunnyAsset.bunnyVideoId,
+            remote.thumbnailFileName,
+          )
+        : null;
 
     const video =
-      statusChanged || durationSeconds !== null
+      statusChanged ||
+      durationSeconds !== null ||
+      thumbnailUrl !== null ||
+      recoveredMetadata?.changed === true
         ? await this.prisma.videoAsset.update({
             where: { id },
             data: {
               ...(statusChanged ? { status: nextStatus } : {}),
               ...(durationSeconds === null ? {} : { durationSeconds }),
+              ...(thumbnailUrl === null ? {} : { thumbnailUrl }),
+              ...(recoveredMetadata?.changed === true
+                ? { metadataJson: this.toJsonInput(recoveredMetadata.metadata) }
+                : {}),
             },
           })
         : await this.prisma.videoAsset.findUniqueOrThrow({ where: { id } });
+
+    if (recoveredMetadata?.changed === true) {
+      await this.writeAudit(adminId, "VIDEO_BUNNY_REMOTE_RECOVERED", id, {
+        previousStatus: existing.status,
+        nextStatus,
+        bunnyStatus: remote.status,
+        bunnyVideoId: bunnyAsset.bunnyVideoId,
+      });
+    }
 
     if (statusChanged) {
       await this.writeAudit(adminId, "VIDEO_BUNNY_STATUS_SYNC", id, {
@@ -647,6 +802,11 @@ export class VideosService {
         bunnyStatus: remote.status,
         bunnyVideoId: bunnyAsset.bunnyVideoId,
       });
+    }
+
+    // A recovered asset can become publicly playable again, so a cache holding
+    // the previous non-playable view must not survive this call.
+    if (statusChanged || recoveredMetadata?.changed === true) {
       this.invalidateAdminVideoCaches();
     }
 
@@ -656,7 +816,331 @@ export class VideosService {
       bunnyStatus: remote.status,
       encodeProgress: remote.encodeProgress,
       statusChanged,
+      remoteMissing: false,
     };
+  }
+
+  /**
+   * Reconciles a Bunny asset whose remote video answered an authoritative 404.
+   *
+   * THE LOCAL ROW IS NEVER DELETED HERE. A single 404 is not a mandate to
+   * destroy local history, provenance and audit trail; it is an observation
+   * that the remote asset is gone. Deleting the row automatically would also
+   * remove the operator's only handle on the problem. The row is preserved,
+   * flagged, and made non-playable, and the operator decides what happens next
+   * - purge it deliberately, or recover it if the asset comes back.
+   *
+   * Three things change, and nothing else:
+   *
+   * 1. `metadataJson.bunnyStream.remoteMissing` records when and why. Provider
+   *    identifiers are preserved for audit and for a later remote purge.
+   * 2. The local status becomes non-playable - `FAILED`, unless the asset is
+   *    already `DISABLED`, which is an administrator decision and is kept.
+   * 3. Every admin/public metadata cache is invalidated, so a cached READY view
+   *    cannot keep serving an asset that no longer exists.
+   *
+   * That is enough to fail closed everywhere: public watch resolution and
+   * share-link eligibility both gate on `status === READY`, so no new signed
+   * Bunny playback URL can be minted and no new share link can include it.
+   *
+   * IDEMPOTENT. Re-syncing an already-flagged asset rewrites nothing, keeps the
+   * original `detectedAt`, and does not re-fire the audit event.
+   */
+  private async reconcileMissingBunnyVideo(params: {
+    id: string;
+    adminId: string;
+    currentStatus: VideoStatus;
+    metadataJson: Prisma.JsonValue | null;
+    bunnyVideoId: string;
+  }): Promise<SyncBunnyVideoStatusResponse> {
+    const nextStatus = resolveBunnyRemoteMissingStatus(params.currentStatus);
+    const statusChanged = nextStatus !== params.currentStatus;
+    const marked = applyBunnyRemoteMissingMarker(
+      params.metadataJson,
+      new Date(),
+    );
+
+    const video =
+      statusChanged || marked.changed
+        ? await this.prisma.videoAsset.update({
+            where: { id: params.id },
+            data: {
+              ...(statusChanged ? { status: nextStatus } : {}),
+              ...(marked.changed
+                ? { metadataJson: this.toJsonInput(marked.metadata) }
+                : {}),
+            },
+          })
+        : await this.prisma.videoAsset.findUniqueOrThrow({
+            where: { id: params.id },
+          });
+
+    if (marked.changed || statusChanged) {
+      await this.writeAudit(
+        params.adminId,
+        "VIDEO_BUNNY_REMOTE_MISSING",
+        params.id,
+        {
+          previousStatus: params.currentStatus,
+          nextStatus,
+          bunnyVideoId: params.bunnyVideoId,
+          remoteResult: "NOT_FOUND",
+        },
+        AuditStatus.FAIL,
+      );
+      this.invalidateAdminVideoCaches();
+    }
+
+    return {
+      message:
+        "Bunny Stream reports this video no longer exists. The local record was kept and marked as remote-missing.",
+      video: this.toVideoResponse(video),
+      bunnyStatus: null,
+      encodeProgress: null,
+      statusChanged,
+      remoteMissing: true,
+    };
+  }
+
+  /**
+   * Mints a short-lived signed Bunny embed URL for the authenticated Admin
+   * preview.
+   *
+   * WHY THIS EXISTS. The stored `embedUrl` is deliberately unsigned - see
+   * `buildUnsignedEmbedUrl()` - and the Bunny library has Embed View Token
+   * Authentication enabled, so rendering the stored value yields a Bunny 403.
+   * Admin preview therefore has to be signed per request, exactly like public
+   * watch resolution already is.
+   *
+   * FAIL CLOSED, and gated on the *same* strict classifier as public playback:
+   * a `bunny-malformed` record is refused rather than falling back to generic
+   * embed handling, which would hand out a permanent unsigned Bunny URL. The
+   * result is never persisted, and no Bunny secret is returned - the token
+   * security key is only an input to the hash.
+   *
+   * Authorization happens before this method runs: the controller sits behind
+   * `AdminAccessTokenGuard` + `AdminRolesGuard` and the handler carries
+   * `@AdminReadRoles()`.
+   */
+  async getBunnyVideoPreview(id: string): Promise<BunnyVideoPreviewResponse> {
+    const bunny = this.requireBunnyStreamService();
+    bunny.ensureEnabled();
+
+    const existing = await this.prisma.videoAsset.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        status: true,
+        provider: true,
+        sourceType: true,
+        providerAssetId: true,
+        // Part of the Bunny identification predicate - see
+        // `classifyBunnyVideoAsset()`.
+        playbackId: true,
+        metadataJson: true,
+      },
+    });
+
+    if (existing === null) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    const classification = classifyBunnyVideoAsset(existing);
+
+    if (classification.kind === "bunny-malformed") {
+      // Never sign, and never emit the stored unsigned URL, for a record that
+      // claims to be Bunny but fails the predicate.
+      throw new BadRequestException(
+        "Bunny Stream video record is malformed and cannot be previewed.",
+      );
+    }
+
+    if (classification.kind === "not-bunny") {
+      throw new BadRequestException("Video is not backed by Bunny Stream.");
+    }
+
+    if (existing.status !== VideoStatus.READY) {
+      throw new BadRequestException(
+        "Bunny Stream video is not ready for preview.",
+      );
+    }
+
+    // Configuration check before minting anything: `createSignedEmbedUrl()`
+    // needs both the library id and the token security key, and a missing one
+    // must surface as a clean refusal rather than an internal error.
+    if (!bunny.canSignEmbedUrl()) {
+      throw new BadRequestException("Bunny Stream is not enabled.");
+    }
+
+    // ADMIN PREVIEW MUST OPEN PAUSED. The Bunny library's Player settings
+    // default to autoplay, so the embed renders `<video ... autoplay ...>` and
+    // the browser starts playing as soon as the iframe loads. `autoplay=false`
+    // is Bunny's documented per-embed override; it is scoped to this URL only,
+    // changes no library setting, and is not covered by the embed token, so it
+    // cannot affect the signature. Public watch resolution passes no player
+    // parameters and therefore keeps the library default unchanged.
+    const signed = bunny.createSignedEmbedUrl(
+      classification.bunnyVideoId,
+      new Date(),
+      ADMIN_PREVIEW_PLAYER_PARAMS,
+    );
+
+    return { embedUrl: signed.embedUrl, expires: signed.expires };
+  }
+
+  /**
+   * Uploads an operator-chosen image as the Bunny video's main thumbnail.
+   *
+   * WHY THIS EXISTS. The create form has always let an operator pick a
+   * thumbnail, but the Bunny branch silently discarded it, so the only way to
+   * get a custom poster was to open the Bunny dashboard by hand. This is the
+   * automated replacement for that manual step.
+   *
+   * ORDERING - the video must already be READY. `thumbnailTime` makes Bunny
+   * extract its own main thumbnail *during* encoding, so an image uploaded
+   * while the video is still PROCESSING can be replaced by that extraction.
+   * Waiting for READY is the provably safe order; see
+   * `docs/features/bunny-stream.md` §4.5.
+   *
+   * Gated on the same strict `classifyBunnyVideoAsset()` predicate as every
+   * other Bunny branch, so no cross-provider or malformed record can ever
+   * trigger a Bunny write.
+   *
+   * Bunny's Set Thumbnail response does not carry the resulting file name, so
+   * the authoritative `thumbnailFileName` is re-read with one `getVideo()` and
+   * the CDN URL is built from it. If Bunny has not exposed one yet the video is
+   * left untouched and `thumbnailPersisted: false` is reported - never a guess,
+   * never a FAILED video.
+   */
+  async setBunnyVideoThumbnail(
+    id: string,
+    file: Express.Multer.File | undefined,
+    adminId: string,
+  ): Promise<BunnyVideoThumbnailResponse> {
+    const bunny = this.requireBunnyStreamService();
+    bunny.ensureEnabled();
+
+    const thumbnail = this.validateBunnyThumbnailUpload(file);
+
+    const existing = await this.prisma.videoAsset.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        status: true,
+        provider: true,
+        sourceType: true,
+        providerAssetId: true,
+        // Part of the Bunny identification predicate - see
+        // `classifyBunnyVideoAsset()`.
+        playbackId: true,
+        metadataJson: true,
+      },
+    });
+
+    if (existing === null) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    const classification = classifyBunnyVideoAsset(existing);
+
+    if (classification.kind === "bunny-malformed") {
+      throw new BadRequestException(
+        "Bunny Stream video record is malformed and cannot receive a thumbnail.",
+      );
+    }
+
+    if (classification.kind === "not-bunny") {
+      throw new BadRequestException("Video is not backed by Bunny Stream.");
+    }
+
+    if (existing.status !== VideoStatus.READY) {
+      throw new BadRequestException(
+        "Bunny Stream video must be READY before a custom thumbnail can be set.",
+      );
+    }
+
+    // Propagates truthfully: a Bunny failure is never reported as a success.
+    await bunny.setVideoThumbnail(classification.bunnyVideoId, thumbnail);
+
+    // Bunny names the stored file itself - a custom upload commonly lands as
+    // `thumbnail_<random>.jpg` - so the name must be read back, never assumed.
+    const remote = await bunny.getVideo(classification.bunnyVideoId);
+    const thumbnailUrl = bunny.buildThumbnailUrl(
+      classification.bunnyVideoId,
+      remote.thumbnailFileName,
+    );
+
+    const video =
+      thumbnailUrl === null
+        ? await this.prisma.videoAsset.findUniqueOrThrow({ where: { id } })
+        : await this.prisma.videoAsset.update({
+            where: { id },
+            // Unlike status sync, this DOES replace an existing poster: the
+            // operator just chose a new one on purpose.
+            data: { thumbnailUrl },
+          });
+
+    await this.writeAudit(adminId, "VIDEO_BUNNY_THUMBNAIL_SET", id, {
+      bunnyVideoId: classification.bunnyVideoId,
+      thumbnailFileName: remote.thumbnailFileName,
+      thumbnailPersisted: thumbnailUrl !== null,
+    });
+    this.invalidateAdminVideoCaches();
+
+    return {
+      message:
+        thumbnailUrl === null
+          ? "Bunny Stream accepted the thumbnail; the poster URL is not available yet."
+          : "Bunny Stream thumbnail updated.",
+      video: this.toVideoResponse(video),
+      thumbnailUrl,
+      thumbnailPersisted: thumbnailUrl !== null,
+    };
+  }
+
+  /**
+   * Validates an in-memory thumbnail before it is forwarded to Bunny.
+   *
+   * Mirrors the project's existing thumbnail rules - the same MIME allowlist
+   * and the same size ceiling as the local-thumbnail path - but works on the
+   * buffer, because this image is streamed straight through to Bunny and is
+   * never written to permanent storage.
+   *
+   * Magic bytes are checked as well as the declared type, so a renamed
+   * executable or an SVG relabelled as `image/png` cannot reach the provider.
+   */
+  private validateBunnyThumbnailUpload(
+    file: Express.Multer.File | undefined,
+  ): Buffer {
+    if (file === undefined) {
+      throw new BadRequestException("Thumbnail image file is required.");
+    }
+
+    const mimeType = file.mimetype.toLowerCase();
+    if (
+      !(BUNNY_THUMBNAIL_ALLOWED_MIME_TYPES as readonly string[]).includes(
+        mimeType,
+      )
+    ) {
+      throw new BadRequestException("Thumbnail image type is not supported.");
+    }
+
+    const buffer = file.buffer;
+    if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+      throw new BadRequestException("Thumbnail image file is empty.");
+    }
+
+    if (buffer.length > this.getThumbnailUploadMaxBytes()) {
+      throw new BadRequestException("Thumbnail image file is too large.");
+    }
+
+    if (!hasThumbnailMagicBytes(buffer, mimeType)) {
+      throw new BadRequestException(
+        "Thumbnail image content does not match its declared type.",
+      );
+    }
+
+    return buffer;
   }
 
   async uploadVideo(
@@ -1904,6 +2388,53 @@ export class VideosService {
     }
 
     const deleteRemoteAsset = dto.deleteRemoteAsset ?? false;
+
+    // STEP 1 - VALIDATE, WITHOUT MUTATING ANYTHING.
+    //
+    // Every local precondition is checked before a single destructive action
+    // runs, local or remote. The same checks are re-run inside the transaction
+    // below, which is what actually enforces them against a concurrent change;
+    // this pass exists so a video that was never going to be purgeable does not
+    // get its Bunny asset deleted first.
+    const bunnyRemoteDelete = await this.prepareBunnyRemoteDelete(
+      id,
+      deleteRemoteAsset,
+    );
+
+    // STEP 2 + 3 - DELETE THE REMOTE BUNNY ASSET, AND ABORT IF IT IS NOT
+    // CONFIRMED GONE.
+    //
+    // REMOTE FIRST, deliberately, and only for Bunny. The two possible failure
+    // states are not equally bad:
+    //
+    //   remote gone + local row still here  -> visible, reconcilable, retriable
+    //   local row gone + remote still here  -> an invisible, billable orphan
+    //
+    // Deleting the local row first produces the second state whenever Bunny is
+    // unreachable, and nothing is left pointing at the remote asset. Doing the
+    // remote delete first produces the first state instead, which the next sync
+    // or reconciliation run flags as remote-missing.
+    //
+    // `deleteVideo()` treats a 404 as confirmed - the asset is gone either way,
+    // which is what makes a retry after a partial failure work. Anything else
+    // (timeout, network error, 401/403, 429, 5xx) throws, and that error
+    // propagates: the local purge below never runs, and the row stays intact.
+    //
+    // Cloudinary is untouched by this and keeps its existing post-transaction
+    // best-effort behaviour.
+    if (bunnyRemoteDelete !== null) {
+      await this.deleteBunnyRemoteAssetOrThrow(
+        bunnyRemoteDelete.bunnyVideoId,
+        id,
+        adminId,
+      );
+    }
+
+    // STEP 4 - COMMIT THE LOCAL PURGE.
+    //
+    // If this transaction fails, Bunny is already gone but the local row
+    // survives. That is reported truthfully rather than as a success, and the
+    // retry works: Bunny answers 404, which counts as confirmed.
     const purgeResult = await this.prisma.$transaction(async (transaction) => {
       const video = await transaction.videoAsset.findUnique({
         where: { id },
@@ -1953,18 +2484,31 @@ export class VideosService {
       const hadWebsiteAssignments = activeWebsiteAssignmentCount > 0;
       const hadShareLinks = shareLinkVideoCount > 0;
 
-      if (hadWebsiteAssignments) {
-        throw new BadRequestException(
-          "Video cannot be permanently deleted while it is assigned to active websites.",
-        );
-      }
-
+      // AN ACTIVE WEBSITE ASSIGNMENT NO LONGER BLOCKS THE PURGE.
+      //
+      // It used to throw here, which forced an operator to visit every website
+      // and unassign by hand before a video they had ALREADY disabled could be
+      // removed. That gate bought nothing: `status === DISABLED` is checked
+      // just above and is the real safety property - a DISABLED video is
+      // already administratively unavailable, its ACTIVE share links were
+      // disabled by `disableVideo()`, and public resolution requires
+      // `READY`, so no assignment can make it playable.
+      //
+      // The assignment is therefore relationship state that the purge cleans
+      // up, exactly like `ShareLinkVideo` below. The counts are still gathered
+      // and still reported truthfully.
+      //
+      // Deliberately NOT relaxed: the DISABLED requirement, the canonical
+      // provenance conflict (checked before this transaction), and the OWNER
+      // role gate on the route.
       const disabledShareLinkCount = await this.disableActiveShareLinksForVideo(
         transaction,
         id,
       );
       const detachedShareLinkVideoCount =
         await this.detachShareLinkVideosForVideo(transaction, id);
+      const detachedWebsiteAssignmentCount =
+        await this.detachWebsiteVideosForVideo(transaction, id);
 
       await transaction.videoAsset.delete({ where: { id } });
 
@@ -1980,6 +2524,7 @@ export class VideosService {
             sourceType: video.sourceType,
             disabledShareLinkCount,
             detachedShareLinkVideoCount,
+            detachedWebsiteAssignmentCount,
           }),
         },
       });
@@ -1991,6 +2536,7 @@ export class VideosService {
         activeWebsiteAssignmentCount,
         disabledShareLinkCount,
         detachedShareLinkVideoCount,
+        detachedWebsiteAssignmentCount,
       };
     });
 
@@ -1998,15 +2544,16 @@ export class VideosService {
     // provider branch is mutually exclusive: `readBunnyVideoAsset` only matches
     // assets the Bunny upload path created, so Cloudinary, DIRECT_URL, EMBED,
     // LOCAL_FILE and DB_BLOB purges are byte-for-byte unchanged.
-    const bunnyAsset = readBunnyVideoAsset(purgeResult.video);
+    //
+    // The Bunny branch already ran BEFORE the transaction and is only reported
+    // here; reaching this line at all means Bunny confirmed the delete.
     const shouldDeleteCloudinaryAsset =
       deleteRemoteAsset &&
       purgeResult.video.provider === VideoProvider.CLOUDINARY &&
       purgeResult.video.providerAssetId !== null;
-    const shouldDeleteBunnyAsset = deleteRemoteAsset && bunnyAsset !== null;
     const shouldDeleteRemoteAsset =
-      shouldDeleteCloudinaryAsset || shouldDeleteBunnyAsset;
-    let remoteAssetDeleted = false;
+      shouldDeleteCloudinaryAsset || bunnyRemoteDelete !== null;
+    let remoteAssetDeleted = bunnyRemoteDelete !== null;
 
     if (
       shouldDeleteCloudinaryAsset &&
@@ -2014,11 +2561,6 @@ export class VideosService {
     ) {
       remoteAssetDeleted = await this.deleteRemoteAssetBestEffort(
         purgeResult.video.providerAssetId,
-        purgeResult.video.id,
-      );
-    } else if (shouldDeleteBunnyAsset && bunnyAsset !== null) {
-      remoteAssetDeleted = await this.deleteBunnyRemoteAssetBestEffort(
-        bunnyAsset.bunnyVideoId,
         purgeResult.video.id,
       );
     }
@@ -2067,6 +2609,8 @@ export class VideosService {
         activeWebsiteAssignmentCount: purgeResult.activeWebsiteAssignmentCount,
         disabledShareLinkCount: purgeResult.disabledShareLinkCount,
         detachedShareLinkVideoCount: purgeResult.detachedShareLinkVideoCount,
+        detachedWebsiteAssignmentCount:
+          purgeResult.detachedWebsiteAssignmentCount,
         deleteRemoteAsset,
         remoteAssetDeleteAttempted: shouldDeleteRemoteAsset,
         remoteAssetDeleted,
@@ -2093,6 +2637,8 @@ export class VideosService {
         activeWebsiteAssignmentCount: purgeResult.activeWebsiteAssignmentCount,
         disabledShareLinkCount: purgeResult.disabledShareLinkCount,
         detachedShareLinkVideoCount: purgeResult.detachedShareLinkVideoCount,
+        detachedWebsiteAssignmentCount:
+          purgeResult.detachedWebsiteAssignmentCount,
       },
       storage: {
         localVideoDeleteAttempted,
@@ -2228,29 +2774,150 @@ export class VideosService {
   }
 
   /**
-   * Deletes a Bunny Stream asset after its local row has already been purged.
+   * Decides whether this purge must delete a Bunny remote asset, and refuses
+   * early if the local preconditions would have rejected the purge anyway.
    *
-   * Returns the truth: `false` whenever Bunny did not confirm the delete, so
-   * the purge audit entry and the API response report a failure instead of
-   * silently claiming success. A `false` here means the Bunny library still
-   * holds an asset that no local row points at.
+   * NON-DESTRUCTIVE. Reads only. Its whole purpose is to make sure the remote
+   * delete in step 2 is never issued for a video the local purge was going to
+   * reject in step 4 - which would destroy a Bunny asset and then leave the
+   * record behind, still pointing at it.
+   *
+   * Returns null when there is nothing remote to do: `deleteRemoteAsset` was
+   * not requested, or the record is not a Bunny-backed asset. A record merely
+   * LABELLED `provider: BUNNY` never matches, so Cloudinary, DIRECT_URL,
+   * EMBED, LOCAL_FILE and DB_BLOB purges keep their existing ordering exactly.
    */
-  private async deleteBunnyRemoteAssetBestEffort(
+  private async prepareBunnyRemoteDelete(
+    id: string,
+    deleteRemoteAsset: boolean,
+  ): Promise<{ bunnyVideoId: string } | null> {
+    if (!deleteRemoteAsset) {
+      return null;
+    }
+
+    const video = await this.prisma.videoAsset.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        status: true,
+        provider: true,
+        sourceType: true,
+        providerAssetId: true,
+        // Part of the Bunny identification predicate - see
+        // `classifyBunnyVideoAsset()`.
+        playbackId: true,
+        metadataJson: true,
+      },
+    });
+
+    if (video === null) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    const bunnyAsset = readBunnyVideoAsset(video);
+    if (bunnyAsset === null) {
+      return null;
+    }
+
+    // The same guards the purge transaction enforces, checked before anything
+    // irreversible happens remotely. The transaction re-checks them, so a
+    // concurrent change is still caught there.
+    if (video.status !== VideoStatus.DISABLED) {
+      throw new BadRequestException(
+        "Video must be disabled before it can be permanently deleted.",
+      );
+    }
+
+    // NOTE: an ACTIVE website assignment is deliberately NOT checked here any
+    // more - see the purge transaction for why. `DISABLED` above is the real
+    // precondition, and it is still enforced before any remote delete, so a
+    // video the purge would reject still never reaches Bunny.
+    return { bunnyVideoId: bunnyAsset.bunnyVideoId };
+  }
+
+  /**
+   * Deletes a Bunny Stream asset and throws unless Bunny confirmed it is gone.
+   *
+   * THROWS RATHER THAN RETURNING FALSE, because the caller runs this BEFORE the
+   * local purge: an unconfirmed remote delete has to abort the whole operation
+   * with the local row intact, not degrade into a partial success.
+   *
+   * A 404 is confirmation, handled inside `deleteVideo()` - the asset is gone
+   * either way. That is also what makes the retry path work after a local
+   * transaction failure: the second attempt sees 404 and proceeds.
+   *
+   * Everything else - timeout, network error, 401/403, 429, 5xx - reaches here
+   * as an exception and is re-thrown as a retriable, secret-free failure. The
+   * Bunny error body is never logged, so no key can leak through it.
+   */
+  private async deleteBunnyRemoteAssetOrThrow(
     bunnyVideoId: string,
     videoId: string,
-  ): Promise<boolean> {
+    adminId: string,
+  ): Promise<void> {
     try {
-      return await this.requireBunnyStreamService().deleteVideo(bunnyVideoId);
+      // Availability is asserted INSIDE the try on purpose, so a refusal is
+      // audited exactly like any other unconfirmed remote delete before it
+      // propagates - and so the purge still aborts with the local row intact.
+      this.assertBunnyAvailableForPurge();
+
+      const deleted =
+        await this.requireBunnyStreamService().deleteVideo(bunnyVideoId);
+
+      if (!deleted) {
+        throw new ServiceUnavailableException(
+          "Bunny Stream did not confirm the remote video deletion. The local record was kept; retry the purge.",
+        );
+      }
     } catch (error) {
       this.logger.warn(
         {
           videoId,
           errorName: error instanceof Error ? error.name : "UnknownError",
         },
-        "Bunny Stream remote video asset deletion failed after video purge.",
+        "Bunny Stream remote video deletion was not confirmed; local purge aborted.",
       );
-      return false;
+      await this.writeAudit(
+        adminId,
+        "VIDEO_BUNNY_REMOTE_DELETE",
+        videoId,
+        {
+          bunnyVideoId,
+          remoteResult: "NOT_CONFIRMED",
+          // The remote delete runs BEFORE the local purge, so this records what
+          // happened to the purge as a result of this outcome.
+          localPurgeStage: "ABORTED",
+        },
+        AuditStatus.FAIL,
+      );
+
+      // A 4xx that is genuinely the caller's fault - notably "Bunny Stream is
+      // not enabled." - is passed through unchanged, because retrying it would
+      // not help and the message already says what is wrong.
+      //
+      // EVERYTHING ELSE becomes a 503 carrying the fact that matters: the local
+      // record still exists and the purge can be retried. Bunny's own 5xx maps
+      // to an InternalServerErrorException inside `request()`, which the global
+      // filter would flatten into a bare "Internal server error" - accurate but
+      // useless to the operator deciding what to do next.
+      if (error instanceof HttpException && error.getStatus() < 500) {
+        throw error;
+      }
+
+      throw new ServiceUnavailableException(
+        "Bunny Stream did not confirm the remote video deletion. The local record was kept; retry the purge.",
+      );
     }
+
+    await this.writeAudit(adminId, "VIDEO_BUNNY_REMOTE_DELETE", videoId, {
+      bunnyVideoId,
+      remoteResult: "DELETED_OR_ALREADY_ABSENT",
+      // Written pre-commit by design. A VIDEO_PURGE_COMMIT row following this
+      // one is what says the local purge actually landed; this row on its own
+      // means "Bunny is gone, the local row may still exist" - exactly the
+      // state an operator needs to see if the transaction then failed.
+      localPurgeStage: "PENDING",
+    });
   }
 
   /**
@@ -2293,27 +2960,15 @@ export class VideosService {
    * Applies the Bunny state to the local lifecycle without ever overwriting an
    * administrator decision (`DISABLED`) or demoting a published asset
    * (`READY`).
+   *
+   * Delegates to the exported pure helper so this service and the operational
+   * reconciliation script share ONE copy of the transition rules.
    */
   private resolveBunnyLocalStatus(
     currentStatus: VideoStatus,
     processingState: "PROCESSING" | "READY" | "FAILED",
   ): VideoStatus {
-    if (
-      currentStatus === VideoStatus.DISABLED ||
-      currentStatus === VideoStatus.READY
-    ) {
-      return currentStatus;
-    }
-
-    if (processingState === "READY") {
-      return VideoStatus.READY;
-    }
-
-    if (processingState === "FAILED") {
-      return VideoStatus.FAILED;
-    }
-
-    return VideoStatus.PROCESSING;
+    return resolveBunnyLocalStatus(currentStatus, processingState);
   }
 
   private requireBunnyStreamService(): BunnyStreamService {
@@ -2322,6 +2977,51 @@ export class VideosService {
     }
 
     return this.bunnyStreamService;
+  }
+
+  /**
+   * Refuses a remote-deleting purge when Bunny cannot confirm the deletion.
+   *
+   * WHY THIS IS ITS OWN ERROR. The generic "Bunny Stream is not enabled."
+   * tells an operator staring at a failed purge nothing they can act on: not
+   * whether the video survived, not what to do next, and not that a local-only
+   * purge is a legitimate alternative. Worse, the same sentence is raised by
+   * two unrelated conditions - the feature being switched off, and the
+   * collaborator not being wired into the container at all - so it cannot even
+   * be diagnosed from the response.
+   *
+   * The stable `code` lets a client branch without parsing prose, and `reason`
+   * separates the two conditions for an operator reading the response:
+   *
+   *   NOT_ENABLED - `BUNNY_STREAM_ENABLED` is false on this server.
+   *   NOT_WIRED   - the service is not in the container. That is a server
+   *                 defect, not a configuration choice.
+   *
+   * NEITHER VALUE LEAKS ANYTHING. No key, library id or hostname is included,
+   * and the message never states which credential is missing.
+   *
+   * THIS DOES NOT WEAKEN THE PURGE. It refuses earlier and more clearly; it
+   * never lets the local transaction run. `deleteRemoteAsset: false` remains
+   * the explicit, operator-chosen way to purge locally, and it never reaches
+   * this method because `prepareBunnyRemoteDelete()` returns null first.
+   */
+  private assertBunnyAvailableForPurge(): void {
+    const reason =
+      this.bunnyStreamService === undefined
+        ? "NOT_WIRED"
+        : this.bunnyStreamService.isEnabled()
+          ? null
+          : "NOT_ENABLED";
+
+    if (reason === null) {
+      return;
+    }
+
+    throw new BadRequestException({
+      code: BUNNY_STREAM_UNAVAILABLE_FOR_PURGE,
+      reason,
+      message: BUNNY_STREAM_UNAVAILABLE_FOR_PURGE_MESSAGE,
+    });
   }
 
   private resolveVideoListPage(value: number | undefined): number {
@@ -2399,6 +3099,30 @@ export class VideosService {
         status: ShareLinkStatus.DISABLED,
       },
     });
+
+    return result.count;
+  }
+
+  /**
+   * Removes the video's website assignments as part of a permanent purge.
+   *
+   * `WebsiteVideo.video` is `onDelete: Cascade`, so the rows would disappear
+   * with the `VideoAsset` anyway. Deleting them explicitly - exactly as
+   * `detachShareLinkVideosForVideo()` already does for `ShareLinkVideo` - makes
+   * the count observable so the response and the audit row can report what was
+   * actually removed, instead of inferring it from a database-level cascade.
+   *
+   * Deletes rows of EVERY status, not just `ACTIVE`: the video row is about to
+   * be gone, so leaving a `DISABLED` assignment behind would only orphan it.
+   *
+   * MUST run inside the purge transaction, which is after any confirmed remote
+   * deletion. Nothing here may execute while a Bunny delete is still unproven.
+   */
+  private async detachWebsiteVideosForVideo(
+    tx: Prisma.TransactionClient,
+    videoId: string,
+  ): Promise<number> {
+    const result = await tx.websiteVideo.deleteMany({ where: { videoId } });
 
     return result.count;
   }
@@ -3408,12 +4132,28 @@ export class VideosService {
     );
   }
 
+  /**
+   * The canonical digit string becomes the exact `bigint` the column holds.
+   *
+   * No `Number`, no `parseInt`, no `parseFloat` anywhere in the path, so
+   * `"9007199254740993"` persists as `9007199254740993n` rather than the
+   * IEEE-754 neighbour `9007199254740992n`.
+   *
+   * The canonical check is repeated here rather than trusted from the DTO:
+   * `BigInt()` on its own accepts `"0x10"` and `" 12 "`, and one call site
+   * (the local-upload completion) reads the value back out of stored session
+   * metadata rather than straight off a validated DTO.
+   */
   private parseViewCount(value: string | undefined): bigint {
     if (value === undefined || value.trim() === "") {
       return BigInt(0);
     }
 
-    return BigInt(value);
+    if (!isCanonicalViewCount(value)) {
+      throw new BadRequestException(VIEW_COUNT_INVALID_MESSAGE);
+    }
+
+    return toViewCountBigInt(value);
   }
 
   private parseNullableDate(value: string | undefined): Date | null {

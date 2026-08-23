@@ -6,7 +6,10 @@ import {
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { BunnyStreamService } from "../bunny/bunny-stream.service";
-import { classifyBunnyVideoAsset } from "../bunny/bunny-video-asset.util";
+import {
+  classifyBunnyVideoAsset,
+  isBunnyRemoteMissing,
+} from "../bunny/bunny-video-asset.util";
 import {
   buildCacheKey,
   hashCacheKeyPart,
@@ -19,6 +22,7 @@ import {
   AssignmentStatus,
   DomainStatus,
   ShareLinkStatus,
+  VideoProvider,
   VideoSourceType,
   VideoStatus,
   WebsiteStatus,
@@ -49,6 +53,22 @@ import {
   type PublicWatchVideoResponse,
   type PublicWatchWebsiteResponse,
 } from "./types/public-watch-response.type";
+
+/**
+ * Bunny player overrides for the PUBLIC reviewer embed.
+ *
+ * `autoplay=false` so the reviewer sees the poster frame before playback
+ * instead of the video starting on its own. Bunny's embed page renders
+ * `<video ... autoplay ...>` by default (the library's Player setting) and
+ * already carries the correct `data-poster`, so suppressing autoplay is what
+ * makes that poster visible — a share link that opens on a still frame the
+ * reviewer clicks once to play.
+ *
+ * These parameters are appended after the credential pair and are NOT part of
+ * the embed token, which hashes `videoId + expires` only. Authorization,
+ * signing order and the atomic view consumption are completely unaffected.
+ */
+const PUBLIC_BUNNY_PLAYER_PARAMS = { autoplay: "false" } as const;
 
 type PublicWatchRequestMeta = {
   ip?: string | undefined;
@@ -411,7 +431,11 @@ export class PublicService {
       now,
     });
 
-    // Consumption succeeded. Only now may playback credentials be minted.
+    // Consumption succeeded. Only now may playback credentials be minted - and
+    // Bunny signing additionally passes the authoritative database gate first.
+    const signableBunnyVideoIds =
+      await this.loadSignableBunnyVideoIds(playableVideos);
+
     return {
       valid: true,
       reasonCode: "OK",
@@ -420,6 +444,7 @@ export class PublicService {
         playableVideos,
         { host: normalizedHost, token: trimmedToken },
         shareLink,
+        signableBunnyVideoIds,
       ),
     };
   }
@@ -571,6 +596,13 @@ export class PublicService {
 
     // Consumption succeeded. Signing happens here, per request, so a cache hit
     // still yields a freshly signed Bunny URL rather than a replayed one.
+    //
+    // AND the cached rows do not get the final say. This process's cache cannot
+    // be invalidated by reconciliation running elsewhere, so Bunny signing is
+    // gated on a fresh read of the current database rows.
+    const signableBunnyVideoIds =
+      await this.loadSignableBunnyVideoIds(playableVideos);
+
     return {
       valid: true,
       reasonCode: "OK",
@@ -578,10 +610,15 @@ export class PublicService {
         params.cachedMetadata.website,
         params.normalizedHost,
       ),
-      videos: this.toPublicVideoResponses(playableVideos, {
-        host: params.normalizedHost,
-        token: params.trimmedToken,
-      }),
+      videos: this.toPublicVideoResponses(
+        playableVideos,
+        {
+          host: params.normalizedHost,
+          token: params.trimmedToken,
+        },
+        undefined,
+        signableBunnyVideoIds,
+      ),
     };
   }
 
@@ -749,7 +786,13 @@ export class PublicService {
   private toPublicVideoResponses(
     videos: PublicWatchVideoWithBinary[],
     playbackContext: { host: string; token: string },
-    shareLink?: Pick<ShareLink, "id" | "maxViews" | "expiresAt">,
+    shareLink: Pick<ShareLink, "id" | "maxViews" | "expiresAt"> | undefined,
+    /**
+     * Result of the authoritative database gate, computed by the caller after
+     * consumption. Deliberately REQUIRED: a caller that forgot it would
+     * otherwise silently sign from cached state. An empty map signs nothing.
+     */
+    signableBunnyVideoIds: Map<string, string>,
   ): PublicWatchVideoResponse[] {
     return this.selectPublicPlayableVideos(videos).map((video) => {
       const grant =
@@ -796,7 +839,7 @@ export class PublicService {
       // Bunny-backed assets only. Every other source type - including a
       // legacy `provider: BUNNY` DIRECT_URL record - falls through with
       // `video.embedUrl` untouched.
-      const embedUrl = this.resolvePublicEmbedUrl(video);
+      const embedUrl = this.resolvePublicEmbedUrl(video, signableBunnyVideoIds);
 
       return {
         id: video.id,
@@ -837,6 +880,126 @@ export class PublicService {
   }
 
   /**
+   * AUTHORITATIVE DATABASE GATE for Bunny playback signing.
+   *
+   * WHY THIS EXISTS - and why a cache invalidation cannot replace it.
+   *
+   * `MemoryCacheService` is PROCESS-LOCAL. Reconciliation that runs anywhere
+   * else - `yarn reconcile:bunny --apply`, a second API worker, a manual
+   * database fix - commits `status = FAILED` + `remoteMissing` to the database
+   * but has no way to reach this process's `public:watch:` entries. Without
+   * this gate, a cached READY row would keep minting fresh signed Bunny URLs
+   * for a video Bunny has already deleted, for as long as the entry lives.
+   *
+   * So public Bunny signing no longer trusts cached metadata for the decision
+   * that matters. Immediately before a token is minted, the CURRENT row is
+   * re-read from the database and must still satisfy every condition:
+   *
+   *   1. the `VideoAsset` still exists;
+   *   2. `status === READY`;
+   *   3. it still passes the existing strict `classifyBunnyVideoAsset()`
+   *      predicate - the same one used everywhere else, not a weaker copy;
+   *   4. `metadataJson.bunnyStream.remoteMissing` is absent;
+   *   5. the authoritative Bunny video id equals the one the cached row asked
+   *      to sign.
+   *
+   * Anything else FAILS CLOSED: the video is simply absent from the returned
+   * map, `resolvePublicEmbedUrl()` emits `null`, and no token is minted. It
+   * never falls back to the stored unsigned `embedUrl`.
+   *
+   * PERFORMANCE. **ONE** batched, primary-key-indexed local query for the whole
+   * response, and only when the share actually contains a Bunny-backed video -
+   * a share with none issues no query at all. It performs **no** Bunny
+   * Management API request: remote existence remains eventual-consistency state
+   * maintained by sync and reconciliation, never re-validated per view.
+   *
+   * ORDERING. Called by both resolution paths strictly AFTER the atomic view
+   * consumption has claimed the view, preserving the existing invariant. If the
+   * gate then refuses because the asset became unavailable concurrently, the
+   * view is still spent - deliberately. Spending one view is strictly better
+   * than issuing playback for a known-unavailable asset.
+   *
+   * Returns videoId -> authoritative Bunny video id for the assets that may be
+   * signed right now.
+   */
+  private async loadSignableBunnyVideoIds(
+    videos: PublicWatchVideoWithBinary[],
+  ): Promise<Map<string, string>> {
+    // Candidates are decided from the cached rows only so the query stays
+    // small; the database is what decides whether each one may actually sign.
+    const candidateIds = videos
+      .filter((video) => classifyBunnyVideoAsset(video).kind === "bunny")
+      .map((video) => video.id);
+
+    if (candidateIds.length === 0) {
+      return new Map();
+    }
+
+    let currentRows: Array<{
+      id: string;
+      status: VideoStatus;
+      provider: VideoProvider;
+      sourceType: VideoSourceType;
+      providerAssetId: string | null;
+      playbackId: string | null;
+      metadataJson: Prisma.JsonValue | null;
+    }>;
+
+    try {
+      currentRows = await this.prisma.videoAsset.findMany({
+        where: { id: { in: candidateIds } },
+        select: {
+          id: true,
+          status: true,
+          provider: true,
+          sourceType: true,
+          providerAssetId: true,
+          // Part of the Bunny identification predicate - see
+          // `classifyBunnyVideoAsset()`.
+          playbackId: true,
+          metadataJson: true,
+        },
+      });
+    } catch (error) {
+      // FAIL CLOSED on a database error too. Returning an empty map costs a
+      // Bunny video its playback for this request; assuming the cached row is
+      // still valid could hand out a token for a deleted asset.
+      this.logger.error(
+        { errorName: error instanceof Error ? error.name : "UnknownError" },
+        "Authoritative Bunny signing gate could not read the current video rows.",
+      );
+
+      return new Map();
+    }
+
+    const signable = new Map<string, string>();
+
+    for (const row of currentRows) {
+      // (2) Current status, read from the database - not from the cache.
+      if (row.status !== VideoStatus.READY) {
+        continue;
+      }
+
+      // (4) Reconciled as gone from Bunny.
+      if (isBunnyRemoteMissing(row.metadataJson)) {
+        continue;
+      }
+
+      // (3) The same strict predicate as every other Bunny branch.
+      const classification = classifyBunnyVideoAsset(row);
+      if (classification.kind !== "bunny") {
+        continue;
+      }
+
+      signable.set(row.id, classification.bunnyVideoId);
+    }
+
+    // (1) A row that no longer exists is simply absent from `currentRows`, so
+    // it never reaches the map and fails closed by construction.
+    return signable;
+  }
+
+  /**
    * Mints the embed URL the public browser is allowed to see.
    *
    * AUTHORIZATION AND CONSUMPTION BEFORE SIGNING. This runs inside
@@ -858,6 +1021,7 @@ export class PublicService {
    */
   private resolvePublicEmbedUrl(
     video: PublicWatchVideoWithBinary,
+    signableBunnyVideoIds: Map<string, string>,
   ): string | null {
     const classification = classifyBunnyVideoAsset(video);
 
@@ -868,6 +1032,26 @@ export class PublicService {
     if (classification.kind === "bunny-malformed") {
       // Never emit the stored unsigned Bunny URL. `isPublicPlayableVideo()`
       // already filtered this record out; this is the second line of defence.
+      return null;
+    }
+
+    // AUTHORITATIVE GATE - see `loadSignableBunnyVideoIds()`. Absent means the
+    // current database row failed at least one condition, so this request must
+    // mint nothing, whatever the cached row said.
+    const authoritativeBunnyVideoId = signableBunnyVideoIds.get(video.id);
+    if (authoritativeBunnyVideoId === undefined) {
+      return null;
+    }
+
+    // (5) Identifier agreement. A cached row pointing at a different Bunny
+    // video than the one the database now holds must never be signed - with
+    // either id.
+    if (authoritativeBunnyVideoId !== classification.bunnyVideoId) {
+      this.logger.warn(
+        { videoId: video.id },
+        "Cached Bunny video id no longer matches the stored record; refusing to sign.",
+      );
+
       return null;
     }
 
@@ -903,8 +1087,11 @@ export class PublicService {
     }
 
     try {
-      return this.bunnyStreamService.createSignedEmbedUrl(bunnyVideoId)
-        .embedUrl;
+      return this.bunnyStreamService.createSignedEmbedUrl(
+        bunnyVideoId,
+        new Date(),
+        PUBLIC_BUNNY_PLAYER_PARAMS,
+      ).embedUrl;
     } catch (error) {
       this.logger.error(
         {

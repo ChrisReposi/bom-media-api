@@ -203,7 +203,13 @@ describe("Bunny Stream management requests", () => {
     assert.equal(calls[0]?.method, "POST");
     assert.equal(calls[0]?.headers.AccessKey, API_KEY);
     assert.equal(calls[0]?.headers["Content-Type"], "application/json");
-    assert.equal(calls[0]?.body, JSON.stringify({ title: "Bunny title" }));
+    // AUTO FALLBACK POSTER. Every Create Video carries `thumbnailTime`, Bunny's
+    // documented "video time in ms to extract the main video thumbnail", so a
+    // video uploaded with no custom image still gets one during encoding.
+    assert.equal(
+      calls[0]?.body,
+      JSON.stringify({ title: "Bunny title", thumbnailTime: 1000 }),
+    );
     assert.equal(video.guid, VIDEO_GUID);
   });
 
@@ -595,14 +601,29 @@ function createSigningSpy(options: { enabled?: boolean } = {}) {
       spy.canSignCount += 1;
       return spy.enabled;
     },
-    createSignedEmbedUrl(videoId: string) {
+    /**
+     * Mirrors the real signature, including the optional player parameters.
+     * A double that silently dropped that argument would hide what the caller
+     * actually asked for - which is exactly the property some tests assert.
+     */
+    createSignedEmbedUrl(
+      videoId: string,
+      _now?: Date,
+      playerParams: Record<string, string> = {},
+    ) {
       spy.signCount += 1;
       spy.signedVideoIds.push(videoId);
       const expires = FIXED_NOW_SECONDS + 300;
       const token = sha256Hex(`${TOKEN_SECURITY_KEY}${videoId}${expires}`);
+      const playerQuery = Object.entries(playerParams)
+        .map(
+          ([key, value]) =>
+            `&${encodeURIComponent(key)}=${encodeURIComponent(value)}`,
+        )
+        .join("");
 
       return {
-        embedUrl: `${BUNNY_STREAM_EMBED_BASE_URL}/${LIBRARY_ID}/${videoId}?token=${token}&expires=${expires}`,
+        embedUrl: `${BUNNY_STREAM_EMBED_BASE_URL}/${LIBRARY_ID}/${videoId}?token=${token}&expires=${expires}${playerQuery}`,
         token,
         expires,
       };
@@ -635,6 +656,29 @@ describe("Bunny public playback requires full share authorization first", () => 
     assert.match(String(url.searchParams.get("token")), /^[a-f0-9]{64}$/);
     assert.ok(Number(url.searchParams.get("expires")) > FIXED_NOW_SECONDS - 1);
     assert.ok(bunnyStream.signCount > 0);
+  });
+
+  it("opens on the poster: the reviewer URL carries autoplay=false", async () => {
+    // Reviewer priority - a share link must show a still frame the reviewer
+    // recognises, then play on one click, rather than starting on its own.
+    // Bunny's embed already carries the right `data-poster`; suppressing the
+    // library's default autoplay is what makes it visible.
+    const { service } = createCompatHarness({
+      videos: [bunnyStreamVideo()],
+      bunnyStream: createSigningSpy(),
+    });
+
+    const response = await service.resolvePublicWatch({
+      host: LEGACY_HOST,
+      token: LEGACY_ALIAS,
+    });
+    const params = new URL(String(response.videos[0]?.embedUrl)).searchParams;
+
+    assert.equal(params.get("autoplay"), "false");
+    // The credential pair is untouched - the token covers videoId + expires
+    // only, so a player parameter cannot weaken or invalidate it.
+    assert.match(String(params.get("token")), /^[a-f0-9]{64}$/);
+    assert.ok(Number(params.get("expires")) > FIXED_NOW_SECONDS - 1);
   });
 
   it("never returns the stored unsigned embed URL", async () => {
@@ -950,11 +994,12 @@ describe("Bunny Stream environment validation", () => {
     });
   });
 
-  it("requires the library id, API key and token security key once enabled", () => {
+  it("requires the library id, API key, token security key and pull-zone hostname once enabled", () => {
     for (const missing of [
       "BUNNY_STREAM_LIBRARY_ID",
       "BUNNY_STREAM_API_KEY",
       "BUNNY_STREAM_TOKEN_SECURITY_KEY",
+      "BUNNY_STREAM_PULL_ZONE_HOSTNAME",
     ]) {
       withCleanEnv(() => {
         const config: Record<string, string> = {
@@ -963,6 +1008,7 @@ describe("Bunny Stream environment validation", () => {
           BUNNY_STREAM_LIBRARY_ID: LIBRARY_ID,
           BUNNY_STREAM_API_KEY: API_KEY,
           BUNNY_STREAM_TOKEN_SECURITY_KEY: TOKEN_SECURITY_KEY,
+          BUNNY_STREAM_PULL_ZONE_HOSTNAME: PULL_ZONE_HOSTNAME,
         };
         delete config[missing];
 
@@ -972,6 +1018,75 @@ describe("Bunny Stream environment validation", () => {
         );
       });
     }
+  });
+
+  it("does NOT require the pull-zone hostname while Bunny is disabled", () => {
+    // An existing deployment that has never heard of Bunny must keep booting
+    // unchanged after this variable became required-when-enabled.
+    withCleanEnv(() => {
+      const validated = validateEnv({
+        ...BASE_ENV,
+        BUNNY_STREAM_ENABLED: "false",
+      });
+
+      assert.equal(validated.BUNNY_STREAM_ENABLED, "false");
+      assert.equal(apiConfig().bunnyStream.pullZoneHostname, null);
+    });
+
+    withCleanEnv(() => {
+      // Not even present at all.
+      const config = { ...BASE_ENV };
+      assert.doesNotThrow(() => validateEnv(config));
+    });
+  });
+
+  it("FAILS FAST on a malformed pull-zone hostname rather than serving broken thumbnails", () => {
+    const malformed = [
+      "https://vz-example.b-cdn.net",
+      "vz-example.b-cdn.net/",
+      "vz-example.b-cdn.net/path",
+      "vz-example.b-cdn.net:8080",
+      "vz-example",
+      "vz example.b-cdn.net",
+      "-vz.b-cdn.net",
+      "user@vz-example.b-cdn.net",
+    ];
+
+    for (const hostname of malformed) {
+      withCleanEnv(() => {
+        assert.throws(
+          () =>
+            validateEnv({
+              ...BASE_ENV,
+              BUNNY_STREAM_ENABLED: "true",
+              BUNNY_STREAM_LIBRARY_ID: LIBRARY_ID,
+              BUNNY_STREAM_API_KEY: API_KEY,
+              BUNNY_STREAM_TOKEN_SECURITY_KEY: TOKEN_SECURITY_KEY,
+              BUNNY_STREAM_PULL_ZONE_HOSTNAME: hostname,
+            }),
+          /BUNNY_STREAM_PULL_ZONE_HOSTNAME must be a bare CDN hostname/,
+          `expected ${JSON.stringify(hostname)} to be rejected`,
+        );
+      });
+    }
+  });
+
+  it("accepts and lower-cases a valid pull-zone hostname", () => {
+    withCleanEnv(() => {
+      const validated = validateEnv({
+        ...BASE_ENV,
+        BUNNY_STREAM_ENABLED: "true",
+        BUNNY_STREAM_LIBRARY_ID: LIBRARY_ID,
+        BUNNY_STREAM_API_KEY: API_KEY,
+        BUNNY_STREAM_TOKEN_SECURITY_KEY: TOKEN_SECURITY_KEY,
+        BUNNY_STREAM_PULL_ZONE_HOSTNAME: "VZ-Example.B-CDN.net",
+      });
+
+      assert.equal(
+        validated.BUNNY_STREAM_PULL_ZONE_HOSTNAME,
+        "vz-example.b-cdn.net",
+      );
+    });
   });
 
   it("rejects a non-numeric library id", () => {
@@ -984,6 +1099,7 @@ describe("Bunny Stream environment validation", () => {
             BUNNY_STREAM_LIBRARY_ID: "not-a-library",
             BUNNY_STREAM_API_KEY: API_KEY,
             BUNNY_STREAM_TOKEN_SECURITY_KEY: TOKEN_SECURITY_KEY,
+            BUNNY_STREAM_PULL_ZONE_HOSTNAME: PULL_ZONE_HOSTNAME,
           }),
         /BUNNY_STREAM_LIBRARY_ID must be a numeric library id/,
       );
@@ -998,6 +1114,7 @@ describe("Bunny Stream environment validation", () => {
         BUNNY_STREAM_LIBRARY_ID: LIBRARY_ID,
         BUNNY_STREAM_API_KEY: API_KEY,
         BUNNY_STREAM_TOKEN_SECURITY_KEY: TOKEN_SECURITY_KEY,
+        BUNNY_STREAM_PULL_ZONE_HOSTNAME: PULL_ZONE_HOSTNAME,
       });
 
       const bunnyStream = apiConfig().bunnyStream;
@@ -1006,10 +1123,14 @@ describe("Bunny Stream environment validation", () => {
         "embedTokenTtlSeconds",
         "enabled",
         "libraryId",
+        "pullZoneHostname",
         "tusTtlSeconds",
       ]);
       assert.equal(bunnyStream.enabled, true);
       assert.equal(bunnyStream.libraryId, LIBRARY_ID);
+      // The hostname is NOT a secret - it is the public CDN host that appears
+      // in every thumbnail URL a browser loads.
+      assert.equal(bunnyStream.pullZoneHostname, PULL_ZONE_HOSTNAME);
       assert.equal(bunnyStream.tusTtlSeconds, 3600);
       assert.equal(bunnyStream.embedTokenTtlSeconds, 300);
 
@@ -1222,10 +1343,13 @@ describe("Bunny signing happens strictly after atomic view consumption", () => {
       2,
       "each successful consumption mints its own URL - never a replayed one",
     );
-    assert.match(
+    // Parsed rather than end-anchored: the credential pair is the contract,
+    // and player parameters may legitimately follow it.
+    const secondParams = new URL(
       String(second.videos[0]?.embedUrl),
-      /token=[a-f0-9]{64}&expires=\d+$/,
-    );
+    ).searchParams;
+    assert.match(String(secondParams.get("token")), /^[a-f0-9]{64}$/);
+    assert.match(String(secondParams.get("expires")), /^\d+$/);
   });
 
   it("does not consume a view for any denial path, and signs nothing", async () => {
@@ -1457,5 +1581,357 @@ describe("Bunny disabled blocks every network operation", () => {
       false,
     );
     assert.equal(createService().canSignEmbedUrl(), true);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Thumbnail (poster) metadata
+ *
+ * AUTHORITATIVE CONTRACT. Bunny's Get Video response provides
+ * `thumbnailFileName`, and Bunny's documented storage structure defines
+ * delivery as:
+ *
+ *     https://{pull_zone_hostname}/{videoId}/{thumbnailFileName}
+ *
+ * These mocks therefore contain NO pre-built URL field. An earlier revision
+ * faked one, which meant the suite could pass while real backfill produced
+ * nothing - the tests were asserting a contract Bunny does not guarantee.
+ * ------------------------------------------------------------------ */
+
+const PULL_ZONE_HOSTNAME = "vz-example.b-cdn.net";
+
+function createThumbnailService(overrides: ConfigOverrides = {}) {
+  return createService({
+    BUNNY_STREAM_PULL_ZONE_HOSTNAME: PULL_ZONE_HOSTNAME,
+    ...overrides,
+  });
+}
+
+describe("Bunny Stream thumbnail metadata", () => {
+  it("reads thumbnailFileName from a response that has NO url field", async () => {
+    const service = createThumbnailService();
+    stubFetch({
+      json: {
+        guid: VIDEO_GUID,
+        videoLibraryId: Number(LIBRARY_ID),
+        status: BUNNY_VIDEO_STATUS.FINISHED,
+        thumbnailFileName: "thumbnail.jpg",
+        // Deliberately absent: the integration must not depend on one.
+      },
+    });
+
+    const video = await service.getVideo(VIDEO_GUID);
+
+    assert.equal(video.thumbnailFileName, "thumbnail.jpg");
+    assert.equal("thumbnailUrl" in video, false);
+  });
+
+  it("degrades to null while Bunny is still encoding", async () => {
+    const service = createThumbnailService();
+    stubFetch({
+      json: { guid: VIDEO_GUID, status: BUNNY_VIDEO_STATUS.PROCESSING },
+    });
+
+    const video = await service.getVideo(VIDEO_GUID);
+
+    assert.equal(video.thumbnailFileName, null);
+    assert.equal(service.buildThumbnailUrl(VIDEO_GUID, null), null);
+  });
+
+  it("never carries a Bunny secret in the mapped video", async () => {
+    const service = createThumbnailService();
+    stubFetch({
+      json: {
+        guid: VIDEO_GUID,
+        status: BUNNY_VIDEO_STATUS.FINISHED,
+        thumbnailFileName: "thumbnail.jpg",
+      },
+    });
+
+    const serialized = JSON.stringify(await service.getVideo(VIDEO_GUID));
+
+    assert.doesNotMatch(serialized, new RegExp(API_KEY));
+    assert.doesNotMatch(serialized, new RegExp(TOKEN_SECURITY_KEY));
+  });
+});
+
+describe("Bunny Stream thumbnail URL construction", () => {
+  it("builds the documented storage-structure URL", () => {
+    const service = createThumbnailService();
+
+    assert.equal(
+      service.buildThumbnailUrl("abc-123", "thumbnail.jpg"),
+      "https://vz-example.b-cdn.net/abc-123/thumbnail.jpg",
+    );
+  });
+
+  it("uses the file name Bunny reported, never an invented default", () => {
+    const service = createThumbnailService();
+
+    assert.equal(
+      service.buildThumbnailUrl(VIDEO_GUID, "thumbnail_ab12cd34.jpg"),
+      `https://${PULL_ZONE_HOSTNAME}/${VIDEO_GUID}/thumbnail_ab12cd34.jpg`,
+    );
+  });
+
+  it("returns null when Bunny has no thumbnail yet", () => {
+    const service = createThumbnailService();
+
+    assert.equal(service.buildThumbnailUrl(VIDEO_GUID, null), null);
+    assert.equal(service.buildThumbnailUrl(VIDEO_GUID, ""), null);
+    assert.equal(service.buildThumbnailUrl(VIDEO_GUID, "   "), null);
+  });
+
+  it("returns null when no pull-zone hostname is configured", () => {
+    const service = createService({
+      BUNNY_STREAM_PULL_ZONE_HOSTNAME: undefined,
+    });
+
+    assert.equal(service.buildThumbnailUrl(VIDEO_GUID, "thumbnail.jpg"), null);
+  });
+
+  it("REFUSES traversal and path-bearing file names", () => {
+    const service = createThumbnailService();
+    const hostile = [
+      "../secret",
+      "../../etc/passwd",
+      "foo/bar.jpg",
+      "foo\bar.jpg",
+      "..",
+      ".",
+      "/thumbnail.jpg",
+      "thumb nail.jpg",
+      "https://evil.example/x.jpg",
+      "thumbnail.jpg?x=1",
+      "thumbnail.jpg#frag",
+      "javascript:alert(1)",
+      "thumbnail",
+    ];
+
+    for (const fileName of hostile) {
+      assert.equal(
+        service.buildThumbnailUrl(VIDEO_GUID, fileName),
+        null,
+        `expected ${JSON.stringify(fileName)} to be refused`,
+      );
+    }
+  });
+
+  it("REFUSES a hostile video id", () => {
+    const service = createThumbnailService();
+
+    for (const videoId of ["../x", "a/b", "a\b", "", "   ", ".."]) {
+      assert.equal(
+        service.buildThumbnailUrl(videoId, "thumbnail.jpg"),
+        null,
+        `expected ${JSON.stringify(videoId)} to be refused`,
+      );
+    }
+  });
+
+  it("REFUSES a malformed configured hostname rather than building a bad URL", () => {
+    const malformed = [
+      "https://vz-example.b-cdn.net",
+      "vz-example.b-cdn.net/",
+      "vz-example.b-cdn.net/path",
+      "vz-example",
+      "vz-example.b-cdn.net:8080",
+      "user@vz-example.b-cdn.net",
+      "vz example.b-cdn.net",
+      "-vz.b-cdn.net",
+    ];
+
+    for (const hostname of malformed) {
+      const service = createService({
+        BUNNY_STREAM_PULL_ZONE_HOSTNAME: hostname,
+      });
+
+      assert.equal(
+        service.buildThumbnailUrl(VIDEO_GUID, "thumbnail.jpg"),
+        null,
+        `expected hostname ${JSON.stringify(hostname)} to be refused`,
+      );
+    }
+  });
+
+  it("normalises hostname case", () => {
+    const service = createService({
+      BUNNY_STREAM_PULL_ZONE_HOSTNAME: "VZ-Example.B-CDN.net",
+    });
+
+    assert.equal(
+      service.buildThumbnailUrl("abc-123", "thumbnail.jpg"),
+      "https://vz-example.b-cdn.net/abc-123/thumbnail.jpg",
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Per-embed player parameters
+ *
+ * Admin preview must open PAUSED. Bunny's library Player settings default to
+ * autoplay, so the embed renders `<video ... autoplay ...>`; `autoplay=false`
+ * is Bunny's documented per-embed override.
+ *
+ * The regression that matters here is the PUBLIC one: passing no parameters
+ * must keep producing exactly the URL it produced before this option existed.
+ * ------------------------------------------------------------------ */
+
+describe("Bunny Stream embed player parameters", () => {
+  it("the no-argument overload still produces the credential-only URL", () => {
+    const service = createService();
+
+    const signed = service.createSignedEmbedUrl(VIDEO_GUID, FIXED_NOW);
+    const expires = FIXED_NOW_SECONDS + 300;
+    const token = sha256Hex(`${TOKEN_SECURITY_KEY}${VIDEO_GUID}${expires}`);
+
+    // The original shape is preserved for any caller that wants the library
+    // defaults. Both current call sites pass `autoplay=false` deliberately -
+    // admin preview and public reviewer playback both open on the poster.
+    assert.equal(
+      signed.embedUrl,
+      `${BUNNY_STREAM_EMBED_BASE_URL}/${LIBRARY_ID}/${VIDEO_GUID}?token=${token}&expires=${expires}`,
+    );
+    assert.equal(new URL(signed.embedUrl).searchParams.has("autoplay"), false);
+  });
+
+  it("appends autoplay=false after the credential pair when asked", () => {
+    const service = createService();
+
+    const signed = service.createSignedEmbedUrl(VIDEO_GUID, FIXED_NOW, {
+      autoplay: "false",
+    });
+    const params = new URL(signed.embedUrl).searchParams;
+
+    assert.equal(params.get("autoplay"), "false");
+    assert.match(params.get("token") ?? "", /^[0-9a-f]{64}$/);
+    assert.equal(Number(params.get("expires")), signed.expires);
+  });
+
+  it("does not let a player parameter change the token or the expiry", () => {
+    const service = createService();
+
+    const plain = service.createSignedEmbedUrl(VIDEO_GUID, FIXED_NOW);
+    const withParams = service.createSignedEmbedUrl(VIDEO_GUID, FIXED_NOW, {
+      autoplay: "false",
+    });
+
+    // The token covers videoId + expires only, so an added parameter cannot
+    // invalidate the signature - which is what makes this safe.
+    assert.equal(withParams.token, plain.token);
+    assert.equal(withParams.expires, plain.expires);
+  });
+
+  it("percent-encodes player parameters so none can inject extra query keys", () => {
+    const service = createService();
+
+    const signed = service.createSignedEmbedUrl(VIDEO_GUID, FIXED_NOW, {
+      "a&b": "c&token=deadbeef",
+    });
+    const params = new URL(signed.embedUrl).searchParams;
+
+    assert.equal(params.get("a&b"), "c&token=deadbeef");
+    // The real credential is untouched by the injection attempt.
+    assert.match(params.get("token") ?? "", /^[0-9a-f]{64}$/);
+    assert.notEqual(params.get("token"), "deadbeef");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Set Thumbnail — the custom-poster path
+ *
+ * Bunny's Set Thumbnail endpoint takes the image itself as the request body,
+ * `Content-Type: application/octet-stream`. The `thumbnailUrl` query mode is
+ * deliberately unused: it would need the image publicly hosted first, and
+ * accepting a caller-supplied URL would make this backend an SSRF fetcher.
+ * ------------------------------------------------------------------ */
+
+describe("Bunny Stream set thumbnail", () => {
+  const THUMBNAIL_BYTES = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02]);
+
+  it("POSTs the raw bytes to the documented thumbnail path", async () => {
+    const calls = stubFetch({ json: { success: true, statusCode: 200 } });
+
+    await createService().setVideoThumbnail(VIDEO_GUID, THUMBNAIL_BYTES);
+
+    assert.equal(calls.length, 1);
+    assert.equal(
+      calls[0]?.url,
+      `https://video.bunnycdn.com/library/${LIBRARY_ID}/videos/${VIDEO_GUID}/thumbnail`,
+    );
+    assert.equal(calls[0]?.method, "POST");
+    assert.equal(calls[0]?.headers["Content-Type"], "application/octet-stream");
+  });
+
+  it("authenticates with the server-side AccessKey", async () => {
+    const calls = stubFetch({ json: { success: true } });
+
+    await createService().setVideoThumbnail(VIDEO_GUID, THUMBNAIL_BYTES);
+
+    assert.equal(calls[0]?.headers.AccessKey, API_KEY);
+  });
+
+  it("never uses the thumbnailUrl query mode", async () => {
+    const calls = stubFetch({ json: { success: true } });
+
+    await createService().setVideoThumbnail(VIDEO_GUID, THUMBNAIL_BYTES);
+
+    // No query string at all - the image travels in the body.
+    assert.equal(new URL(String(calls[0]?.url)).search, "");
+  });
+
+  it("refuses to reach Bunny while the feature is disabled", async () => {
+    const calls = stubFetch({ json: { success: true } });
+    const service = createService({ BUNNY_STREAM_ENABLED: "false" });
+
+    await assert.rejects(
+      service.setVideoThumbnail(VIDEO_GUID, THUMBNAIL_BYTES),
+      /Bunny Stream is not enabled/,
+    );
+    assert.equal(calls.length, 0);
+  });
+
+  it("propagates a Bunny failure instead of claiming success", async () => {
+    stubFetch({ status: 500 });
+
+    await assert.rejects(
+      createService().setVideoThumbnail(VIDEO_GUID, THUMBNAIL_BYTES),
+      (error: Error) => {
+        // A truthful failure, and never a secret in the message.
+        assert.doesNotMatch(error.message, new RegExp(API_KEY));
+        assert.doesNotMatch(error.message, new RegExp(TOKEN_SECURITY_KEY));
+        return true;
+      },
+    );
+  });
+});
+
+describe("Bunny Stream automatic thumbnailTime fallback", () => {
+  it("sends the project default when the caller passes none", async () => {
+    const calls = stubFetch({ json: { guid: VIDEO_GUID } });
+
+    await createService().createVideo("Auto poster");
+
+    const body = JSON.parse(String(calls[0]?.body)) as Record<string, unknown>;
+    assert.equal(body.thumbnailTime, 1000);
+  });
+
+  it("honours an explicit thumbnailTime", async () => {
+    const calls = stubFetch({ json: { guid: VIDEO_GUID } });
+
+    await createService().createVideo("Auto poster", { thumbnailTimeMs: 2500 });
+
+    const body = JSON.parse(String(calls[0]?.body)) as Record<string, unknown>;
+    assert.equal(body.thumbnailTime, 2500);
+  });
+
+  it("keeps thumbnailTime a plain integer in milliseconds", async () => {
+    const calls = stubFetch({ json: { guid: VIDEO_GUID } });
+
+    await createService().createVideo("Auto poster");
+
+    const body = JSON.parse(String(calls[0]?.body)) as Record<string, unknown>;
+    assert.equal(Number.isInteger(body.thumbnailTime), true);
+    assert.equal(typeof body.thumbnailTime, "number");
   });
 });

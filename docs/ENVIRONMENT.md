@@ -1,7 +1,7 @@
 # Environment Variables
 
 Status: CURRENT
-Last verified: 2026-08-21
+Last verified: 2026-08-23
 Verified against: `src/config/env.validation.ts`, `src/config/env.config.ts`, `src/config/load-env.ts`, `.env.example`, and every `configService.get(...)` call in `src/`
 
 **No real secret values appear in this document, and none may ever be added.**
@@ -203,17 +203,47 @@ Process-local, lost on restart, **not shared** between Node processes.
 | `VIDEO_UPLOAD_MAX_MB` | `500` | Cloudinary upload limit |
 | `VIDEO_THUMBNAIL_UPLOAD_MAX_MB` | `5` | Ceiling `10` |
 
-## 14. Declared but not read by any code
+## 14. Bunny Stream
 
-Generated inventory, 2026-08-21. Method: collect every `NAME=` declared in
-`.env.example`, `.env`, `.env.local` and `.env.production` (119 distinct
-names), then check each against the full text of `src/`, `prisma/`, `scripts/`
-and `test/`. **19 names have no reference anywhere in backend code.** Re-run the
-check when adding or removing a variable rather than trusting this count.
+Off by default. **Nothing below is required while `BUNNY_STREAM_ENABLED=false`**,
+so an existing production deployment boots unchanged before any Bunny value is
+added. See [features/bunny-stream.md](./features/bunny-stream.md).
+
+| Variable | Default | Notes |
+|---|---|---|
+| `BUNNY_STREAM_ENABLED` | `false` | Master switch. While false, every Bunny endpoint returns `400` and no Bunny value is validated |
+| `BUNNY_STREAM_LIBRARY_ID` | unset | **Required when enabled.** Must be numeric. Not a secret |
+| `BUNNY_STREAM_API_KEY` | unset | **Required when enabled.** Management API `AccessKey`. **Secret — backend only** |
+| `BUNNY_STREAM_TOKEN_SECURITY_KEY` | unset | **Required when enabled.** Embed view token signing key. **Secret — backend only** |
+| `BUNNY_STREAM_TUS_TTL_SECONDS` | `3600` | Bounded 300–86400. Out-of-range **fails at boot** rather than clamping |
+| `BUNNY_STREAM_EMBED_TOKEN_TTL_SECONDS` | `300` | Bounded 60–3600. Same fail-fast behaviour |
+| `BUNNY_STREAM_PULL_ZONE_HOSTNAME` | unset | **Still unread.** Reserved for CDN token authentication, which is out of MVP scope |
+
+> `BUNNY_STREAM_SIGNING_KEY` was a never-read placeholder. It is superseded by
+> `BUNNY_STREAM_TOKEN_SECURITY_KEY` and has been removed from the templates.
+
+Only the non-secret values reach `ApiEnvironmentConfig.bunnyStream`
+(`enabled`, `libraryId`, `tusTtlSeconds`, `embedTokenTtlSeconds`). The two
+secrets are read exclusively by `BunnyStreamService` through `ConfigService` and
+never appear in a response, an exception message or a log line.
+
+## 15. Declared but not read by any code
+
+Generated inventory, 2026-08-21, revised 2026-08-23 when the Bunny Stream MVP
+landed. Method: collect every `NAME=` declared in `.env.example`, `.env`,
+`.env.local` and `.env.production`, then check each against the full text of
+`src/`, `prisma/`, `scripts/` and `test/`. Re-run the check when adding or
+removing a variable rather than trusting the table below.
+
+> **Changed on 2026-08-23.** `BUNNY_STREAM_LIBRARY_ID`, `BUNNY_STREAM_API_KEY`
+> and the new `BUNNY_STREAM_ENABLED` / `BUNNY_STREAM_TOKEN_SECURITY_KEY` /
+> `BUNNY_STREAM_TUS_TTL_SECONDS` / `BUNNY_STREAM_EMBED_TOKEN_TTL_SECONDS` are
+> now read (§14), and `BUNNY_STREAM_SIGNING_KEY` was removed from the templates.
+> Only `BUNNY_STREAM_PULL_ZONE_HOSTNAME` remains from that family.
 
 | Variable | Status | Note |
 |---|---|---|
-| `BUNNY_STREAM_LIBRARY_ID`, `BUNNY_STREAM_API_KEY`, `BUNNY_STREAM_PULL_ZONE_HOSTNAME`, `BUNNY_STREAM_SIGNING_KEY` | `PLANNED` | Reserved for a future Bunny Stream provider. **No implementation.** See [features/bunny-stream.md](./features/bunny-stream.md) |
+| `BUNNY_STREAM_PULL_ZONE_HOSTNAME` | reserved | The rest of the `BUNNY_*` family is now **read** — see §14. This one stays unread: CDN token authentication is out of MVP scope |
 | `MUX_TOKEN_ID`, `MUX_TOKEN_SECRET`, `MUX_SIGNING_KEY_ID`, `MUX_SIGNING_PRIVATE_KEY_BASE64` | `PLANNED` | Reserved for a future Mux provider |
 | `VIDEO_PROVIDER` | inert | Provider is chosen per video by the creation endpoint, not by this variable |
 | `API_PUBLIC_BASE_URL` | inert | Documentation value only |
@@ -227,7 +257,7 @@ check when adding or removing a variable rather than trusting this count.
 Setting an inert variable has no effect. Removing one is safe but should be done
 deliberately — see [KNOWN_ISSUES.md](./KNOWN_ISSUES.md#ki-005).
 
-## 15. Rules
+## 16. Rules
 
 1. Adding a variable means: read it through `env.config.ts`, validate it in
    `env.validation.ts`, add it to `.env.example` with a **placeholder**, and add

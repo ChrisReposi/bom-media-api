@@ -318,3 +318,63 @@ export class PurgeVideoResponse {
     remoteAssetDeleted: boolean;
   };
 }
+
+export class BunnyTusUploadCredentialsResponse {
+  @ApiProperty({ example: "8f2c0e46-2b0a-4b8b-9d2e-1f3a4c5b6d7e" })
+  videoId!: string;
+
+  @ApiProperty({ example: "123456" })
+  libraryId!: string;
+
+  @ApiProperty({
+    example: 1781000000,
+    description: "UNIX seconds after which the signature stops being accepted.",
+  })
+  expirationTime!: number;
+
+  @ApiProperty({
+    example: "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+    description:
+      "SHA-256 hex of libraryId + apiKey + expirationTime + videoId. The API key itself is never returned.",
+  })
+  signature!: string;
+
+  @ApiProperty({ example: "https://video.bunnycdn.com/tusupload" })
+  tusEndpoint!: string;
+}
+
+export class InitBunnyVideoUploadResponse {
+  @ApiProperty({ example: "Bunny Stream upload initialized." })
+  message!: string;
+
+  @ApiProperty({ type: VideoResponse })
+  video!: VideoResponse;
+
+  @ApiProperty({ type: BunnyTusUploadCredentialsResponse })
+  upload!: BunnyTusUploadCredentialsResponse;
+}
+
+export class SyncBunnyVideoStatusResponse {
+  @ApiProperty({ example: "Bunny Stream status synchronized." })
+  message!: string;
+
+  @ApiProperty({ type: VideoResponse })
+  video!: VideoResponse;
+
+  @ApiProperty({
+    example: 4,
+    nullable: true,
+    description: "Raw Bunny status code. 4 is Finished; 5 and 6 are failures.",
+  })
+  bunnyStatus!: number | null;
+
+  @ApiProperty({
+    example: 100,
+    nullable: true,
+    description: "Bunny encode progress, 0-100. Transient; never persisted.",
+  })
+  encodeProgress!: number | null;
+
+  @ApiProperty({ example: false })
+  statusChanged!: boolean;
+}

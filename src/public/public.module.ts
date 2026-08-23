@@ -1,4 +1,5 @@
 import { Module } from "@nestjs/common";
+import { BunnyStreamModule } from "../bunny/bunny-stream.module";
 import { DatabaseModule } from "../database/database.module";
 import { VideoViewGrowthService } from "../videos/video-view-growth.service";
 import { LocalVideoStorageModule } from "../videos/storage/local-video-storage.module";
@@ -7,7 +8,7 @@ import { PublicMediaGrantService } from "./public-media-grant.service";
 import { PublicService } from "./public.service";
 
 @Module({
-  imports: [DatabaseModule, LocalVideoStorageModule],
+  imports: [BunnyStreamModule, DatabaseModule, LocalVideoStorageModule],
   controllers: [PublicController],
   providers: [PublicService, PublicMediaGrantService, VideoViewGrowthService],
 })

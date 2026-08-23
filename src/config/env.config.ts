@@ -1,5 +1,13 @@
 import { registerAs } from "@nestjs/config";
 import {
+  DEFAULT_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+  DEFAULT_BUNNY_TUS_TTL_SECONDS,
+  MAX_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+  MAX_BUNNY_TUS_TTL_SECONDS,
+  MIN_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+  MIN_BUNNY_TUS_TTL_SECONDS,
+} from "../bunny/bunny-stream.constants";
+import {
   DEFAULT_ADMIN_WEB_ORIGIN,
   DEFAULT_API_HOST,
   DEFAULT_API_PORT,
@@ -72,6 +80,17 @@ export interface ApiEnvironmentConfig {
     minFreeSpaceMb: number;
     staleUploadMaxAgeHours: number;
     thumbnailUploadMaxMb: number;
+  };
+  /**
+   * Bunny Stream. Non-secret values only - `BUNNY_STREAM_API_KEY` and
+   * `BUNNY_STREAM_TOKEN_SECURITY_KEY` are deliberately absent here and are read
+   * exclusively by `BunnyStreamService` through `ConfigService`.
+   */
+  bunnyStream: {
+    enabled: boolean;
+    libraryId: string | null;
+    tusTtlSeconds: number;
+    embedTokenTtlSeconds: number;
   };
   release: {
     version: string | null;
@@ -371,6 +390,22 @@ export const apiConfig = registerAs("api", (): ApiEnvironmentConfig => {
       thumbnailUploadMaxMb: parsePositiveInteger(
         process.env.LOCAL_THUMBNAIL_UPLOAD_MAX_MB,
         10,
+      ),
+    },
+    bunnyStream: {
+      enabled: parseBoolean(process.env.BUNNY_STREAM_ENABLED, false),
+      libraryId: readOptionalTrimmedEnv(process.env.BUNNY_STREAM_LIBRARY_ID),
+      tusTtlSeconds: parseBoundedInteger(
+        process.env.BUNNY_STREAM_TUS_TTL_SECONDS,
+        DEFAULT_BUNNY_TUS_TTL_SECONDS,
+        MIN_BUNNY_TUS_TTL_SECONDS,
+        MAX_BUNNY_TUS_TTL_SECONDS,
+      ),
+      embedTokenTtlSeconds: parseBoundedInteger(
+        process.env.BUNNY_STREAM_EMBED_TOKEN_TTL_SECONDS,
+        DEFAULT_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+        MIN_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+        MAX_BUNNY_EMBED_TOKEN_TTL_SECONDS,
       ),
     },
     release: {

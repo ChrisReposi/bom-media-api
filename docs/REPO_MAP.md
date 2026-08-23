@@ -68,6 +68,9 @@ root.
 | Cloudinary URL helpers | `src/videos/utils/cloudinary-video.util.ts` |
 | Slug generation, checksums, search, filter keys | `src/videos/utils/*.util.ts` |
 | Cloudinary SDK wrapper | `src/cloudinary/cloudinary.service.ts` |
+| Bunny Stream client: create/get/delete, TUS signing, embed signing | `src/bunny/bunny-stream.service.ts` |
+| Bunny API base, TUS/embed endpoints, status codes, TTL bounds | `src/bunny/bunny-stream.constants.ts` |
+| The single predicate deciding whether an asset is Bunny-backed | `src/bunny/bunny-video-asset.util.ts` |
 
 ## Websites, domains, share links
 

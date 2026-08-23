@@ -1,7 +1,7 @@
 # Known Issues
 
 Status: CURRENT
-Last verified: 2026-08-21
+Last verified: 2026-08-23
 Verified against: source inspection and a local verification run on 2026-08-21
 
 Every entry here is backed by evidence a reader can re-check. **No speculative
@@ -131,7 +131,7 @@ real friction) · `LOW` (hygiene, correctness of documentation, cleanup).
 - **Evidence.** Verified by searching `src/`, `prisma/` and `scripts/` on
   2026-08-21: `VIDEO_PROVIDER`, `API_PUBLIC_BASE_URL`, `API_SELF_ORIGIN`,
   `SHARE_TOKEN_BYTES`, `DEFAULT_SHARE_LINK_EXPIRES_DAYS`,
-  `DEFAULT_SHARE_LINK_MAX_VIEWS`, all `BUNNY_*`, all `MUX_*`, and (in
+  `DEFAULT_SHARE_LINK_MAX_VIEWS`, all `MUX_*`, and (in
   `.env.local` only) `PUBLIC_RENDERER_LOCAL_ORIGIN`,
   `PUBLIC_RESOLVE_ALLOW_MISSING_TOKEN`, `PUBLIC_SHARE_DEFAULT_PROTOCOL` have no
   reader. `VITE_API_BASE_URL` and `VITE_VIDEO_DB_UPLOAD_ENABLED` appear in the
@@ -140,8 +140,15 @@ real friction) · `LOW` (hygiene, correctness of documentation, cleanup).
 - **Impact.** Operators reasonably assume setting `VIDEO_PROVIDER=bunny` or
   `SHARE_TOKEN_BYTES=64` changes behaviour. It does not. Silent no-ops are a
   configuration-drift and incident-analysis hazard.
-- **Direction.** Keep `BUNNY_*`/`MUX_*` as clearly-labelled reservations; remove
-  or wire up the rest. Full table in [ENVIRONMENT.md](./ENVIRONMENT.md#14-declared-but-not-read-by-any-code).
+- **Updated 2026-08-23.** The `BUNNY_*` family is no longer inert:
+  `BUNNY_STREAM_ENABLED`, `BUNNY_STREAM_LIBRARY_ID`, `BUNNY_STREAM_API_KEY`,
+  `BUNNY_STREAM_TOKEN_SECURITY_KEY` and the two TTL variables are read by
+  `BunnyStreamService` and `env.validation.ts`. `BUNNY_STREAM_SIGNING_KEY` was
+  removed from the templates; only `BUNNY_STREAM_PULL_ZONE_HOSTNAME` remains
+  reserved.
+- **Direction.** Keep `MUX_*` and `BUNNY_STREAM_PULL_ZONE_HOSTNAME` as
+  clearly-labelled reservations; remove or wire up the rest. Full table in
+  [ENVIRONMENT.md](./ENVIRONMENT.md#15-declared-but-not-read-by-any-code).
 - **Safe to defer?** Yes, now that they are documented.
 
 ### KI-006

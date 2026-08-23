@@ -23,7 +23,7 @@ hosts them**. They are set together at creation and are not interchangeable.
 |---|---|---|
 | `MANUAL` | **CURRENT** — the default; no provider integration | `videos.service.ts` |
 | `CLOUDINARY` | **CURRENT** — upload, delete, derived thumbnails | `src/cloudinary/cloudinary.service.ts` |
-| `BUNNY` | **PLANNED** | No Bunny-specific integration exists. The enum member is persistable and plays back generically — see §1.1 |
+| `BUNNY` | **CURRENT (MVP)** | `src/bunny/bunny-stream.service.ts` — TUS upload initiation, status sync, signed short-lived embed playback, remote purge. See [bunny-stream.md](./bunny-stream.md) |
 | `MUX` | **PLANNED** | No Mux-specific integration exists. Same generic behaviour |
 
 `VIDEO_PROVIDER` in `.env.example` is read by nothing.
@@ -44,11 +44,19 @@ Two consequences that earlier documentation got wrong:
 - **Cloudinary records are not created only via embed.** A `DIRECT_URL` video
   whose `playbackUrl` is any `*.cloudinary.com` URL is auto-classified
   `provider: CLOUDINARY, sourceType: DIRECT_URL`.
-- **`provider: BUNNY` / `provider: MUX` records can be created today** through
-  `POST /admin/videos`, and will play back as ordinary direct URLs. That is a
-  stored label plus generic URL handling — there is no provider integration
-  behind it. Say "no Bunny-specific integration exists", not "no Bunny code
-  paths are reachable".
+- **`provider: BUNNY` / `provider: MUX` records can be created this way**
+  through `POST /admin/videos`, and will play back as ordinary direct URLs. That
+  is a stored *label* plus generic URL handling.
+
+  A **Bunny-backed** asset is not that. It is created only by
+  `POST /admin/videos/bunny/upload-init` and is recognised by
+  `classifyBunnyVideoAsset()` — `provider = BUNNY` **and** `sourceType = EMBED`
+  **and** a `providerAssetId` holding the Bunny GUID **and** a `playbackId`
+  equal to it **and** a matching `metadataJson.bunnyStream` marker. A
+  merely-labelled `DIRECT_URL` record classifies as `not-bunny` and is untouched
+  by every Bunny branch; a record claiming the Bunny EMBED shape that fails the
+  predicate classifies as `bunny-malformed` and **fails closed**. See
+  [bunny-stream.md](./bunny-stream.md).
 
 ## 2. Creation paths
 
@@ -61,6 +69,7 @@ Two consequences that earlier documentation got wrong:
 | `POST /admin/videos/upload` | `UPLOAD` + `CLOUDINARY` | **no** |
 | `POST /admin/videos/upload-db` | `DB_BLOB` | **no** |
 | `POST /admin/videos/upload-local/*` | `LOCAL_FILE` | yes |
+| `POST /admin/videos/bunny/upload-init` | `EMBED` + `BUNNY`, status `PROCESSING` | yes |
 
 Two implemented upload paths have no UI. See
 [KNOWN_ISSUES.md](../KNOWN_ISSUES.md#ki-014).
@@ -237,6 +246,10 @@ PHASE 1 — inside a single Prisma transaction
 PHASE 2 — after the commit, no transaction, all best-effort
     if deleteRemoteAsset && provider === CLOUDINARY && providerAssetId
         deleteRemoteAssetBestEffort(providerAssetId)
+    else if deleteRemoteAsset && readBunnyVideoAsset(video) !== null
+        deleteBunnyRemoteAssetBestEffort(bunnyVideoId)   ← mutually exclusive
+        (throws before any HTTP request when BUNNY_STREAM_ENABLED=false,
+         so remoteAssetDeleted stays false and the audit row is FAIL)
     deleteOwnedThumbnailBestEffort(metadataJson, thumbnailUrl)
     deleteStorageKeyBestEffort(localFileAsset.storageKey)
     deleteStorageKeyBestEffort(localThumbnailAsset.storageKey)

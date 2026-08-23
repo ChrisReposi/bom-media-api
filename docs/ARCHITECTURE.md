@@ -274,7 +274,7 @@ independent. Implementation status verified in `src/videos/videos.service.ts`:
 |---|---|
 | `MANUAL` | CURRENT — default; no provider integration |
 | `CLOUDINARY` | CURRENT — `src/cloudinary/cloudinary.service.ts`; upload, delete, derived thumbnails |
-| `BUNNY` | **PLANNED** — no Bunny-specific integration exists. The enum member is persistable and generic direct-URL playback works; see below |
+| `BUNNY` | **CURRENT (MVP)** — `src/bunny/bunny-stream.service.ts`; TUS upload initiation, status sync, signed short-lived embed playback, remote purge. See [features/bunny-stream.md](./features/bunny-stream.md) |
 | `MUX` | **PLANNED** — no Mux-specific integration exists; same generic behaviour |
 
 `VIDEO_PROVIDER` in `.env.example` is **not read by any code**.
@@ -282,10 +282,27 @@ independent. Implementation status verified in `src/videos/videos.service.ts`:
 `provider` is chosen by `resolveProvider(dto)`: an explicit `dto.provider` wins,
 otherwise a `*.cloudinary.com` `playbackUrl` yields `CLOUDINARY`, otherwise
 `MANUAL`. Because `CreateVideoDto.provider` is `@IsEnum(VideoProvider)`, a
-record with `provider: BUNNY` or `provider: MUX` **can be created today** and
-will play back as an ordinary `DIRECT_URL`. That is a stored label plus generic
-URL handling — not an integration. See
+record with `provider: BUNNY` or `provider: MUX` can still be created this way
+and will play back as an ordinary `DIRECT_URL`. That is a stored label plus
+generic URL handling.
+
+A **Bunny-backed** asset is a different thing entirely: it is created only by
+`POST /admin/videos/bunny/upload-init`, and `classifyBunnyVideoAsset()`
+recognises it by all five of `provider = BUNNY`, `sourceType = EMBED`, a
+`providerAssetId` holding the Bunny GUID, a `playbackId` equal to it, and a
+matching `metadataJson.bunnyStream` marker. Every Bunny branch — signed
+playback, status sync, remote purge — is gated on that one classifier, so a
+merely-labelled record is never affected.
+
+A record that claims the Bunny EMBED shape but fails the predicate classifies as
+`bunny-malformed` and **fails closed**: it is not publicly playable and its
+stored unsigned `embedUrl` is never emitted. See
 [features/bunny-stream.md](./features/bunny-stream.md).
+
+For a Bunny-backed asset the watch response carries a **short-lived signed**
+`iframe.mediadelivery.net` URL in the existing `embedUrl` field, minted only
+after the full authorization chain in §6 has passed **and** the atomic view
+consumption has claimed the view.
 
 ### 7.1 Chunked local-file upload
 

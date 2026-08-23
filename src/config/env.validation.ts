@@ -9,6 +9,14 @@ import {
   MARIADB_COLLATION_PROBE_CONFIRMATION,
   MARIADB_COLLATION_PROBE_DISABLED,
 } from "../common/diagnostics/mariadb-collation-probe.constants";
+import {
+  DEFAULT_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+  DEFAULT_BUNNY_TUS_TTL_SECONDS,
+  MAX_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+  MAX_BUNNY_TUS_TTL_SECONDS,
+  MIN_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+  MIN_BUNNY_TUS_TTL_SECONDS,
+} from "../bunny/bunny-stream.constants";
 import { isAbsolute } from "node:path";
 import proxyaddr from "proxy-addr";
 
@@ -871,6 +879,75 @@ export function validateEnv(
     );
   }
   validated.LOCAL_THUMBNAIL_UPLOAD_MAX_MB = String(localThumbnailUploadMaxMb);
+
+  // Bunny Stream. Off by default, and nothing below is required while it is
+  // off, so a production deployment that has never heard of Bunny still boots
+  // with no new environment values.
+  validated.BUNNY_STREAM_ENABLED = readBoolean(
+    config,
+    "BUNNY_STREAM_ENABLED",
+    false,
+  );
+
+  const bunnyLibraryId = readOptionalTrimmedString(
+    config,
+    "BUNNY_STREAM_LIBRARY_ID",
+  );
+  const bunnyApiKey = readOptionalTrimmedString(config, "BUNNY_STREAM_API_KEY");
+  const bunnyTokenSecurityKey = readOptionalTrimmedString(
+    config,
+    "BUNNY_STREAM_TOKEN_SECURITY_KEY",
+  );
+
+  if (validated.BUNNY_STREAM_ENABLED === "true") {
+    if (bunnyLibraryId === undefined) {
+      throw new Error(
+        "BUNNY_STREAM_LIBRARY_ID is required when BUNNY_STREAM_ENABLED=true",
+      );
+    }
+    if (!/^\d{1,20}$/.test(bunnyLibraryId)) {
+      throw new Error("BUNNY_STREAM_LIBRARY_ID must be a numeric library id");
+    }
+    if (bunnyApiKey === undefined) {
+      throw new Error(
+        "BUNNY_STREAM_API_KEY is required when BUNNY_STREAM_ENABLED=true",
+      );
+    }
+    if (bunnyTokenSecurityKey === undefined) {
+      throw new Error(
+        "BUNNY_STREAM_TOKEN_SECURITY_KEY is required when BUNNY_STREAM_ENABLED=true",
+      );
+    }
+  }
+
+  if (bunnyLibraryId !== undefined) {
+    validated.BUNNY_STREAM_LIBRARY_ID = bunnyLibraryId;
+  }
+  if (bunnyApiKey !== undefined) {
+    validated.BUNNY_STREAM_API_KEY = bunnyApiKey;
+  }
+  if (bunnyTokenSecurityKey !== undefined) {
+    validated.BUNNY_STREAM_TOKEN_SECURITY_KEY = bunnyTokenSecurityKey;
+  }
+
+  validated.BUNNY_STREAM_TUS_TTL_SECONDS = String(
+    readBoundedInteger(
+      config,
+      "BUNNY_STREAM_TUS_TTL_SECONDS",
+      DEFAULT_BUNNY_TUS_TTL_SECONDS,
+      MIN_BUNNY_TUS_TTL_SECONDS,
+      MAX_BUNNY_TUS_TTL_SECONDS,
+    ),
+  );
+  validated.BUNNY_STREAM_EMBED_TOKEN_TTL_SECONDS = String(
+    readBoundedInteger(
+      config,
+      "BUNNY_STREAM_EMBED_TOKEN_TTL_SECONDS",
+      DEFAULT_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+      MIN_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+      MAX_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+    ),
+  );
 
   // Optional release identity, injected at build/deploy time (never read from
   // .git at runtime). Absent values are always allowed — including in

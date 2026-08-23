@@ -9,6 +9,9 @@ import {
 import { ConfigService } from "@nestjs/config";
 import { randomUUID } from "node:crypto";
 import { readFile, unlink } from "node:fs/promises";
+import { BUNNY_STREAM_METADATA_KEY } from "../bunny/bunny-stream.constants";
+import { BunnyStreamService } from "../bunny/bunny-stream.service";
+import { readBunnyVideoAsset } from "../bunny/bunny-video-asset.util";
 import { buildCacheKey } from "../cache/memory-cache-key.util";
 import { MemoryCacheService } from "../cache/memory-cache.service";
 import { rethrowWithDatabaseStage } from "../common/errors/safe-database-error-context.util";
@@ -29,6 +32,7 @@ import {
 import type { CompleteLocalVideoUploadDto } from "./dto/complete-local-video-upload.dto";
 import type { CreateEmbedVideoDto } from "./dto/create-embed-video.dto";
 import type { CreateVideoDto } from "./dto/create-video.dto";
+import type { InitBunnyVideoUploadDto } from "./dto/init-bunny-video-upload.dto";
 import type { InitLocalVideoUploadDto } from "./dto/init-local-video-upload.dto";
 import type { ListVideosQueryDto } from "./dto/list-videos-query.dto";
 import {
@@ -45,9 +49,11 @@ import type { UploadVideoDto } from "./dto/upload-video.dto";
 import type {
   CancelLocalVideoUploadResponse,
   DisableVideoResponse,
+  InitBunnyVideoUploadResponse,
   InitLocalVideoUploadResponse,
   LocalVideoChunkUploadResponse,
   PurgeVideoResponse,
+  SyncBunnyVideoStatusResponse,
   VideoUploadSessionResponse,
   VideoListResponse,
   VideoResponse,
@@ -90,7 +96,10 @@ type VideoMutationAction =
   | "VIDEO_UPDATE"
   | "VIDEO_DISABLE"
   | "VIDEO_PURGE_COMMIT"
-  | "VIDEO_PURGE_STORAGE";
+  | "VIDEO_PURGE_STORAGE"
+  | "VIDEO_BUNNY_UPLOAD_INIT"
+  | "VIDEO_BUNNY_UPLOAD_INIT_ORPHAN"
+  | "VIDEO_BUNNY_STATUS_SYNC";
 
 const DEFAULT_DB_UPLOAD_MAX_MB = 50;
 const MAX_DB_UPLOAD_MAX_MB = 100;
@@ -194,6 +203,10 @@ export class VideosService {
     private readonly videoMetadataService: VideoMetadataService,
     private readonly localVideoStorageService: LocalVideoStorageService,
     @Optional() private readonly memoryCache?: MemoryCacheService,
+    // Appended and optional on purpose. Every legacy video path must keep
+    // working with no Bunny collaborator at all, and the existing unit
+    // harnesses construct this service positionally.
+    @Optional() private readonly bunnyStreamService?: BunnyStreamService,
   ) {}
 
   async listVideos(query: ListVideosQueryDto): Promise<VideoListResponse> {
@@ -467,6 +480,183 @@ export class VideosService {
     this.invalidateAdminVideoCaches();
 
     return this.toVideoResponse(video);
+  }
+
+  /**
+   * Starts a Bunny Stream upload.
+   *
+   * Creates the remote video, records it locally as a non-ready `EMBED` asset
+   * carrying the Bunny GUID, and hands the admin browser short-lived TUS
+   * credentials. The video bytes never pass through this process.
+   */
+  async initBunnyVideoUpload(
+    dto: InitBunnyVideoUploadDto,
+    adminId: string,
+  ): Promise<InitBunnyVideoUploadResponse> {
+    const bunny = this.requireBunnyStreamService();
+    bunny.ensureEnabled();
+
+    const title = dto.title.trim();
+    const slug = await this.ensureUniqueSlug(dto.slug ?? title);
+    const bunnyVideo = await bunny.createVideo(title);
+    const libraryId = bunny.getLibraryId();
+
+    let video: VideoAsset;
+    try {
+      video = await this.prisma.videoAsset.create({
+        data: {
+          title,
+          slug,
+          description: this.trimNullable(dto.description),
+          provider: VideoProvider.BUNNY,
+          sourceType: VideoSourceType.EMBED,
+          providerAssetId: bunnyVideo.guid,
+          playbackId: bunnyVideo.guid,
+          playbackUrl: null,
+          embedProvider: EmbedProvider.GENERIC_IFRAME,
+          // The stored embed URL is deliberately UNSIGNED. It identifies the
+          // asset for admin use; the public watch response never returns it
+          // as-is - `PublicService` replaces it with a freshly signed URL
+          // after authorization. See docs/features/bunny-stream.md.
+          embedUrl: bunny.buildUnsignedEmbedUrl(bunnyVideo.guid),
+          embedAllow: this.getEmbedDefaultAllow(),
+          thumbnailUrl: null,
+          durationSeconds: null,
+          viewCount: this.parseViewCount(dto.viewCount),
+          publishedAt: this.parseNullableDate(dto.publishedAt),
+          // Bunny owns the lifecycle from here: PROCESSING until a status sync
+          // sees Bunny report Finished.
+          status: VideoStatus.PROCESSING,
+          filterKey: this.normalizeNullableVideoFilterKey(dto.filterKey),
+          metadataJson: this.buildMetadataJson(
+            {
+              [BUNNY_STREAM_METADATA_KEY]: {
+                videoId: bunnyVideo.guid,
+                libraryId,
+                createdAt: new Date().toISOString(),
+              },
+            },
+            null,
+          ),
+        },
+      });
+    } catch (error) {
+      // The remote asset exists but the local row does not. Remove the remote
+      // asset so the library does not accumulate invisible orphans, and record
+      // the outcome either way.
+      await this.deleteBunnyRemoteAssetAfterFailedInsert(
+        bunnyVideo.guid,
+        adminId,
+      );
+
+      throw error;
+    }
+
+    await this.writeAudit(adminId, "VIDEO_BUNNY_UPLOAD_INIT", video.id, {
+      provider: video.provider,
+      sourceType: video.sourceType,
+      status: video.status,
+      bunnyVideoId: bunnyVideo.guid,
+      bunnyLibraryId: libraryId,
+    });
+    this.invalidateAdminVideoCaches();
+
+    return {
+      message: "Bunny Stream upload initialized.",
+      video: this.toVideoResponse(video),
+      // Contains a signature derived from the API key, never the key itself.
+      upload: bunny.createTusUploadCredentials(bunnyVideo.guid),
+    };
+  }
+
+  /**
+   * Polls Bunny for the encoding state of a Bunny-backed asset and maps it onto
+   * the existing local `VideoStatus` lifecycle.
+   *
+   * Transition rules, deliberately conservative:
+   *
+   * - `DISABLED` is never overwritten - that is an administrator's decision.
+   * - `READY` is never demoted - a published asset does not lose its share
+   *   links because of a transient Bunny read.
+   * - `DRAFT`, `PROCESSING` and `FAILED` follow Bunny, so a failed upload that
+   *   is retried can recover to `READY`.
+   *
+   * `encodeProgress` is returned for display and never persisted; polling must
+   * not write to the database on every tick.
+   */
+  async syncBunnyVideoStatus(
+    id: string,
+    adminId: string,
+  ): Promise<SyncBunnyVideoStatusResponse> {
+    const bunny = this.requireBunnyStreamService();
+    bunny.ensureEnabled();
+
+    const existing = await this.prisma.videoAsset.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        status: true,
+        provider: true,
+        sourceType: true,
+        providerAssetId: true,
+        // Part of the Bunny identification predicate - see
+        // `classifyBunnyVideoAsset()`.
+        playbackId: true,
+        durationSeconds: true,
+        metadataJson: true,
+      },
+    });
+
+    if (existing === null) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    const bunnyAsset = readBunnyVideoAsset(existing);
+    if (bunnyAsset === null) {
+      throw new BadRequestException("Video is not backed by Bunny Stream.");
+    }
+
+    const remote = await bunny.getVideo(bunnyAsset.bunnyVideoId);
+    const nextStatus = this.resolveBunnyLocalStatus(
+      existing.status,
+      bunny.mapProcessingState(remote.status),
+    );
+    const statusChanged = nextStatus !== existing.status;
+    const durationSeconds =
+      existing.durationSeconds === null &&
+      remote.length !== null &&
+      remote.length > 0
+        ? Math.round(remote.length)
+        : null;
+
+    const video =
+      statusChanged || durationSeconds !== null
+        ? await this.prisma.videoAsset.update({
+            where: { id },
+            data: {
+              ...(statusChanged ? { status: nextStatus } : {}),
+              ...(durationSeconds === null ? {} : { durationSeconds }),
+            },
+          })
+        : await this.prisma.videoAsset.findUniqueOrThrow({ where: { id } });
+
+    if (statusChanged) {
+      await this.writeAudit(adminId, "VIDEO_BUNNY_STATUS_SYNC", id, {
+        previousStatus: existing.status,
+        nextStatus,
+        bunnyStatus: remote.status,
+        bunnyVideoId: bunnyAsset.bunnyVideoId,
+      });
+      this.invalidateAdminVideoCaches();
+    }
+
+    return {
+      message: "Bunny Stream status synchronized.",
+      video: this.toVideoResponse(video),
+      bunnyStatus: remote.status,
+      encodeProgress: remote.encodeProgress,
+      statusChanged,
+    };
   }
 
   async uploadVideo(
@@ -1723,6 +1913,9 @@ export class VideosService {
           provider: true,
           sourceType: true,
           providerAssetId: true,
+          // Part of the Bunny identification predicate - see
+          // `classifyBunnyVideoAsset()`.
+          playbackId: true,
           thumbnailUrl: true,
           metadataJson: true,
           localFileAsset: {
@@ -1801,15 +1994,31 @@ export class VideosService {
       };
     });
 
-    const shouldDeleteRemoteAsset =
+    // Remote cleanup is opt-in per the existing purge contract, and each
+    // provider branch is mutually exclusive: `readBunnyVideoAsset` only matches
+    // assets the Bunny upload path created, so Cloudinary, DIRECT_URL, EMBED,
+    // LOCAL_FILE and DB_BLOB purges are byte-for-byte unchanged.
+    const bunnyAsset = readBunnyVideoAsset(purgeResult.video);
+    const shouldDeleteCloudinaryAsset =
       deleteRemoteAsset &&
       purgeResult.video.provider === VideoProvider.CLOUDINARY &&
       purgeResult.video.providerAssetId !== null;
+    const shouldDeleteBunnyAsset = deleteRemoteAsset && bunnyAsset !== null;
+    const shouldDeleteRemoteAsset =
+      shouldDeleteCloudinaryAsset || shouldDeleteBunnyAsset;
     let remoteAssetDeleted = false;
 
-    if (shouldDeleteRemoteAsset && purgeResult.video.providerAssetId !== null) {
+    if (
+      shouldDeleteCloudinaryAsset &&
+      purgeResult.video.providerAssetId !== null
+    ) {
       remoteAssetDeleted = await this.deleteRemoteAssetBestEffort(
         purgeResult.video.providerAssetId,
+        purgeResult.video.id,
+      );
+    } else if (shouldDeleteBunnyAsset && bunnyAsset !== null) {
+      remoteAssetDeleted = await this.deleteBunnyRemoteAssetBestEffort(
+        bunnyAsset.bunnyVideoId,
         purgeResult.video.id,
       );
     }
@@ -2016,6 +2225,103 @@ export class VideosService {
       );
       return false;
     }
+  }
+
+  /**
+   * Deletes a Bunny Stream asset after its local row has already been purged.
+   *
+   * Returns the truth: `false` whenever Bunny did not confirm the delete, so
+   * the purge audit entry and the API response report a failure instead of
+   * silently claiming success. A `false` here means the Bunny library still
+   * holds an asset that no local row points at.
+   */
+  private async deleteBunnyRemoteAssetBestEffort(
+    bunnyVideoId: string,
+    videoId: string,
+  ): Promise<boolean> {
+    try {
+      return await this.requireBunnyStreamService().deleteVideo(bunnyVideoId);
+    } catch (error) {
+      this.logger.warn(
+        {
+          videoId,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        },
+        "Bunny Stream remote video asset deletion failed after video purge.",
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Compensating delete for the narrow window where Bunny created the remote
+   * video but the local insert failed. Best effort by design: the caller still
+   * rethrows the original database error.
+   */
+  private async deleteBunnyRemoteAssetAfterFailedInsert(
+    bunnyVideoId: string,
+    adminId: string,
+  ): Promise<void> {
+    let deleted = false;
+
+    try {
+      deleted =
+        await this.requireBunnyStreamService().deleteVideo(bunnyVideoId);
+    } catch (error) {
+      this.logger.error(
+        {
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        },
+        "Bunny Stream orphan cleanup failed after a local video insert error.",
+      );
+    }
+
+    try {
+      await this.writeAudit(
+        adminId,
+        "VIDEO_BUNNY_UPLOAD_INIT_ORPHAN",
+        bunnyVideoId,
+        { bunnyVideoId, remoteAssetDeleted: deleted },
+        deleted ? AuditStatus.SUCCESS : AuditStatus.FAIL,
+      );
+    } catch {
+      // Audit is best effort here; the original insert error is what matters.
+    }
+  }
+
+  /**
+   * Applies the Bunny state to the local lifecycle without ever overwriting an
+   * administrator decision (`DISABLED`) or demoting a published asset
+   * (`READY`).
+   */
+  private resolveBunnyLocalStatus(
+    currentStatus: VideoStatus,
+    processingState: "PROCESSING" | "READY" | "FAILED",
+  ): VideoStatus {
+    if (
+      currentStatus === VideoStatus.DISABLED ||
+      currentStatus === VideoStatus.READY
+    ) {
+      return currentStatus;
+    }
+
+    if (processingState === "READY") {
+      return VideoStatus.READY;
+    }
+
+    if (processingState === "FAILED") {
+      return VideoStatus.FAILED;
+    }
+
+    return VideoStatus.PROCESSING;
+  }
+
+  private requireBunnyStreamService(): BunnyStreamService {
+    if (this.bunnyStreamService === undefined) {
+      throw new BadRequestException("Bunny Stream is not enabled.");
+    }
+
+    return this.bunnyStreamService;
   }
 
   private resolveVideoListPage(value: number | undefined): number {

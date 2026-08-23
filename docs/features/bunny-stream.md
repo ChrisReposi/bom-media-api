@@ -1,229 +1,393 @@
 # Feature: Bunny Stream video provider
 
-Status: **PLANNED — NOT IMPLEMENTED**
-Last verified: 2026-08-21
-Verified against: `prisma/schema.prisma` (`VideoProvider`), `src/videos/videos.service.ts` (`resolveProvider`, `purgeVideo`), `src/videos/dto/create-video.dto.ts`, `.env.example` lines 147-151, and a repository-wide search for "bunny" on 2026-08-21
+Status: **CURRENT — MVP**
+Last verified: 2026-08-23 (revised after targeted review)
+Verified against: `src/bunny/**`, `src/videos/videos.service.ts` (`initBunnyVideoUpload`, `syncBunnyVideoStatus`, `purgeVideo`), `src/videos/videos.controller.ts`, `src/public/public.service.ts` (`resolvePublicEmbedUrl`, `isPublicPlayableVideo`), `src/config/env.validation.ts`, `test/bunny-stream.test.ts`, `test/video-purge.test.ts`
 Owner: unassigned
 
-> **No Bunny-specific integration exists.** Read the two tables below before
-> writing or repeating any claim about Bunny status — an earlier revision of
-> this document said "zero implementation code", which was imprecise: the enum
-> member is reachable and generic playback works.
->
-> **Do not implement from this document.** It is a planning artefact, written to
-> capture constraints while the current video architecture is fresh.
-> Implementation requires a separate, explicit instruction.
+> A previous revision of this document was a **planning artefact** with status
+> `PLANNED — NOT IMPLEMENTED`. The MVP described below is now implemented. The
+> scope limits in §11 are real limits, not aspirations — read them before
+> assuming a capability exists.
 
-### CURRENT — verified present today
+## 1. What exists
 
-| Fact | Evidence |
+A Bunny-backed video is an ordinary `VideoAsset` using fields the schema already
+had. **No Prisma migration was required.**
+
+| Field | Value for a Bunny asset |
 |---|---|
-| `VideoProvider.BUNNY` exists in the Prisma enum | `prisma/schema.prisma`, migration `20260529163942_init` |
-| The enum member is **persistable** through the public admin API | `CreateVideoDto.provider?: VideoProvider` with `@IsOptional() @IsEnum(VideoProvider)`; `resolveProvider(dto)` returns `dto.provider` when supplied |
-| A `provider: BUNNY` record plays back **generically** | It is an ordinary `sourceType: DIRECT_URL` video; the stored `playbackUrl` is returned verbatim and the public site renders it in a native `<video>` |
-| Provider-ready database fields exist and are generic | `VideoAsset.provider`, `providerAssetId`, `playbackId`, `playbackUrl`, `metadataJson` |
-| The admin UI has a display label | `BUNNY: "Bunny"` in `bom-media-admin/src/features/videos/videoFormatters.ts`; `VideoProvider` union in `videoTypes.ts` |
-| Four `BUNNY_STREAM_*` environment placeholders exist | `.env.example` lines 147–151 — **verified unread**: no reference in `src/`, `prisma/`, `scripts/` or `test/` |
+| `provider` | `BUNNY` |
+| `sourceType` | `EMBED` |
+| `providerAssetId` | the Bunny video GUID |
+| `playbackId` | the same GUID |
+| `embedProvider` | `GENERIC_IFRAME` |
+| `embedUrl` | the **unsigned** `https://iframe.mediadelivery.net/embed/{library}/{guid}` — never served to the public as-is |
+| `metadataJson.bunnyStream` | `{ videoId, libraryId, createdAt }` — the marker that makes the record Bunny-backed |
+| `status` | `PROCESSING` → `READY` / `FAILED`, driven by Bunny |
 
-So a video can today be *labelled* Bunny and served as a plain direct URL. That
-is a stored label plus generic URL handling, not an integration.
+### 1.1 Provider isolation and fail-closed classification
 
-### NOT IMPLEMENTED — none of this exists
+`classifyBunnyVideoAsset()` in `src/bunny/bunny-video-asset.util.ts` is the
+**only** predicate that decides how a record is treated, and every Bunny branch
+is gated on it. It returns exactly one of three outcomes:
 
-| Missing | Consequence |
-|---|---|
-| Bunny-specific service or API client | No programmatic upload, listing, deletion or status query |
-| TUS resumable upload integration | Uploads cannot go to Bunny at all |
-| Bunny webhooks | No encoding-complete or failure callbacks; `VideoStatus` cannot be driven by Bunny |
-| Signed Bunny playback (token authentication) | A Bunny URL stored today would be an unsigned, non-expiring URL — see [KNOWN_ISSUES.md](../KNOWN_ISSUES.md#ki-015) |
-| Bunny player integration | Playback would use the native element or a `GENERIC_IFRAME` embed |
-| Bunny metadata synchronisation | Duration, size and thumbnails are not fetched from Bunny |
-| Provider-specific purge | `purgeVideo()` deletes remote assets only for `provider === CLOUDINARY`; a `BUNNY` record's remote asset is never deleted |
-| Reading of `BUNNY_STREAM_*` | Setting these variables has no effect whatsoever |
-| Production Bunny infrastructure | Not represented in this workspace; classification **EXTERNAL / UNVERIFIED** |
-
-The same applies to `MUX`: enum member and `MUX_*` placeholders only, with no
-Mux-specific integration.
-
-## Goal
-
-Move production video storage and delivery to Bunny Stream so that video bytes
-are served by a CDN instead of the application origin, while keeping every
-authorization decision in this backend.
-
-## Non-goals
-
-- Removing `LOCAL_FILE`. It must remain a supported self-hosted option.
-- Removing `DB_BLOB`. It remains a small, production-disabled fallback.
-- Removing Cloudinary. It stays for images/thumbnails and existing assets.
-- DRM or watermarking.
-- Migrating existing assets automatically.
-
-## Existing behaviour
-
-See [video-pipeline.md](./video-pipeline.md). Five source types are implemented;
-`MANUAL` and `CLOUDINARY` are the only implemented providers. For `LOCAL_FILE`
-and `DB_BLOB` the backend serves every byte and implements Range itself.
-
-Relevant current facts any integration must respect:
-
-- Public authorization for **backend-served** media runs the chain host →
-  `ACTIVE` domain → `ACTIVE` website → `ACTIVE` share link (status/expiry) →
-  `ShareLinkVideo` membership → `ACTIVE` `WebsiteVideo` assignment → `READY` →
-  playable asset. It runs per request for `DB_BLOB`; for unlimited `LOCAL_FILE`
-  links a process-local cache may serve the result for up to
-  `MEDIA_METADATA_CACHE_TTL_SECONDS`
-  ([SECURITY_MODEL.md §4.2](../SECURITY_MODEL.md#42-local_file-media-authorization-cache)).
-- **Externally hosted media is outside that chain entirely.** `DIRECT_URL`,
-  Cloudinary `UPLOAD` and `EMBED` URLs are returned verbatim and fetched by the
-  browser directly. A Bunny integration that returns unsigned Bunny URLs would
-  land in this category and inherit its revocation limits
-  ([KNOWN_ISSUES.md](../KNOWN_ISSUES.md#ki-015)). Signed, short-lived URLs are
-  what keeps it out of that category.
-- View-limited links additionally require an HMAC grant
-  ([ADR 0004](../adr/0004-hmac-media-grants-for-view-limited-links.md)).
-- The public site never constructs media URLs; it consumes the URL fields the
-  watch response returns
-  ([API_CONTRACTS.md](../API_CONTRACTS.md#31-post-publicwatchexchange-preferred-and-get-publicwatch-legacy)).
-- The public site's CSP currently allows `media-src 'self' blob: https:`, so an
-  https CDN host is permitted today, but `connect-src` is `'self'`.
-
-## Target behaviour
-
-Not built. If built, it would introduce a `BUNNY` provider whose videos are
-uploaded to a Bunny Stream library and played back through short-lived signed
-Bunny URLs handed out only after this backend has authorized the request.
-
-## Architecture (sketch only)
-
-```
-Admin upload  → API validates → API uploads to Bunny Stream library
-                              → store providerAssetId / playbackId
-
-Public watch  → API runs the full authorization chain (unchanged)
-              → API mints a short-lived signed Bunny playback URL
-              → response carries that URL in an existing URL field
-Viewer        → requests video bytes directly from Bunny CDN
-```
-
-Origin bandwidth drops to metadata only. Range handling moves to Bunny.
-
-## Backend impact
-
-A `BunnyStreamService` (upload, delete, signed-URL minting), a provider branch
-in `videos.service.ts`, playback-URL resolution in `public.service.ts`, and new
-creation/purge paths. The authorization chain must not be altered.
-
-## Admin impact
-
-A new upload path in `CreateVideoModal`, provider display (the label already
-exists), and progress/error handling for a third-party upload.
-
-## Public impact
-
-Ideally **none**: if signed URLs are returned in an existing field, older
-deployed bundles keep working. CSP `media-src` must permit the Bunny pull-zone
-host. Verify against the oldest deployed bundle, not only against `main`.
-
-## Database impact
-
-Likely none structurally — `providerAssetId` and `playbackId` already exist. A
-new satellite table would only be needed for Bunny-specific state. Any change
-needs a migration and an update to [DATA_MODEL.md](../DATA_MODEL.md).
-
-## Environment variables
-
-Reserved and currently **unread**:
-
-| Variable | Intended purpose | Secret |
+| Outcome | When | Public playback |
 |---|---|---|
-| `BUNNY_STREAM_LIBRARY_ID` | Target library | no |
-| `BUNNY_STREAM_API_KEY` | Management API auth | **yes** |
-| `BUNNY_STREAM_PULL_ZONE_HOSTNAME` | Playback host | no |
-| `BUNNY_STREAM_SIGNING_KEY` | Token-authentication signing | **yes** |
+| `bunny` | the **complete** predicate holds | dynamically signed embed URL |
+| `bunny-malformed` | `provider = BUNNY` **and** `sourceType = EMBED`, but the predicate fails | **fails closed** - not publicly playable, stored `embedUrl` never emitted |
+| `not-bunny` | everything else | unchanged existing behaviour |
 
-Per-customer values, per the customer deployment model. Names only in
-documentation, always.
+The complete predicate requires all five of:
 
-## Security considerations
+1. `provider === BUNNY`
+2. `sourceType === EMBED`
+3. a non-empty `providerAssetId` (the Bunny video GUID)
+4. `playbackId` equal to it
+5. `metadataJson.bunnyStream.videoId` equal to it
 
-- **A signed Bunny URL must never become an unauthenticated bypass.** Keep the
-  TTL short and mint it only after full authorization.
-- Bunny URLs will appear in responses and browser history exactly as media URLs
-  do today; the same redaction rules apply.
-- Two new secrets per customer, with their own rotation procedure.
-- The share-link revocation story changes: revocation cannot recall an already
-  minted signed URL, so TTL bounds the exposure — the same trade-off as media
-  grants, and it must be stated explicitly.
-- The upload path introduces outbound calls to a third party: timeouts, retries
-  and partial-failure handling all need deliberate design.
+That is exactly the shape `initBunnyVideoUpload()` writes, so any deviation is a
+hand-edited or tampered record and is treated as malformed.
 
-## Performance considerations
+> **The `bunny-malformed` branch is a security boundary, not a nicety.** Letting
+> such a record fall through to generic embed handling would hand out its stored
+> **unsigned** `iframe.mediadelivery.net` URL, permanently and outside the
+> share-link authorization model.
 
-Origin bandwidth and Node event-loop pressure drop substantially. Watch
-resolution gains a signing step (cheap, local). Upload becomes slower and
-failure-prone in new ways.
+`readBunnyVideoAsset()` is a convenience wrapper returning the reference only
+for `bunny`. It is sufficient for branches where "do nothing" is correct (status
+sync, remote purge) but **not** for public playback, which must distinguish
+`bunny-malformed` from `not-bunny`.
 
-## Migration
+Consequence: a legacy record merely *labelled* `provider: BUNNY` — those are
+`DIRECT_URL` videos with a stored playback URL, creatable through
+`POST /admin/videos` - classifies as `not-bunny` and keeps resolving, playing
+and purging exactly as it does today. The strict fail-closed rule applies only
+to the Bunny EMBED shape.
 
-Existing `LOCAL_FILE` and `DB_BLOB` videos must keep working unchanged.
-Any migration is opt-in, per video, reversible, and must not delete the source
-until the Bunny asset is verified playable.
+## 2. Upload flow
 
-## Backward compatibility
+```
+Admin browser                    bom-media-api                    Bunny
+     │  POST /admin/videos/bunny/upload-init { title, … }
+     │ ─────────────────────────────▶
+     │                                │  POST /library/{id}/videos
+     │                                │ ───────────────────────────▶
+     │                                │ ◀─────────────── { guid, … }
+     │                                │  create VideoAsset (PROCESSING)
+     │ ◀──── { video, upload: TUS credentials } ──────
+     │
+     │  TUS PATCH/POST, bytes only, direct
+     │ ───────────────────────────────────────────────────────────▶
+     │
+     │  POST /admin/videos/:id/bunny/sync   (polled)
+     │ ─────────────────────────────▶
+     │                                │  GET /library/{id}/videos/{guid}
+     │                                │ ───────────────────────────▶
+     │                                │  map status → VideoStatus
+     │ ◀──── { video, bunnyStatus, encodeProgress } ──
+```
 
-The watch response shape must not change. Adding a field is safe; changing the
-meaning of `publicPlaybackUrl` for existing source types is not.
+**Video bytes never pass through this API.** The backend mints short-lived
+credentials and observes state; it does not proxy the upload.
 
-## Rollback
+## 3. Configuration
 
-Provider selection must be per video, so rollback is: stop creating `BUNNY`
-videos, and re-point or restore affected videos to their retained source. This
-is only possible if sources are retained through the transition — a hard
-requirement.
+| Variable | Required | Secret |
+|---|---|---|
+| `BUNNY_STREAM_ENABLED` | no, defaults `false` | no |
+| `BUNNY_STREAM_LIBRARY_ID` | only when enabled; must be numeric | no |
+| `BUNNY_STREAM_API_KEY` | only when enabled | **yes** |
+| `BUNNY_STREAM_TOKEN_SECURITY_KEY` | only when enabled | **yes** |
+| `BUNNY_STREAM_TUS_TTL_SECONDS` | no; default 3600, bounded 300–86400 | no |
+| `BUNNY_STREAM_EMBED_TOKEN_TTL_SECONDS` | no; default 300, bounded 60–3600 | no |
 
-## Observability
+> **A production deployment that has never heard of Bunny still boots.** Nothing
+> is required while `BUNNY_STREAM_ENABLED=false`, which is the default. Proven by
+> `test/bunny-stream.test.ts` → "boots a production configuration with no Bunny
+> variables at all".
 
-New audit actions for Bunny upload/delete, a health signal for provider
-reachability, and clear logging of provider failures **without** logging keys or
-signed URLs.
+An out-of-range TTL **fails at boot** rather than being silently clamped, which
+matches every other bounded value in `env.validation.ts`.
 
-## Acceptance criteria
+`BUNNY_STREAM_PULL_ZONE_HOSTNAME` remains reserved and **unread** — CDN token
+authentication is out of MVP scope (§11). `BUNNY_STREAM_SIGNING_KEY` was a
+placeholder that never had a reader; it is superseded by
+`BUNNY_STREAM_TOKEN_SECURITY_KEY` and has been removed from the templates.
 
-1. A `BUNNY` video can be created, appears in the admin list, and plays through
-   a share link on a customer domain.
-2. Every existing authorization check still applies; removing the
-   `WebsiteVideo` assignment immediately denies playback.
-3. A signed URL expires and stops working at its TTL.
-4. A `LOCAL_FILE` and a `DB_BLOB` video still play, unchanged.
-5. An older deployed public bundle plays a `BUNNY` video without modification.
-6. Purge removes the Bunny asset and the database rows.
-7. No key or signed URL appears in any log.
+## 4. The client — `src/bunny/bunny-stream.service.ts`
 
-## Required tests
+Five operations, nothing more.
 
-Provider service unit tests (mocked HTTP); signing and expiry; the full
-authorization chain for a `BUNNY` video including wrong host, revoked link,
-removed assignment and non-`READY` status; purge; and failure handling when
-Bunny is unreachable.
+| Method | Bunny call |
+|---|---|
+| `createVideo(title)` | `POST https://video.bunnycdn.com/library/{libraryId}/videos` |
+| `getVideo(videoId)` | `GET .../library/{libraryId}/videos/{videoId}` |
+| `deleteVideo(videoId)` | `DELETE .../library/{libraryId}/videos/{videoId}` |
+| `createTusUploadCredentials(videoId)` | none — local signing |
+| `createSignedEmbedUrl(videoId)` | none — local signing |
 
-## Open questions
+Authentication is the `AccessKey: BUNNY_STREAM_API_KEY` header, built at the one
+outbound call site. Requests are bounded by a 15-second timeout. Response bodies
+are never logged.
 
-- One Bunny library per customer, or one library with per-customer collections?
-- Are signed URLs IP-bound? If so, how does that interact with `TRUST_PROXY_*`
-  and mobile networks that change IP mid-playback?
-- Who owns the Bunny account per customer — us or the customer?
-- What is the fallback when Bunny is down: fail closed, or fall back to a
-  retained local source?
-- Does any customer contract require assets to stay on infrastructure we
-  control?
+> **Feature-disabled isolation.** `createVideo`, `getVideo` and `deleteVideo`
+> each call `ensureEnabled()` before reading any configuration, and the single
+> outbound `request()` call site calls it again. No Bunny HTTP request can leave
+> the process while `BUNNY_STREAM_ENABLED=false`, even if stale credentials are
+> still present in the environment.
 
-## Before implementing
+`canSignEmbedUrl()` is a separate, **non-minting** capability check: it reports
+whether a signed embed URL *could* be produced, performing no hashing and
+issuing no token. Public watch resolution uses it to decide playability before
+the authoritative view consumption, which is what keeps signing strictly after
+it (§6).
 
-Read [video-pipeline.md](./video-pipeline.md),
-[SECURITY_MODEL.md](../SECURITY_MODEL.md),
-[API_CONTRACTS.md](../API_CONTRACTS.md),
-[ADR 0004](../adr/0004-hmac-media-grants-for-view-limited-links.md) and
-[ADR 0007](../adr/0007-video-storage-direction.md). Then write a full spec from
-[FEATURE_TEMPLATE.md](./FEATURE_TEMPLATE.md) and have it reviewed. This document
-is context, not a specification.
+### 4.1 TUS signing
+
+```
+signature = SHA256_HEX(libraryId + apiKey + expirationUnixSeconds + videoId)
+endpoint  = https://video.bunnycdn.com/tusupload
+```
+
+`createTusUploadCredentials()` returns exactly five fields — `videoId`,
+`libraryId`, `expirationTime`, `signature`, `tusEndpoint`. **The API key is an
+input to the hash and is never returned.**
+
+### 4.2 Embed signing
+
+```
+token = SHA256_HEX(tokenSecurityKey + videoId + expirationUnixSeconds)
+url   = https://iframe.mediadelivery.net/embed/{libraryId}/{videoId}
+        ?token=<token>&expires=<expirationUnixSeconds>
+```
+
+### 4.3 Status mapping
+
+Bunny status codes, verified against
+`https://bunny.net/docs/reference/video_getvideo`:
+
+| Bunny `status` | Meaning | Local `VideoStatus` |
+|---|---|---|
+| 4 | Finished | `READY` |
+| 5 | Error | `FAILED` |
+| 6 | UploadFailed | `FAILED` |
+| 0, 1, 2, 3, 7, 8, unknown, absent | Created / Uploaded / Processing / **Transcoding** / JitSegmenting / JitPlaylistsCreated | `PROCESSING` |
+
+> **3 is Transcoding, not Finished.** A video in state 3 is still encoding. Only
+> 4 promotes an asset to `READY`.
+
+Transition rules in `syncBunnyVideoStatus()` are deliberately conservative:
+
+- `DISABLED` is never overwritten — that is an administrator's decision.
+- `READY` is never demoted — a published asset must not lose its share links to
+  a transient Bunny read.
+- `DRAFT`, `PROCESSING` and `FAILED` follow Bunny, so a failed upload that is
+  retried can recover to `READY`.
+
+`encodeProgress` is returned for display and **never persisted** — polling must
+not write to the database on every tick. No column was added for it.
+
+## 5. Endpoints
+
+| Endpoint | Roles | Purpose |
+|---|---|---|
+| `POST /admin/videos/bunny/upload-init` | write | Create the Bunny video and the local record; return TUS credentials |
+| `POST /admin/videos/:id/bunny/sync` | write | Read Bunny state and map it onto `VideoStatus` |
+
+Both sit on `VideosController`, so they inherit `AdminAccessTokenGuard`,
+`AdminRolesGuard` and the `admin` throttle profile unchanged. Both return
+`400 "Bunny Stream is not enabled."` when the feature is off.
+
+Full request/response shapes: [../API_CONTRACTS.md](../API_CONTRACTS.md) §2.13.
+
+## 6. Public playback — authorization strictly before signing
+
+> **SECURITY INVARIANT: a signed Bunny embed URL is minted only after the entire
+> existing share-link authorization chain has already passed.**
+
+Watch resolution runs in four ordered stages, and signing is the last:
+
+```
+1. resolve credential / domain / share link / video candidates
+2. every existing authorization check - host normalization -> ACTIVE domain ->
+   ACTIVE website -> share link found WITHIN that website -> status / expiry /
+   maxViews -> ShareLinkVideo membership -> ACTIVE WebsiteVideo assignment ->
+   READY
+3. AUTHORITATIVE ATOMIC CONSUMPTION - incrementShareLinkView(), a conditional
+   UPDATE that re-verifies status, expiry and maxViews and claims the view in
+   one statement
+4. ONLY IF 3 claimed a row: toPublicVideoResponses() serializes and signs
+```
+
+`selectPublicPlayableVideos()` does the stage-2 filtering and **mints nothing** -
+Bunny playability is decided there by `canSignEmbedUrl()`, a pure configuration
+check. `resolvePublicEmbedUrl()` is called only from `toPublicVideoResponses()`,
+in stage 4. There is no other caller and no other path to a signed URL.
+
+Four properties follow, each covered by a test:
+
+1. **Nothing is signed for a denied request.** The signing spy's call count
+   stays at zero for an unknown host, an unknown or missing credential, a
+   revoked link, an expired link, an exhausted view budget, a removed website
+   assignment, and a non-`READY` video.
+2. **Nothing is signed when the consumption itself fails.** A request that
+   passes every earlier check but loses the atomic claim - a concurrent revoke,
+   expiry or `maxViews` exhaustion - returns `INVALID_LINK` having minted
+   nothing. The same holds for a cache hit whose consumption then fails.
+3. **Reloading re-signs.** The public watch cache stores raw video rows, not
+   serialized responses, so a valid cache hit runs the same four stages and
+   mints a **newly signed** URL after its own consumption.
+4. **It fails closed.** If Bunny is disabled or misconfigured,
+   `isPublicPlayableVideo()` drops the video from the response rather than
+   falling back to the stored unsigned URL - and a `bunny-malformed` record is
+   dropped whatever the configuration (§1.1).
+
+The public browser receives the signed URL, its token and its expiry. It never
+receives `BUNNY_STREAM_API_KEY` or `BUNNY_STREAM_TOKEN_SECURITY_KEY`.
+
+### 6.1 What revocation reaches
+
+A signed embed URL is a **short-lived external URL**, so it sits in the same
+category as media grants: revoking the share link stops future watch resolution
+immediately, but cannot recall a URL already handed to a browser. The embed
+token TTL — 5 minutes by default — bounds that exposure. This is a materially
+better position than `DIRECT_URL`, Cloudinary and ordinary `EMBED` URLs, which
+never expire at all ([KNOWN_ISSUES.md KI-015](../KNOWN_ISSUES.md#ki-015)), but it
+is not instant revocation and must not be described as such.
+
+## 7. Public site
+
+The public site renders a Bunny video through the **existing** allowlisted
+iframe path. Three lists had to move together:
+
+| List | Change |
+|---|---|
+| `public_website/assets/app.js` → `ALLOWED_EMBED_HOSTS` | `iframe.mediadelivery.net` added |
+| `public_website/_headers` and `cloudflare-security-headers.txt` → CSP `frame-src` | `https://iframe.mediadelivery.net` added |
+| Backend `VIDEO_EMBED_ALLOWED_HOSTS` | **deliberately unchanged** |
+
+> The backend allowlist governs the generic `POST /admin/videos/embed` path,
+> where an operator pastes a URL that is then stored permanently. Adding the
+> Bunny host there would let an admin store a **permanent unsigned** Bunny embed
+> URL, which is exactly what §6 forbids. Bunny embed URLs are constructed
+> server-side from a fixed constant instead, so the three-way agreement holds in
+> substance: the only Bunny URL the public site can ever be asked to render is
+> one this backend signed.
+
+No public response field was added. The signed URL is returned in the existing
+`embedUrl` field, so an older deployed bundle keeps working as long as it has the
+host in its allowlist and its CSP.
+
+## 8. Admin
+
+`bom-media-admin/src/features/videos/bunnyVideoApi.ts` drives the flow with the
+official `tus-js-client` package: init on the backend, upload direct to
+`https://video.bunnycdn.com/tusupload` with the four Bunny headers, then poll
+`bunny/sync` until Bunny reports a terminal state. Retry delays are
+`[0, 3000, 5000, 10000, 20000, 60000]` ms; resumption uses tus-js-client's
+standard `findPreviousUploads()` / `resumeFromPreviousUpload()`.
+
+> **The default tus-js-client fingerprint is file-oriented and unsafe here.**
+> Two different Bunny videos uploaded from the same local file would share it,
+> so `findPreviousUploads()` could offer video A's upload URL while the admin is
+> uploading video B - the bytes would land on A while the admin polls B, which
+> would sit in `PROCESSING` against the wrong asset. `bunnyTusFingerprint.ts`
+> supplies a custom fingerprint binding the Bunny **library id** and **video
+> id** as well as the file identity, each component percent-encoded and joined
+> with `/`:
+>
+> ```
+> bunny-stream/v1/<libraryId>/<videoId>/<name>/<size>/<type>/<lastModified>
+> ```
+>
+> **Invariant: uploads created for different Bunny `videoId`s can never share a
+> resumable TUS fingerprint.** An interrupted upload of the same file to the
+> *same* video still resumes. `removeFingerprintOnSuccess: true` stops a
+> completed upload from remaining a resumable candidate. No secret is part of a
+> fingerprint - fingerprints are persisted in browser storage.
+>
+> Verified by `yarn smoke:bunny-fingerprint` in `bom-media-admin`.
+
+**No Bunny secret exists in the admin bundle or in any `VITE_*` variable.**
+
+## 9. Delete and purge
+
+Bunny remote deletion is folded into the existing purge flow and inherits every
+safeguard: OWNER-only, `confirmVideoId` must match, no canonical share link, the
+video must already be `DISABLED`, and it must have no `ACTIVE` website
+assignment. Like Cloudinary, it is opt-in through `deleteRemoteAsset: true`.
+
+The Cloudinary and Bunny branches are mutually exclusive and both are gated on
+their own provider check, so no other provider can reach either.
+
+> **A failed Bunny delete is reported as a failure.** `deleteVideo()` resolves
+> `true` only when Bunny confirmed (a 404 counts — the asset is gone either
+> way); anything else propagates. The purge response carries
+> `remote.remoteAssetDeleted: false` and the `VIDEO_PURGE_STORAGE` audit row is
+> written with `AuditStatus.FAIL`. Purge never claims a remote deletion Bunny
+> did not give.
+
+## 10. Failure and orphan handling
+
+Proportional by design; no job system was introduced.
+
+| Failure | Handling |
+|---|---|
+| Bunny create succeeds, local insert fails | Compensating `deleteVideo()` before rethrowing, plus a `VIDEO_BUNNY_UPLOAD_INIT_ORPHAN` audit row recording whether it worked |
+| Local record exists, browser never uploads | The record stays `PROCESSING` and is not publicly playable. **Remaining orphan risk** — see below |
+| TUS upload fails | Same as above; the admin can retry, and tus-js-client resumes |
+| Bunny encoding fails | Sync maps status 5/6 to `FAILED`; a retry can recover to `READY` |
+| Bunny delete fails during purge | Reported truthfully, audited `FAIL` (§9) |
+| Purge requests remote deletion while Bunny is **disabled** | No HTTP request is made; `remote.remoteAssetDeleted` stays `false` and the audit row is `FAIL`. The local row is still purged, so the Bunny asset becomes an orphan an operator must remove |
+| Bunny unreachable | `503 "Bunny Stream is currently unreachable."`; public playback fails closed |
+
+> **Documented remaining orphan risk.** A Bunny video created by
+> `upload-init` whose browser upload never starts leaves a `PROCESSING` local
+> record and an empty Bunny asset. Nothing reaps either automatically. There is
+> no equivalent of `LOCAL_VIDEO_STALE_UPLOAD_MAX_AGE_HOURS` for Bunny in this
+> MVP. Operators can find them by listing videos with `provider=BUNNY` and
+> `status=PROCESSING` older than a reasonable window, and purge them normally
+> (disable first, then purge with `deleteRemoteAsset: true`).
+
+## 11. Explicit MVP scope limits
+
+Not implemented, and not partially implemented:
+
+- Bunny **webhooks**. Status is polled, not pushed.
+- **CDN token authentication** on the pull zone.
+- MediaCage **DRM**.
+- A custom **HLS player**. Playback is the Bunny iframe.
+- **Automatic migration** of existing videos to Bunny.
+- Bunny **collections**, analytics, captions, AI transcription.
+- **Multi-library** management. One library per deployment.
+- Background **queues** for retries or reconciliation.
+- Bunny-sourced **thumbnails** (the pull-zone hostname is unread).
+
+## 12. Tests
+
+`test/bunny-stream.test.ts` (50 tests) and the Bunny section of
+`test/video-purge.test.ts` (7 tests). The Bunny HTTP boundary is mocked by
+replacing `globalThis.fetch`; **no automated test makes a real Bunny request.**
+
+Covered: the disabled path, request construction and the `AccessKey` header, the
+TUS signature formula and its expiry bounds, the absence of the API key from the
+returned credentials, the embed token formula and its expiry bounds, status
+mapping in all three directions, provider isolation across every legacy fixture,
+authorization-before-signing across nine denial paths, re-signing on a cache hit,
+fail-closed behaviour, Bunny-only remote deletion, honest failure reporting, and
+environment validation with and without Bunny values.
+
+These are **not** part of the release-blocking share-link compatibility suite.
+Bunny has no legacy production links to keep compatible; what that suite proves
+about Bunny is the opposite direction — that adding it changed nothing for the
+five existing source types. See
+[../SHARE_LINK_COMPATIBILITY_TESTS.md](../SHARE_LINK_COMPATIBILITY_TESTS.md) §8.
+
+## 13. Related documents
+
+- [video-pipeline.md](./video-pipeline.md) — every source type and provider
+- [../SECURITY_MODEL.md](../SECURITY_MODEL.md) §4.1 — media exposure classes
+- [../API_CONTRACTS.md](../API_CONTRACTS.md) §2.13 — the two endpoints
+- [../ENVIRONMENT.md](../ENVIRONMENT.md) §16 — the variables
+- [../KNOWN_ISSUES.md](../KNOWN_ISSUES.md#ki-015) — provider URL revocation limits

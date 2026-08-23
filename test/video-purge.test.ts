@@ -14,6 +14,7 @@ import {
   VideoSourceType,
   VideoStatus,
 } from "../src/generated/prisma/client";
+import { BunnyStreamService } from "../src/bunny/bunny-stream.service";
 import { LocalVideoStorageService } from "../src/videos/storage/local-video-storage.service";
 import { VideosService } from "../src/videos/videos.service";
 
@@ -22,6 +23,7 @@ type FakeVideoRecord = {
   provider: VideoProvider;
   sourceType: VideoSourceType;
   providerAssetId: string | null;
+  playbackId: string | null;
   thumbnailUrl: string | null;
   metadataJson: unknown;
   status: VideoStatus;
@@ -273,6 +275,7 @@ function createVideo(
     provider: VideoProvider.MANUAL,
     sourceType: VideoSourceType.LOCAL_FILE,
     providerAssetId: null,
+    playbackId: null,
     thumbnailUrl: null,
     metadataJson: null,
     status: VideoStatus.DISABLED,
@@ -309,6 +312,11 @@ function addShareLinkRelation(
 function createVideosService(params?: {
   prisma?: FakePrismaService;
   localStorage?: FakeLocalStorageService;
+  /**
+   * Optional Bunny collaborator. Omitted by every legacy purge test, which is
+   * itself the proof that no legacy purge path needs one.
+   */
+  bunnyStream?: unknown;
 }): {
   prisma: FakePrismaService;
   localStorage: FakeLocalStorageService;
@@ -322,6 +330,8 @@ function createVideosService(params?: {
     new FakeConfigService() as never,
     {} as never,
     localStorage as never,
+    undefined,
+    params?.bunnyStream as never,
   );
 
   return { prisma, localStorage, service };
@@ -594,5 +604,334 @@ describe("LocalVideoStorageService delete safety", () => {
     assert.equal(deleted, false);
     assert.equal(await readFile(outsidePath, "utf8"), "keep");
     await rm(outsidePath, { force: true });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Bunny Stream purge
+ *
+ * PROVIDER ISOLATION. The Bunny delete branch must fire for Bunny-backed
+ * assets and for nothing else, and it must never report a success Bunny did
+ * not give.
+ * ------------------------------------------------------------------ */
+
+const BUNNY_GUID = "11111111-2222-3333-4444-555555555555";
+
+function createBunnyStreamStub(
+  options: { result?: boolean; throws?: boolean } = {},
+) {
+  const stub = {
+    deletedVideoIds: [] as string[],
+    async deleteVideo(videoId: string): Promise<boolean> {
+      stub.deletedVideoIds.push(videoId);
+
+      if (options.throws === true) {
+        throw new Error("bunny unreachable");
+      }
+
+      return options.result ?? true;
+    },
+  };
+
+  return stub;
+}
+
+function createBunnyVideo(
+  overrides: Partial<FakeVideoRecord> = {},
+): FakeVideoRecord {
+  return createVideo({
+    id: "video-bunny",
+    provider: VideoProvider.BUNNY,
+    sourceType: VideoSourceType.EMBED,
+    providerAssetId: BUNNY_GUID,
+    playbackId: BUNNY_GUID,
+    metadataJson: {
+      bunnyStream: { videoId: BUNNY_GUID, libraryId: "987654" },
+    },
+    localFileAsset: null,
+    localThumbnailAsset: null,
+    ...overrides,
+  });
+}
+
+describe("VideosService purge — Bunny Stream", () => {
+  it("deletes the Bunny asset when remote deletion is requested", async () => {
+    const bunnyStream = createBunnyStreamStub();
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+      "admin-1",
+    );
+
+    assert.deepEqual(bunnyStream.deletedVideoIds, [BUNNY_GUID]);
+    assert.equal(response.remote.remoteAssetDeleteAttempted, true);
+    assert.equal(response.remote.remoteAssetDeleted, true);
+    assert.deepEqual(prisma.deletedVideoIds, ["video-bunny"]);
+  });
+
+  it("leaves the Bunny asset alone when remote deletion is not requested", async () => {
+    const bunnyStream = createBunnyStreamStub();
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny" },
+      "admin-1",
+    );
+
+    assert.deepEqual(bunnyStream.deletedVideoIds, []);
+    assert.equal(response.remote.remoteAssetDeleteAttempted, false);
+    assert.equal(response.remote.remoteAssetDeleted, false);
+  });
+
+  it("reports the failure instead of claiming Bunny deleted the asset", async () => {
+    const bunnyStream = createBunnyStreamStub({ result: false });
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+      "admin-1",
+    );
+
+    assert.equal(response.remote.remoteAssetDeleteAttempted, true);
+    assert.equal(response.remote.remoteAssetDeleted, false);
+
+    const storageAudit = prisma.audits.find(
+      (audit) => audit.action === "VIDEO_PURGE_STORAGE",
+    );
+    assert.equal(storageAudit?.status, AuditStatus.FAIL);
+  });
+
+  it("reports the failure when Bunny throws rather than answering", async () => {
+    const bunnyStream = createBunnyStreamStub({ throws: true });
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+      "admin-1",
+    );
+
+    assert.equal(response.remote.remoteAssetDeleted, false);
+    assert.equal(
+      prisma.audits.find((audit) => audit.action === "VIDEO_PURGE_STORAGE")
+        ?.status,
+      AuditStatus.FAIL,
+    );
+  });
+
+  it("never calls Bunny for a non-Bunny asset, whatever the provider", async () => {
+    for (const video of [
+      createVideo({ id: "video-local" }),
+      createVideo({
+        id: "video-cloudinary",
+        provider: VideoProvider.CLOUDINARY,
+        sourceType: VideoSourceType.UPLOAD,
+        providerAssetId: "cloud/asset",
+        localFileAsset: null,
+        localThumbnailAsset: null,
+      }),
+      createVideo({
+        id: "video-embed",
+        sourceType: VideoSourceType.EMBED,
+        localFileAsset: null,
+        localThumbnailAsset: null,
+      }),
+      // Labelled BUNNY but carrying no marker: a legacy DIRECT_URL record.
+      createVideo({
+        id: "video-legacy-bunny-label",
+        provider: VideoProvider.BUNNY,
+        sourceType: VideoSourceType.DIRECT_URL,
+        localFileAsset: null,
+        localThumbnailAsset: null,
+      }),
+    ]) {
+      const bunnyStream = createBunnyStreamStub();
+      const { prisma, service } = createVideosService({ bunnyStream });
+      prisma.videos.set(video.id, video);
+
+      await service.purgeVideo(
+        video.id,
+        { confirmVideoId: video.id, deleteRemoteAsset: true },
+        "admin-1",
+      );
+
+      assert.deepEqual(
+        bunnyStream.deletedVideoIds,
+        [],
+        `${video.id} must not reach the Bunny delete branch`,
+      );
+    }
+  });
+
+  it("still respects every existing purge safeguard for a Bunny asset", async () => {
+    const bunnyStream = createBunnyStreamStub();
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set(
+      "video-bunny",
+      createBunnyVideo({ status: VideoStatus.READY }),
+    );
+
+    await assert.rejects(
+      service.purgeVideo(
+        "video-bunny",
+        { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+        "admin-1",
+      ),
+      BadRequestException,
+    );
+    assert.deepEqual(bunnyStream.deletedVideoIds, []);
+    assert.deepEqual(prisma.deletedVideoIds, []);
+  });
+
+  it("refuses to purge a Bunny asset that is still assigned to an active website", async () => {
+    const bunnyStream = createBunnyStreamStub();
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+    prisma.websiteVideos.push({
+      videoId: "video-bunny",
+      status: AssignmentStatus.ACTIVE,
+    });
+
+    await assert.rejects(
+      service.purgeVideo(
+        "video-bunny",
+        { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+        "admin-1",
+      ),
+      BadRequestException,
+    );
+    assert.deepEqual(bunnyStream.deletedVideoIds, []);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * BLOCKER 3 — purge must not reach Bunny while the feature is disabled
+ *
+ * These drive the REAL `BunnyStreamService` (not a stub) with
+ * `BUNNY_STREAM_ENABLED=false` and a `globalThis.fetch` spy, so "no network
+ * request" is proved rather than assumed.
+ * ------------------------------------------------------------------ */
+
+class DisabledBunnyConfigService {
+  constructor(private readonly values: Record<string, string | undefined>) {}
+
+  get<T = string>(key: string): T | undefined {
+    return this.values[key] as T | undefined;
+  }
+}
+
+describe("VideosService purge — Bunny disabled", () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls: string[] = [];
+
+  beforeEach(() => {
+    fetchCalls = [];
+    globalThis.fetch = (async (input: string | URL) => {
+      fetchCalls.push(String(input));
+      return { ok: true, status: 200, json: async () => ({}) } as Response;
+    }) as typeof fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("makes no Bunny request and does not claim the remote asset was deleted", async () => {
+    // Credentials are deliberately present: the gate must be the ENABLED flag,
+    // not the absence of configuration.
+    const bunnyStream = new BunnyStreamService(
+      new DisabledBunnyConfigService({
+        BUNNY_STREAM_ENABLED: "false",
+        BUNNY_STREAM_LIBRARY_ID: "987654",
+        BUNNY_STREAM_API_KEY: "purge-test-api-key",
+        BUNNY_STREAM_TOKEN_SECURITY_KEY: "purge-test-token-security-key",
+      }) as never,
+    );
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set("video-bunny", createBunnyVideo());
+
+    const response = await service.purgeVideo(
+      "video-bunny",
+      { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+      "admin-1",
+    );
+
+    assert.deepEqual(fetchCalls, [], "no Bunny HTTP request may be issued");
+    assert.notEqual(
+      response.remote.remoteAssetDeleted,
+      true,
+      "a disabled deployment must never claim remote deletion succeeded",
+    );
+    assert.equal(response.remote.remoteAssetDeleteAttempted, true);
+    assert.equal(
+      prisma.audits.find((audit) => audit.action === "VIDEO_PURGE_STORAGE")
+        ?.status,
+      AuditStatus.FAIL,
+      "the existing purge convention must record the cleanup failure",
+    );
+    // The database row is still purged; only the remote cleanup failed.
+    assert.deepEqual(prisma.deletedVideoIds, ["video-bunny"]);
+  });
+
+  it("still enforces every purge safeguard while Bunny is disabled", async () => {
+    const bunnyStream = new BunnyStreamService(
+      new DisabledBunnyConfigService({
+        BUNNY_STREAM_ENABLED: "false",
+      }) as never,
+    );
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set(
+      "video-bunny",
+      createBunnyVideo({ status: VideoStatus.READY }),
+    );
+
+    await assert.rejects(
+      service.purgeVideo(
+        "video-bunny",
+        { confirmVideoId: "video-bunny", deleteRemoteAsset: true },
+        "admin-1",
+      ),
+      BadRequestException,
+    );
+    assert.deepEqual(fetchCalls, []);
+    assert.deepEqual(prisma.deletedVideoIds, []);
+  });
+
+  it("leaves legacy provider purge behaviour untouched while Bunny is disabled", async () => {
+    const bunnyStream = new BunnyStreamService(
+      new DisabledBunnyConfigService({
+        BUNNY_STREAM_ENABLED: "false",
+      }) as never,
+    );
+    const { prisma, service } = createVideosService({ bunnyStream });
+    prisma.videos.set(
+      "video-cloudinary",
+      createVideo({
+        id: "video-cloudinary",
+        provider: VideoProvider.CLOUDINARY,
+        sourceType: VideoSourceType.UPLOAD,
+        providerAssetId: "cloud/asset",
+        localFileAsset: null,
+        localThumbnailAsset: null,
+      }),
+    );
+
+    const response = await service.purgeVideo(
+      "video-cloudinary",
+      { confirmVideoId: "video-cloudinary", deleteRemoteAsset: true },
+      "admin-1",
+    );
+
+    // FakeCloudinaryService confirms the delete, unaffected by the Bunny gate.
+    assert.equal(response.remote.remoteAssetDeleted, true);
+    assert.deepEqual(fetchCalls, []);
   });
 });

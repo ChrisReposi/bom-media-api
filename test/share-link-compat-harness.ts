@@ -181,6 +181,18 @@ export type CompatVideo = {
    */
   provider: VideoProvider;
   sourceType: VideoSourceType;
+  /**
+   * Provider-specific remote id. Legacy fixtures leave it null; the Bunny
+   * fixture carries the Bunny video GUID, which is what `readBunnyVideoAsset`
+   * matches against the `metadataJson` marker.
+   */
+  providerAssetId: string | null;
+  /**
+   * Part of the Bunny identification predicate. Legacy fixtures leave it null;
+   * the Bunny fixture carries the same GUID as `providerAssetId`.
+   */
+  playbackId: string | null;
+  metadataJson: unknown;
   playbackUrl: string | null;
   embedUrl: string | null;
   embedProvider: EmbedProvider | null;
@@ -265,6 +277,9 @@ function baseVideo(overrides: Partial<CompatVideo> = {}): CompatVideo {
     description: null,
     provider: VideoProvider.MANUAL,
     sourceType: VideoSourceType.DIRECT_URL,
+    providerAssetId: null,
+    playbackId: null,
+    metadataJson: null,
     playbackUrl: "https://media.example.com/legacy/video.mp4",
     embedUrl: null,
     embedProvider: null,
@@ -406,6 +421,61 @@ export function cloudinaryEmbedVideo(
     embedAllow: "autoplay; fullscreen; encrypted-media; picture-in-picture",
     thumbnailUrl:
       "https://res.cloudinary.com/demo-cloud/video/upload/so_0/legacy/asset.jpg",
+    ...overrides,
+  });
+}
+
+/**
+ * A Bunny Stream backed asset: `provider=BUNNY`, `sourceType=EMBED`,
+ * `embedProvider=GENERIC_IFRAME`, the Bunny GUID in `providerAssetId`, and the
+ * `bunnyStream` marker in `metadataJson`. This is exactly the shape
+ * `initBunnyVideoUpload()` writes.
+ *
+ * The stored `embedUrl` is deliberately UNSIGNED. Any test that sees it in a
+ * public response has caught a signing bypass.
+ */
+export const BUNNY_LIBRARY_ID = "987654";
+export const BUNNY_VIDEO_GUID = "11111111-2222-3333-4444-555555555555";
+export const BUNNY_UNSIGNED_EMBED_URL = `https://iframe.mediadelivery.net/embed/${BUNNY_LIBRARY_ID}/${BUNNY_VIDEO_GUID}`;
+
+export function bunnyStreamVideo(
+  overrides: Partial<CompatVideo> = {},
+): CompatVideo {
+  return baseVideo({
+    id: "video-bunny-stream",
+    provider: VideoProvider.BUNNY,
+    sourceType: VideoSourceType.EMBED,
+    providerAssetId: BUNNY_VIDEO_GUID,
+    playbackId: BUNNY_VIDEO_GUID,
+    metadataJson: {
+      bunnyStream: {
+        videoId: BUNNY_VIDEO_GUID,
+        libraryId: BUNNY_LIBRARY_ID,
+        createdAt: "2026-01-15T00:00:00.000Z",
+      },
+    },
+    playbackUrl: null,
+    embedUrl: BUNNY_UNSIGNED_EMBED_URL,
+    embedProvider: EmbedProvider.GENERIC_IFRAME,
+    embedAllow: "autoplay; fullscreen; encrypted-media; picture-in-picture",
+    thumbnailUrl: null,
+    ...overrides,
+  });
+}
+
+/**
+ * A legacy record merely *labelled* `provider: BUNNY`: an ordinary
+ * `DIRECT_URL` video with a stored playback URL and no Bunny marker. It must
+ * keep resolving exactly as it does today, untouched by any Bunny branch.
+ */
+export function legacyLabelledBunnyVideo(
+  overrides: Partial<CompatVideo> = {},
+): CompatVideo {
+  return baseVideo({
+    id: "video-legacy-bunny-label",
+    provider: VideoProvider.BUNNY,
+    sourceType: VideoSourceType.DIRECT_URL,
+    playbackUrl: "https://media.example.com/legacy/bunny-labelled.mp4",
     ...overrides,
   });
 }
@@ -609,7 +679,12 @@ export class CompatPrismaService {
   private projectShareLinkVideos(
     record: CompatShareLink,
     query: ShareLinkVideosQuery | undefined,
-  ): Array<{ id: string; sortOrder: number; videoId: string; video?: unknown }> {
+  ): Array<{
+    id: string;
+    sortOrder: number;
+    videoId: string;
+    video?: unknown;
+  }> {
     // Physical row order, exactly as the rows sit in the fixture.
     let rows = [...record.shareLinkVideos];
     const where = query?.where;
@@ -701,9 +776,7 @@ export class CompatPrismaService {
 
   website = {
     findUnique: async (args: { where: { id: string } }) => {
-      const website = this.websites.find(
-        (entry) => entry.id === args.where.id,
-      );
+      const website = this.websites.find((entry) => entry.id === args.where.id);
 
       return website === undefined ? null : { ...website };
     },
@@ -811,7 +884,13 @@ export class CompatPrismaService {
         };
         video.websiteVideos.push(created);
 
-        return { ...created, isFeatured: false, createdAt: FIXTURE_DATE, updatedAt: FIXTURE_DATE, video };
+        return {
+          ...created,
+          isFeatured: false,
+          createdAt: FIXTURE_DATE,
+          updatedAt: FIXTURE_DATE,
+          video,
+        };
       }
 
       existing.status = args.update.status ?? AssignmentStatus.ACTIVE;
@@ -936,7 +1015,10 @@ export class CompatPrismaService {
       const memberVideoId = args.where.shareLinkVideos?.some?.videoId;
       let count = 0;
       for (const link of this.shareLinks) {
-        if (args.where.status !== undefined && link.status !== args.where.status) {
+        if (
+          args.where.status !== undefined &&
+          link.status !== args.where.status
+        ) {
           continue;
         }
         if (
@@ -1267,6 +1349,11 @@ export type CompatHarnessOptions = {
   memoryCache?: boolean;
   pepper?: string;
   localVideoStorage?: unknown;
+  /**
+   * Optional Bunny collaborator. Left undefined by every legacy suite, which is
+   * itself the proof that no legacy path needs one.
+   */
+  bunnyStream?: unknown;
 };
 
 export function createCompatHarness(
@@ -1305,6 +1392,7 @@ export function createCompatHarness(
     new StubVideoViewGrowthService() as never,
     grants,
     memoryCache,
+    options.bunnyStream as never,
   );
   const adminWebsites = new AdminWebsitesService(
     prisma as never,

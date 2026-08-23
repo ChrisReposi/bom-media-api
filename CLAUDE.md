@@ -1,7 +1,7 @@
 # CLAUDE.md — bom-media-api
 
 Status: CURRENT
-Last verified: 2026-08-21
+Last verified: 2026-08-23
 Verified against: `package.json`, `src/**`, `prisma/schema.prisma`, `.github/workflows/ci.yml`
 
 ## What this repository is
@@ -31,9 +31,11 @@ Nothing else is allowed to write to the database.
    when its `WebsiteVideo` assignment is `ACTIVE` for the website resolved from
    the request `host`, and the share link is `ACTIVE`. This governs
    **backend-served** media only — `DIRECT_URL`, Cloudinary and `EMBED` URLs are
-   handed to the browser verbatim and cannot be revoked. See
-   @docs/SECURITY_MODEL.md sections 4.1 and 4.2 before writing anything about
-   media revocation.
+   handed to the browser verbatim and cannot be revoked. A **Bunny-backed**
+   `EMBED` is the one middle case: its URL is signed per request and expires on
+   its own short TTL, which bounds but does not eliminate that exposure. See
+   @docs/SECURITY_MODEL.md sections 4.1, 4.1.1 and 4.2 before writing anything
+   about media revocation.
 6. **Yarn only.** Never create `package-lock.json` or `pnpm-lock.yaml`.
 7. **Prefer status/soft-disable over hard delete** for websites, domains, share
    links and videos. Permanent deletes must stay guarded, confirmed and audited.
@@ -54,6 +56,7 @@ Nothing else is allowed to write to the database.
 | Logging, health, audit/access logs               | @docs/OBSERVABILITY.md                   |
 | Before assuming something is broken              | @docs/KNOWN_ISSUES.md                    |
 | Video sources/providers                          | @docs/features/video-pipeline.md         |
+| Bunny Stream provider                            | @docs/features/bunny-stream.md           |
 | Share links end to end                           | @docs/features/share-links.md            |
 | Cross-repo behaviour                             | `../project-docs/SYSTEM_ARCHITECTURE.md` |
 
@@ -150,10 +153,13 @@ build pass. The COMPAT-ID map and the failure policy are in
 
 - Do not refactor unrelated modules, upgrade dependencies, or reformat files you
   did not otherwise change.
-- Do not implement Bunny Stream. **No Bunny-specific integration exists** — the
-  enum member is persistable and plays back generically, but there is no
-  service, client, upload, webhook, signing or purge support (see
-  @docs/features/bunny-stream.md, status PLANNED).
+- Bunny Stream is implemented as an **MVP** (@docs/features/bunny-stream.md,
+  status CURRENT). Present: a client, admin TUS upload initiation, status sync,
+  short-lived signed embed playback, and remote purge. **Deliberately absent:**
+  webhooks, CDN token authentication, DRM, a custom HLS player, automatic
+  migration of legacy videos, collections, analytics, captions and multi-library
+  support. Do not add any of those without an explicit instruction, and do not
+  describe them as present.
 - If a fix needs a change in `bom-media-admin` or `public_website`, state it;
   do not edit those repos from here.
 

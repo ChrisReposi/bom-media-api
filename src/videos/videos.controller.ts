@@ -61,6 +61,7 @@ import { CreateEmbedVideoDto } from "./dto/create-embed-video.dto";
 import { CreateManualVideoWithThumbnailDto } from "./dto/create-manual-video-with-thumbnail.dto";
 import { CreateVideoDto } from "./dto/create-video.dto";
 import { CompleteLocalVideoUploadDto } from "./dto/complete-local-video-upload.dto";
+import { InitBunnyVideoUploadDto } from "./dto/init-bunny-video-upload.dto";
 import { InitLocalVideoUploadDto } from "./dto/init-local-video-upload.dto";
 import { ListVideosQueryDto } from "./dto/list-videos-query.dto";
 import { PurgeVideoDto } from "./dto/purge-video.dto";
@@ -73,9 +74,11 @@ import { UploadVideoDto } from "./dto/upload-video.dto";
 import {
   CancelLocalVideoUploadResponse,
   DisableVideoResponse,
+  InitBunnyVideoUploadResponse,
   InitLocalVideoUploadResponse,
   LocalVideoChunkUploadResponse,
   PurgeVideoResponse,
+  SyncBunnyVideoStatusResponse,
   VideoUploadSessionResponse,
   VideoListResponse,
   VideoResponse,
@@ -531,6 +534,28 @@ export class VideosController {
     return this.videosService.cancelLocalVideoUpload(uploadId, admin.id);
   }
 
+  @Post("bunny/upload-init")
+  @AdminWriteRoles()
+  @ApiOperation({
+    summary: "Initialize a Bunny Stream direct upload",
+    description:
+      "Creates the remote Bunny video, records a non-ready local VideoAsset carrying the Bunny GUID, and returns short-lived TUS credentials. The response never contains the Bunny API key. Video bytes go browser to Bunny and never pass through this API.",
+  })
+  @ApiCreatedResponse({ type: InitBunnyVideoUploadResponse })
+  @ApiBadRequestResponse({
+    description:
+      "Bunny Stream is disabled, or the request body failed validation.",
+  })
+  @ApiUnauthorizedResponse({
+    description: "Missing, invalid, expired, or inactive access token.",
+  })
+  initBunnyVideoUpload(
+    @Body() dto: InitBunnyVideoUploadDto,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<InitBunnyVideoUploadResponse> {
+    return this.videosService.initBunnyVideoUpload(dto, admin.id);
+  }
+
   @Get(":id")
   @AdminReadRoles()
   @ApiOperation({ summary: "Get admin video detail" })
@@ -940,6 +965,30 @@ export class VideosController {
     @CurrentAdmin() admin: SafeAdminResponse,
   ): Promise<VideoResponse> {
     return this.videosService.updateVideo(id, dto, admin.id);
+  }
+
+  @Post(":id/bunny/sync")
+  @AdminWriteRoles()
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: "Synchronize a Bunny Stream video status",
+    description:
+      "Reads the Bunny encoding state for a Bunny-backed video and maps it onto the local VideoStatus. Bunny status 4 (Finished) promotes a non-ready asset to READY; 5 and 6 map to FAILED. DISABLED and READY are never overwritten. encodeProgress is returned for display only and is not persisted.",
+  })
+  @ApiOkResponse({ type: SyncBunnyVideoStatusResponse })
+  @ApiBadRequestResponse({
+    description:
+      "Bunny Stream is disabled, or the video is not backed by Bunny Stream.",
+  })
+  @ApiUnauthorizedResponse({
+    description: "Missing, invalid, expired, or inactive access token.",
+  })
+  @ApiNotFoundResponse({ description: "Video not found." })
+  syncBunnyVideoStatus(
+    @Param("id") id: string,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<SyncBunnyVideoStatusResponse> {
+    return this.videosService.syncBunnyVideoStatus(id, admin.id);
   }
 
   @Delete(":id")

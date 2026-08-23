@@ -1,7 +1,7 @@
 # Testing
 
 Status: CURRENT
-Last verified: 2026-08-22
+Last verified: 2026-08-23
 Verified against: `package.json`, `test/`, `scripts/test/`, `.github/workflows/ci.yml`, and a full local run on 2026-08-21
 
 ## 1. Test stack
@@ -44,7 +44,8 @@ gitignored); `yarn build` does it for you.
 
 ## 3. What is covered
 
-34 suites, 340 tests as of 2026-08-22. Grouped by concern:
+34 `test/*.test.ts` files, 423 tests as of 2026-08-23 (counted with
+`ls test/*.test.ts | wc -l` and the runner summary). Grouped by concern:
 
 | Area | Suites |
 |---|---|
@@ -53,6 +54,7 @@ gitignored); `yarn build` does it for you.
 | **Share-link compatibility** | `share-link-compat-resolution`, `share-link-compat-providers`, `share-link-compat-media-delivery`, `share-link-compat-http`, `share-link-compat-cache-grants`, `share-link-compat-routes` — **release-blocking**, see [SHARE_LINK_COMPATIBILITY_TESTS.md](./SHARE_LINK_COMPATIBILITY_TESTS.md) |
 | Public watch | `public-watch-exchange`, `public-local-thumbnail` |
 | Videos | `admin-video-search`, `video-purge`, `video-view-growth`, `database-video-checksum`, `upload-concurrency` |
+| Bunny Stream | `bunny-stream` — config gate, request construction, TUS and embed signing, status mapping, provider isolation, **signing strictly after atomic view consumption**, **fail-closed classification of the Bunny EMBED shape**, and **feature-disabled network isolation**. The Bunny HTTP boundary is mocked; **no test makes a real Bunny request** |
 | Website assignment | `website-video-assignment`, `website-video-bulk-assignment` |
 | Storage | `local-video-storage` |
 | Infrastructure | `memory-cache`, `admin-websites-cache`, `global-exception-filter`, `safe-database-error-context`, `release-identity` |
@@ -75,6 +77,9 @@ Be explicit about this when planning work:
 - No contract tests between the backend and either frontend. Contract drift is
   caught only by review against [API_CONTRACTS.md](./API_CONTRACTS.md).
 - No tests for Cloudinary upload paths (the SDK is not stubbed end-to-end).
+- No test performs a real Bunny Stream network call. `test/bunny-stream.test.ts`
+  replaces `globalThis.fetch`, so Bunny request construction is verified but
+  Bunny itself is not. Confirm a real upload manually before a Bunny rollout.
 - No load tests. Range behaviour is covered (`share-link-compat-media-delivery`
   drives the real storage service and the real controller) but not under
   concurrency.
@@ -285,7 +290,7 @@ Windows 11, Node 22.22.0, Yarn 1.22.22, after `yarn install --frozen-lockfile`.
 | `yarn prisma validate` | **PASS** | Schema valid |
 | `yarn typecheck` | **PASS** | |
 | `yarn lint` | **PASS** | 0 errors, 92 warnings (all `consistent-type-imports`); the script sets no `--max-warnings` |
-| `yarn test` | **FAIL (environmental)** | 339/340 pass. `local-video-storage.test.ts` → "rejects symlink components and file targets under the storage root" fails with `EPERM: operation not permitted, symlink`. Creating symlinks on Windows needs elevation or Developer Mode; this passes on the Linux CI runner |
+| `yarn test` | **FAIL (environmental)** | 339/340 pass. `local-video-storage.test.ts` → "rejects symlink components and file targets under the storage root" fails with `EPERM: operation not permitted, symlink`. Creating symlinks on Windows needs elevation or Developer Mode; this passes on the Linux CI runner. Re-confirmed 2026-08-23 at 422/423 after the Bunny Stream suites and the targeted-review corrections were added — the same single failure |
 | `yarn build` | **PASS** | |
 | `yarn format:check` | **FAIL (environmental)** | 152 files flagged. Cause: `git config core.autocrlf=true` checks files out with CRLF while Prettier defaults to `endOfLine: "lf"`. Proven by `npx prettier --end-of-line auto --check src/main.ts` → "All matched files use Prettier code style!". No source formatting drift exists |
 

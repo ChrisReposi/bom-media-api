@@ -128,7 +128,7 @@ CanonicalVideoShareLink ─1:1─ ShareLink
 |---|---|---|
 | `AdminRole` | `OWNER`, `ADMIN`, `STAFF` | Enforced by `AdminRolesGuard` |
 | `AccountStatus` | `ACTIVE`, `DISABLED` | Used by `AdminUser` |
-| `VideoProvider` | `MANUAL`, `BUNNY`, `MUX`, `CLOUDINARY` | **Only `MANUAL` and `CLOUDINARY` have code.** `BUNNY` and `MUX` are `PLANNED` placeholders |
+| `VideoProvider` | `MANUAL`, `BUNNY`, `MUX`, `CLOUDINARY` | `MANUAL`, `CLOUDINARY` and `BUNNY` have code. `MUX` is a `PLANNED` placeholder. A Bunny-backed asset is `provider=BUNNY` + `sourceType=EMBED` + a `metadataJson.bunnyStream` marker; a record merely *labelled* `BUNNY` is an ordinary `DIRECT_URL` video and is untouched by every Bunny branch — see [features/bunny-stream.md](./features/bunny-stream.md) §1.1 |
 | `VideoSourceType` | `UPLOAD`, `DIRECT_URL`, `EMBED`, `DB_BLOB`, `LOCAL_FILE` | All implemented; see [features/video-pipeline.md](./features/video-pipeline.md) |
 | `VideoStatus` | `DRAFT`, `PROCESSING`, `READY`, `FAILED`, `DISABLED` | Only `READY` is publicly playable |
 | `VideoUploadSessionStatus` | `ACTIVE`, `COMPLETING`, `COMPLETED`, `ABORTED`, `EXPIRED`, `FAILED` | Chunked upload lifecycle |
@@ -155,7 +155,13 @@ CanonicalVideoShareLink ─1:1─ ShareLink
 
 Permanent video deletion goes through `POST /admin/videos/:id/purge`
 (OWNER only, requires `confirmVideoId` to equal the id, audited, optionally
-deletes the remote Cloudinary asset).
+deletes the remote Cloudinary **or** Bunny Stream asset — the two branches are
+mutually exclusive and each is gated on its own provider check).
+
+> **Bunny Stream needed no schema change.** It reuses `provider`,
+> `sourceType`, `providerAssetId`, `playbackId`, `embedProvider`, `embedUrl`,
+> `metadataJson` and `status`. No migration was added for it, and no column
+> exists for transient encode progress.
 
 ## 7. Indexing
 

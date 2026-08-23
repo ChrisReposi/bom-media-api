@@ -150,12 +150,21 @@ response shaping; (4) contract compatibility — does this break
 (5) migration safety; (6) documentation drift.
 
 Flag any change that documents planned behaviour as if it already exists.
-**No Bunny-specific integration exists** — no service, API client, TUS upload,
-webhook, signed playback, metadata sync or provider-specific purge. The enum
-member is persistable and plays back generically; see
-`docs/features/bunny-stream.md` for the exact CURRENT vs NOT IMPLEMENTED split.
-Treat both "Bunny is implemented" and "Bunny has zero code paths" as
-inaccurate.
+
+**Bunny Stream is an MVP, not a complete integration.** Present since
+2026-08-23: `src/bunny/**` (create/get/delete, TUS signing, embed signing),
+`POST /admin/videos/bunny/upload-init`, `POST /admin/videos/:id/bunny/sync`,
+short-lived signed embed playback in `PublicService`, and Bunny-only remote
+purge. **Absent by design:** webhooks, CDN token authentication, DRM, a custom
+HLS player, automatic migration of legacy videos, collections, analytics,
+captions, multi-library support and background queues. See
+`docs/features/bunny-stream.md` for the exact split, and treat both "Bunny is
+fully integrated" and "Bunny has no implementation" as inaccurate.
+
+When reviewing a Bunny change, check specifically that: a signed embed URL is
+minted only after the full public authorization chain, `readBunnyVideoAsset()`
+still gates every Bunny branch so no other provider is affected, and neither
+Bunny secret can reach a response, a log line or the admin bundle.
 
 ## Reporting tests
 

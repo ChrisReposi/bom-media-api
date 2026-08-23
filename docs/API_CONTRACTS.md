@@ -1,7 +1,7 @@
 # API Contracts
 
 Status: CURRENT
-Last verified: 2026-08-21
+Last verified: 2026-08-23
 Verified against: all `src/**/*.controller.ts`, `src/**/dto/*.ts`, `src/**/types/*.ts`, and the consuming code in `../bom-media-admin/src/features/**` and `../public_website/assets/app.js`
 
 Base URL: `{origin}/api/v1` (`API_PREFIX`). Interactive schema at `/docs` when
@@ -47,6 +47,8 @@ Swagger is enabled — this document exists to record **who consumes what** and
 | `/admin/videos/upload` | POST | access token | write | — (Cloudinary) |
 | `/admin/videos/upload-db` | POST | access token | write | — |
 | `/admin/videos/upload-local/*` | POST/GET | access token | write / read | **A** |
+| `/admin/videos/bunny/upload-init` | POST | access token | write | **A** |
+| `/admin/videos/:id/bunny/sync` | POST | access token | write | **A** |
 | `/admin/videos/:id/binary`, `/:id/thumbnail-local` | PATCH | access token | write | **A** |
 | `/admin/videos/:id/purge` | POST | access token | **OWNER** | **A** |
 | `/admin/websites*`, `/admin/domains*`, `/admin/domain-groups*` | various | access token | read / write | **A** |
@@ -185,6 +187,7 @@ server-side for `ADMIN_VIDEOS_LIST_CACHE_TTL_SECONDS`.
 | `POST /admin/videos/embed-with-thumbnail` | multipart | same + thumbnail |
 | `POST /admin/videos/upload` | multipart `file` | `sourceType: UPLOAD`, `provider: CLOUDINARY` |
 | `POST /admin/videos/upload-db` | multipart `file` | `sourceType: DB_BLOB`; `400` when `VIDEO_DB_STORAGE_ENABLED` is false |
+| `POST /admin/videos/bunny/upload-init` | JSON `InitBunnyVideoUploadDto` | `sourceType: EMBED`, `provider: BUNNY`, `status: PROCESSING`; `400` when `BUNNY_STREAM_ENABLED` is false. See section 2.13 |
 
 Embed URLs are validated against `VIDEO_EMBED_ALLOWED_HOSTS`; the resulting
 `embedAllow` defaults to `VIDEO_EMBED_DEFAULT_ALLOW`.
@@ -346,6 +349,57 @@ The response reports what actually happened, including orphans:
 > just the status. A `VIDEO_PURGE_STORAGE` audit row is written with
 > `AuditStatus.FAIL` in that case.
 
+### 2.13 Bunny Stream
+
+Two endpoints, both write-role, both on `VideosController` so they inherit the
+existing guards and the `admin` throttle profile. Both return
+`400 "Bunny Stream is not enabled."` while `BUNNY_STREAM_ENABLED=false`.
+
+```jsonc
+// POST /admin/videos/bunny/upload-init
+// request - only `title` is required
+{ "title": "string(<=200)", "description"?, "slug"?, "viewCount"?, "publishedAt"?, "filterKey"? }
+
+// 201
+{ "message": "Bunny Stream upload initialized.",
+  "video": VideoResponse,               // provider BUNNY, sourceType EMBED, status PROCESSING
+  "upload": {                           // short-lived TUS credentials
+    "videoId":        "<bunny guid>",
+    "libraryId":      "<numeric library id>",
+    "expirationTime": 1781000000,       // UNIX seconds
+    "signature":      "<64 hex chars>", // SHA256(libraryId+apiKey+expirationTime+videoId)
+    "tusEndpoint":    "https://video.bunnycdn.com/tusupload" } }
+```
+
+> **CONTRACT INVARIANT: `upload` never contains `BUNNY_STREAM_API_KEY`.** The
+> signature is derived from it server-side and expires at `expirationTime`
+> (`BUNNY_STREAM_TUS_TTL_SECONDS`, default 1 h). The admin client uploads the
+> bytes directly to Bunny with `tus-js-client`; **no video byte passes through
+> this API.**
+
+There is deliberately **no `status` field** in the request: a Bunny asset starts
+`PROCESSING` and its lifecycle is owned by the Bunny encoding state.
+
+```jsonc
+// POST /admin/videos/:id/bunny/sync
+// no request body
+
+// 200
+{ "message": "Bunny Stream status synchronized.",
+  "video": VideoResponse,
+  "bunnyStatus": 4,        // raw Bunny code, or null
+  "encodeProgress": 100,   // 0-100, or null. TRANSIENT - never persisted
+  "statusChanged": true }
+```
+
+Errors: `400` when Bunny is disabled or the video is not Bunny-backed, `404`
+when the video does not exist, `503` when Bunny is unreachable.
+
+Status mapping - 4 (Finished) to `READY`; 5 (Error) and 6 (UploadFailed) to
+`FAILED`; everything else, including 3 (**Transcoding**), to `PROCESSING`.
+`DISABLED` and `READY` are never overwritten. Details in
+[features/bunny-stream.md](./features/bunny-stream.md) section 4.3.
+
 ---
 
 ## 3. Public site ↔ Backend contracts
@@ -416,6 +470,7 @@ configured from a failed watch.
 | `DIRECT_URL` | `playbackUrl` | wherever the operator pointed it | **No** |
 | `UPLOAD` | `playbackUrl` (Cloudinary `secure_url`) | Cloudinary | **No** |
 | `EMBED` | `embedUrl` (+ `embedProvider`, `embedAllow`) | the embed provider | **No** |
+| `EMBED` **(Bunny-backed)** | `embedUrl` - a **freshly signed, short-lived** `iframe.mediadelivery.net` URL | Bunny CDN | **No**, but the URL expires |
 
 For the backend-mediated rows, the URL carries the share token and host, and —
 when the share link has a `maxViews` limit — a signed `grant`. Clients must pass
@@ -427,6 +482,13 @@ For the non-mediated rows, the field contains the stored external URL verbatim
 segment). No token, host binding, grant or expiry is added, and no backend
 request occurs during playback.
 
+> **No public response field was added for Bunny.** The signed URL is returned
+> in the existing `embedUrl` field, so an older deployed public bundle plays a
+> Bunny video without modification - provided its embed host allowlist and CSP
+> `frame-src` include `iframe.mediadelivery.net`. The URL is minted fresh on
+> every watch resolution, including cache hits, so reloading a valid share page
+> after the token expired yields a new URL.
+>
 > **CONTRACT INVARIANT: share-link revocation does not invalidate an
 > already-disclosed external URL.** Revoking, expiring or exhausting a share
 > link stops future watch resolution; a `DIRECT_URL` / Cloudinary / `EMBED` URL

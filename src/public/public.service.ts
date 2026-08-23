@@ -5,6 +5,8 @@ import {
   Optional,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
+import { BunnyStreamService } from "../bunny/bunny-stream.service";
+import { classifyBunnyVideoAsset } from "../bunny/bunny-video-asset.util";
 import {
   buildCacheKey,
   hashCacheKeyPart,
@@ -155,6 +157,9 @@ export class PublicService {
     private readonly videoViewGrowthService: VideoViewGrowthService,
     private readonly publicMediaGrantService: PublicMediaGrantService,
     @Optional() private readonly memoryCache?: MemoryCacheService,
+    // Appended and optional on purpose. Public watch resolution for every
+    // legacy source type must work with no Bunny collaborator at all.
+    @Optional() private readonly bunnyStreamService?: BunnyStreamService,
   ) {}
 
   async resolvePublicWatch(
@@ -347,11 +352,12 @@ export class PublicService {
       return this.invalidResponse(deniedReason, website, normalizedHost);
     }
 
-    const videos = this.toPlayablePublicVideos(shareLink, {
-      host: normalizedHost,
-      token: trimmedToken,
-    });
-    if (videos.length === 0) {
+    // SELECTION ONLY - no playback credential is minted here. See
+    // `selectPublicPlayableVideos`.
+    const playableVideos = this.selectPublicPlayableVideos(
+      shareLink.shareLinkVideos.map(({ video }) => video),
+    );
+    if (playableVideos.length === 0) {
       await this.writeAccessLog({
         domain: normalizedHost,
         reasonCode: "NO_VIDEOS",
@@ -364,6 +370,10 @@ export class PublicService {
       return this.invalidResponse("NO_VIDEOS", website, normalizedHost);
     }
 
+    // AUTHORITATIVE ATOMIC CONSUMPTION. Everything above is a candidate check;
+    // this conditional update re-verifies status, expiry and `maxViews` and
+    // claims the view in one statement. Nothing that grants playback may run
+    // before it succeeds.
     const viewIncremented = await this.incrementShareLinkView(shareLink, now);
     if (!viewIncremented) {
       const latestShareLink = await this.prisma.shareLink.findUnique({
@@ -401,11 +411,16 @@ export class PublicService {
       now,
     });
 
+    // Consumption succeeded. Only now may playback credentials be minted.
     return {
       valid: true,
       reasonCode: "OK",
       website: this.toPublicWebsiteResponse(website, normalizedHost),
-      videos,
+      videos: this.toPublicVideoResponses(
+        playableVideos,
+        { host: normalizedHost, token: trimmedToken },
+        shareLink,
+      ),
     };
   }
 
@@ -525,11 +540,12 @@ export class PublicService {
       return null;
     }
 
-    const videos = this.toPublicVideoResponses(params.cachedMetadata.videos, {
-      host: params.normalizedHost,
-      token: params.trimmedToken,
-    });
-    if (videos.length === 0) {
+    // A cache hit accelerates LOOKUP only. It must not shortcut the ordering:
+    // selection first, authoritative consumption second, signing last.
+    const playableVideos = this.selectPublicPlayableVideos(
+      params.cachedMetadata.videos,
+    );
+    if (playableVideos.length === 0) {
       this.memoryCache?.delete(params.cacheKey);
       return null;
     }
@@ -540,6 +556,7 @@ export class PublicService {
     );
     if (!viewIncremented) {
       this.memoryCache?.delete(params.cacheKey);
+      // Re-runs the full chain, which denies without signing.
       return this.resolvePublicWatchUncached(params.params);
     }
 
@@ -552,6 +569,8 @@ export class PublicService {
       requestMeta: params.params.requestMeta,
     });
 
+    // Consumption succeeded. Signing happens here, per request, so a cache hit
+    // still yields a freshly signed Bunny URL rather than a replayed one.
     return {
       valid: true,
       reasonCode: "OK",
@@ -559,7 +578,10 @@ export class PublicService {
         params.cachedMetadata.website,
         params.normalizedHost,
       ),
-      videos,
+      videos: this.toPublicVideoResponses(playableVideos, {
+        host: params.normalizedHost,
+        token: params.trimmedToken,
+      }),
     };
   }
 
@@ -702,103 +724,198 @@ export class PublicService {
     return result.count === 1;
   }
 
-  private toPlayablePublicVideos(
-    shareLink: ShareLinkWithVideos,
-    playbackContext: { host: string; token: string },
-  ): PublicWatchVideoResponse[] {
-    return this.toPublicVideoResponses(
-      shareLink.shareLinkVideos.map(({ video }) => video),
-      playbackContext,
-      shareLink,
-    );
+  /**
+   * Narrows a candidate list to the videos that are publicly playable.
+   *
+   * SIGNS NOTHING. This runs BEFORE the authoritative view consumption, so it
+   * must never mint a playback credential - it only answers "could this be
+   * served?". Bunny playability is therefore decided by
+   * `BunnyStreamService.canSignEmbedUrl()`, a pure configuration check, not by
+   * attempting a signature.
+   */
+  private selectPublicPlayableVideos(
+    videos: PublicWatchVideoWithBinary[],
+  ): PublicWatchVideoWithBinary[] {
+    return videos.filter((video) => this.isPublicPlayableVideo(video));
   }
 
+  /**
+   * Serializes the public video payload, minting playback credentials.
+   *
+   * MUST ONLY BE CALLED AFTER the authoritative atomic view consumption has
+   * succeeded. It issues HMAC media grants and signs Bunny embed URLs; a
+   * request whose consumption failed must never reach this method.
+   */
   private toPublicVideoResponses(
     videos: PublicWatchVideoWithBinary[],
     playbackContext: { host: string; token: string },
     shareLink?: Pick<ShareLink, "id" | "maxViews" | "expiresAt">,
   ): PublicWatchVideoResponse[] {
-    return videos
-      .filter((video) => this.isPublicPlayableVideo(video))
-      .map((video) => {
-        const grant =
-          shareLink === undefined || shareLink.maxViews === null
-            ? undefined
-            : this.publicMediaGrantService.issue({
-                shareLinkId: shareLink.id,
-                videoId: video.id,
-                host: playbackContext.host,
-                shareLinkExpiresAt: shareLink.expiresAt,
-              });
-        const binaryPlaybackUrl =
-          video.sourceType === VideoSourceType.DB_BLOB
-            ? this.buildPublicBinaryPlaybackUrl({
-                token: playbackContext.token,
-                videoId: video.id,
-                host: playbackContext.host,
-                grant,
-              })
-            : null;
-        const localPlaybackUrl =
+    return this.selectPublicPlayableVideos(videos).map((video) => {
+      const grant =
+        shareLink === undefined || shareLink.maxViews === null
+          ? undefined
+          : this.publicMediaGrantService.issue({
+              shareLinkId: shareLink.id,
+              videoId: video.id,
+              host: playbackContext.host,
+              shareLinkExpiresAt: shareLink.expiresAt,
+            });
+      const binaryPlaybackUrl =
+        video.sourceType === VideoSourceType.DB_BLOB
+          ? this.buildPublicBinaryPlaybackUrl({
+              token: playbackContext.token,
+              videoId: video.id,
+              host: playbackContext.host,
+              grant,
+            })
+          : null;
+      const localPlaybackUrl =
+        video.sourceType === VideoSourceType.LOCAL_FILE
+          ? this.buildPublicLocalPlaybackUrl({
+              token: playbackContext.token,
+              videoId: video.id,
+              host: playbackContext.host,
+              grant,
+            })
+          : null;
+      const localThumbnailUrl =
+        video.sourceType === VideoSourceType.LOCAL_FILE &&
+        this.isPlayableImageAsset(video.localThumbnailAsset ?? null)
+          ? this.buildPublicLocalThumbnailUrl({
+              token: playbackContext.token,
+              videoId: video.id,
+              host: playbackContext.host,
+              grant,
+            })
+          : null;
+      const thumbnailUrl =
+        video.sourceType === VideoSourceType.LOCAL_FILE
+          ? localThumbnailUrl
+          : this.toSafePublicMediaUrl(video.thumbnailUrl);
+      // Bunny-backed assets only. Every other source type - including a
+      // legacy `provider: BUNNY` DIRECT_URL record - falls through with
+      // `video.embedUrl` untouched.
+      const embedUrl = this.resolvePublicEmbedUrl(video);
+
+      return {
+        id: video.id,
+        title: video.title,
+        description: video.description,
+        sourceType: video.sourceType,
+        playbackUrl:
+          video.sourceType === VideoSourceType.DB_BLOB ||
           video.sourceType === VideoSourceType.LOCAL_FILE
-            ? this.buildPublicLocalPlaybackUrl({
-                token: playbackContext.token,
-                videoId: video.id,
-                host: playbackContext.host,
-                grant,
-              })
-            : null;
-        const localThumbnailUrl =
-          video.sourceType === VideoSourceType.LOCAL_FILE &&
-          this.isPlayableImageAsset(video.localThumbnailAsset ?? null)
-            ? this.buildPublicLocalThumbnailUrl({
-                token: playbackContext.token,
-                videoId: video.id,
-                host: playbackContext.host,
-                grant,
-              })
-            : null;
-        const thumbnailUrl =
+            ? null
+            : this.toSafePublicMediaUrl(video.playbackUrl),
+        binaryPlaybackUrl,
+        publicPlaybackUrl:
+          video.sourceType === VideoSourceType.DB_BLOB
+            ? binaryPlaybackUrl
+            : localPlaybackUrl,
+        binaryAsset:
+          video.sourceType === VideoSourceType.DB_BLOB
+            ? this.toPublicBinaryAssetResponse(video.binaryAsset ?? null)
+            : null,
+        localFileAsset:
+          video.sourceType === VideoSourceType.LOCAL_FILE
+            ? this.toPublicLocalAssetResponse(video.localFileAsset ?? null)
+            : null,
+        embedUrl,
+        embedProvider: video.embedProvider,
+        embedAllow: video.embedAllow,
+        thumbnailUrl,
+        publicThumbnailUrl:
           video.sourceType === VideoSourceType.LOCAL_FILE
             ? localThumbnailUrl
-            : this.toSafePublicMediaUrl(video.thumbnailUrl);
+            : thumbnailUrl,
+        durationSeconds: video.durationSeconds,
+        viewCount: video.viewCount.toString(),
+        publishedAt: video.publishedAt?.toISOString() ?? null,
+      };
+    });
+  }
 
-        return {
-          id: video.id,
-          title: video.title,
-          description: video.description,
-          sourceType: video.sourceType,
-          playbackUrl:
-            video.sourceType === VideoSourceType.DB_BLOB ||
-            video.sourceType === VideoSourceType.LOCAL_FILE
-              ? null
-              : this.toSafePublicMediaUrl(video.playbackUrl),
-          binaryPlaybackUrl,
-          publicPlaybackUrl:
-            video.sourceType === VideoSourceType.DB_BLOB
-              ? binaryPlaybackUrl
-              : localPlaybackUrl,
-          binaryAsset:
-            video.sourceType === VideoSourceType.DB_BLOB
-              ? this.toPublicBinaryAssetResponse(video.binaryAsset ?? null)
-              : null,
-          localFileAsset:
-            video.sourceType === VideoSourceType.LOCAL_FILE
-              ? this.toPublicLocalAssetResponse(video.localFileAsset ?? null)
-              : null,
-          embedUrl: video.embedUrl,
-          embedProvider: video.embedProvider,
-          embedAllow: video.embedAllow,
-          thumbnailUrl,
-          publicThumbnailUrl:
-            video.sourceType === VideoSourceType.LOCAL_FILE
-              ? localThumbnailUrl
-              : thumbnailUrl,
-          durationSeconds: video.durationSeconds,
-          viewCount: video.viewCount.toString(),
-          publishedAt: video.publishedAt?.toISOString() ?? null,
-        };
-      });
+  /**
+   * Mints the embed URL the public browser is allowed to see.
+   *
+   * AUTHORIZATION AND CONSUMPTION BEFORE SIGNING. This runs inside
+   * `toPublicVideoResponses`, which is only ever reached after the full chain
+   * has passed - host → `ACTIVE` domain → `ACTIVE` website → share link found
+   * within that website → status / expiry / `maxViews` → `ShareLinkVideo`
+   * membership → `ACTIVE` `WebsiteVideo` assignment → `READY` - **and** after
+   * `incrementShareLinkView()` has atomically claimed the view. There is no
+   * other caller and no other path to a signed Bunny URL.
+   *
+   * It runs on every resolution, including cached-metadata hits, because the
+   * watch cache stores raw video rows rather than serialized responses. A
+   * viewer reloading a valid share page therefore receives a newly signed URL.
+   *
+   * FAIL CLOSED for the Bunny EMBED shape: a `bunny-malformed` record returns
+   * `null` rather than its stored unsigned `embedUrl`. For everything else -
+   * ordinary `EMBED`, legacy `provider: BUNNY` `DIRECT_URL`, Cloudinary,
+   * `LOCAL_FILE`, `DB_BLOB` - the stored value is returned unchanged.
+   */
+  private resolvePublicEmbedUrl(
+    video: PublicWatchVideoWithBinary,
+  ): string | null {
+    const classification = classifyBunnyVideoAsset(video);
+
+    if (classification.kind === "not-bunny") {
+      return video.embedUrl;
+    }
+
+    if (classification.kind === "bunny-malformed") {
+      // Never emit the stored unsigned Bunny URL. `isPublicPlayableVideo()`
+      // already filtered this record out; this is the second line of defence.
+      return null;
+    }
+
+    return this.signBunnyEmbedUrl(classification.bunnyVideoId, video.id);
+  }
+
+  /**
+   * Whether a Bunny embed URL could be signed right now.
+   *
+   * MINTS NOTHING. Used by `isPublicPlayableVideo()`, which runs before the
+   * authoritative view consumption and therefore must not produce a playback
+   * credential.
+   */
+  private canSignBunnyEmbedUrl(): boolean {
+    return this.bunnyStreamService?.canSignEmbedUrl() === true;
+  }
+
+  /**
+   * Signs a short-lived Bunny embed URL, or returns null when it cannot.
+   *
+   * Fail closed: if Bunny is disabled or misconfigured the caller emits `null`
+   * rather than the stored unsigned URL, which would hand out a permanent,
+   * unauthorized Bunny link.
+   *
+   * MUST ONLY BE CALLED AFTER the atomic view consumption has succeeded.
+   */
+  private signBunnyEmbedUrl(
+    bunnyVideoId: string,
+    videoId: string,
+  ): string | null {
+    if (!this.canSignBunnyEmbedUrl() || this.bunnyStreamService === undefined) {
+      return null;
+    }
+
+    try {
+      return this.bunnyStreamService.createSignedEmbedUrl(bunnyVideoId)
+        .embedUrl;
+    } catch (error) {
+      this.logger.error(
+        {
+          videoId,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        },
+        "Bunny Stream embed signing failed during public watch resolution.",
+      );
+
+      return null;
+    }
   }
 
   private isPublicPlayableVideo(video: PublicWatchVideoWithBinary): boolean {
@@ -807,6 +924,23 @@ export class PublicService {
     }
 
     if (video.sourceType === VideoSourceType.EMBED) {
+      const classification = classifyBunnyVideoAsset(video);
+
+      // A record that structurally claims to be a new-style Bunny asset but
+      // fails the predicate is never publicly playable. It must not fall
+      // through to generic embed handling, which would serve its stored
+      // unsigned Bunny URL.
+      if (classification.kind === "bunny-malformed") {
+        return false;
+      }
+
+      // A valid Bunny asset is playable only while a signature could actually
+      // be produced. This is a pure configuration check - it mints nothing -
+      // because this method runs BEFORE the atomic view consumption.
+      if (classification.kind === "bunny") {
+        return this.canSignBunnyEmbedUrl();
+      }
+
       return video.embedUrl !== null && video.embedUrl.trim() !== "";
     }
 

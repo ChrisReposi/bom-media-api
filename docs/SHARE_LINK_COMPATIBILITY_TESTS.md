@@ -2,7 +2,7 @@
 
 Status: CURRENT
 Criticality: RELEASE-BLOCKING
-Last verified: 2026-08-22
+Last verified: 2026-08-23
 Verified against: `test/share-link-compat-*.test.ts`, `src/public/**`, `src/admin-websites/admin-websites.service.ts`, `src/videos/videos.service.ts`, `src/videos/storage/local-video-storage.service.ts`, `prisma/schema.prisma`
 
 The contract these tests defend is
@@ -244,9 +244,21 @@ surfaces.
 
 ## 8. Deliberate non-goals
 
-- **No Bunny scenarios.** Bunny is `PLANNED` with no implementation
-  (`docs/features/bunny-stream.md`); it is not legacy production behaviour and
-  has nothing to keep compatible.
+- **No Bunny scenarios in this suite.** Revised 2026-08-23: Bunny Stream is now
+  implemented (`docs/features/bunny-stream.md`), but it has **no legacy
+  production share links to keep compatible**, so it does not belong behind a
+  backward-compatibility gate. Adding a COMPAT id for it would claim a contract
+  that does not exist.
+
+  What this suite proves about Bunny is the *opposite* direction: that adding
+  the provider changed nothing for `DIRECT_URL`, `EMBED`, `LOCAL_FILE`,
+  `DB_BLOB` and Cloudinary. Bunny's own coverage lives in
+  `test/bunny-stream.test.ts` and the Bunny section of `test/video-purge.test.ts`.
+
+  The shared harness gained two Bunny fixtures (`bunnyStreamVideo()`,
+  `legacyLabelledBunnyVideo()`) and an optional `bunnyStream` collaborator. Every
+  existing suite still constructs `PublicService` **without** one, which is
+  itself the evidence that no legacy path needs it.
 - **No test asserts that a provider/direct URL becomes invalid on revocation.**
   It does not, and writing that test would encode a false guarantee. See
   [SECURITY_MODEL.md §4.1](./SECURITY_MODEL.md#41-backend-served-media-versus-providerdirect-media)

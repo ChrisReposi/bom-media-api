@@ -1,4 +1,5 @@
 import { Module } from "@nestjs/common";
+import { BunnyStreamModule } from "../bunny/bunny-stream.module";
 import { CloudinaryModule } from "../cloudinary/cloudinary.module";
 import { DatabaseModule } from "../database/database.module";
 import { AdminAuthModule } from "../admin-auth/admin-auth.module";
@@ -11,6 +12,7 @@ import { VideosService } from "./videos.service";
   imports: [
     DatabaseModule,
     AdminAuthModule,
+    BunnyStreamModule,
     CloudinaryModule,
     LocalVideoStorageModule,
   ],

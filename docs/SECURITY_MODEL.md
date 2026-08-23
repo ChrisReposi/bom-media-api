@@ -1,7 +1,7 @@
 # Security Model
 
 Status: CURRENT
-Last verified: 2026-08-21
+Last verified: 2026-08-23
 Verified against: `src/main.ts`, `src/app.module.ts`, `src/admin-auth/**`, `src/public/**`, `src/security/**`, `src/common/utils/request-security.util.ts`, `src/config/env.validation.ts`
 
 This document states what the code actually enforces. Anything aspirational is
@@ -36,6 +36,8 @@ marked `PLANNED`.
 | Public share token | `s_` + `randomBytes(32).base64url` | Returned once at creation; DB stores only `sha256(SHARE_TOKEN_PEPPER + raw)` | Until revoked/expired/limit reached |
 | Public share alias | `randomBytes(5).base64url` (~7 chars) | **Stored in clear** in `ShareLink.alias`, unique | Same as the share link |
 | Public media grant | `base64url(payload).base64url(HMAC-SHA256)` via `PUBLIC_MEDIA_GRANT_SECRET` | Query string of media URLs | `min(now + PUBLIC_MEDIA_GRANT_TTL_SECONDS, shareLink.expiresAt)`, clamped 5 min … 24 h |
+| Bunny embed token | `SHA256_HEX(BUNNY_STREAM_TOKEN_SECURITY_KEY + videoId + expires)` | Query string of the Bunny iframe URL | `BUNNY_STREAM_EMBED_TOKEN_TTL_SECONDS`, default 5 min, bounded 1 min … 1 h |
+| Bunny TUS signature | `SHA256_HEX(libraryId + BUNNY_STREAM_API_KEY + expiration + videoId)` | Admin browser only, as a TUS request header | `BUNNY_STREAM_TUS_TTL_SECONDS`, default 1 h, bounded 5 min … 24 h |
 | Admin password | bcrypt, 12 rounds | Database only | Until changed |
 
 > **SECURITY INVARIANT: No raw refresh token and no raw share token is ever
@@ -221,6 +223,7 @@ diagnose the real cause from `AccessLog` — see
 | **Provider / direct** | `DIRECT_URL` | the stored `playbackUrl`, verbatim | **No** | **No** | Revocation stops future *watch resolution* only |
 | **Provider / direct** | `UPLOAD` (Cloudinary) | Cloudinary `secure_url`, verbatim | **No** | **No** | Same |
 | **Provider / direct** | `EMBED` | `embedUrl`, verbatim | **No** | **No** | Same |
+| **Provider / signed** | `EMBED` **(Bunny-backed)** | a freshly signed `iframe.mediadelivery.net` URL | **No** | Bunny embed token | Revocation stops future watch resolution; an already-issued URL dies at its own expiry (default 5 min) |
 
 `toSafePublicMediaUrl()` returns the stored URL unchanged (it only nulls out
 URLs whose path contains an `admin` segment). No token, no grant and no expiry
@@ -244,6 +247,73 @@ This is a **current design characteristic**, not a defect to fix in this pass �
 see [KNOWN_ISSUES.md](./KNOWN_ISSUES.md#ki-015). Any future provider integration
 must address it explicitly; see
 [ADR 0007](./adr/0007-video-storage-direction.md).
+
+### 4.1.1 Bunny Stream signed embed URLs
+
+> **SECURITY INVARIANT: a signed Bunny embed URL is minted only after the entire
+> chain in section 4 has passed AND the authoritative atomic view consumption
+> has succeeded.**
+
+Watch resolution runs in four ordered stages, and signing is the last of them:
+
+```
+1. resolve credential / domain / share link / video candidates
+2. every authorization check in section 4
+3. AUTHORITATIVE ATOMIC CONSUMPTION - incrementShareLinkView()
+     a conditional UPDATE that re-verifies status, expiry and maxViews and
+     claims the view in one statement
+4. ONLY IF 3 claimed a row: serialize and sign
+```
+
+`selectPublicPlayableVideos()` performs stage 2 filtering and **mints nothing**;
+Bunny playability is decided there by `BunnyStreamService.canSignEmbedUrl()`, a
+pure configuration check. `toPublicVideoResponses()` - the only caller of
+`resolvePublicEmbedUrl()`, and the only place a Bunny URL or a media grant is
+issued - runs in stage 4. Consequences:
+
+- A request that ends `INVALID_LINK`, **including one that loses a concurrent
+  revoke / expiry / `maxViews` race at stage 3**, never reaches
+  `BUNNY_STREAM_TOKEN_SECURITY_KEY` at all.
+- A cache hit accelerates lookup only. It follows the same four stages, so a
+  cached resolution whose consumption then fails also signs nothing.
+- The watch metadata cache stores raw video rows, not serialized responses, so a
+  valid cache hit still mints a **newly signed** URL after its own consumption.
+- It **fails closed**: if Bunny is disabled or misconfigured,
+  `isPublicPlayableVideo()` drops the video rather than falling back to the
+  stored unsigned URL.
+- The stored `VideoAsset.embedUrl` for a Bunny asset is deliberately the
+  **unsigned** base URL. It is never returned to a public client.
+
+> **SECURITY INVARIANT: the Bunny EMBED shape fails closed.** A record that
+> structurally claims to be a new-style Bunny asset - `provider = BUNNY` **and**
+> `sourceType = EMBED` - but fails the complete identification predicate is
+> classified `bunny-malformed` and is never publicly playable. It must never
+> fall through to generic embed handling, which would serve its stored
+> **unsigned** Bunny URL permanently. A legacy `provider: BUNNY` record with
+> `sourceType: DIRECT_URL` is `not-bunny` and keeps its existing behaviour
+> exactly; the strict rule applies only to the Bunny EMBED shape.
+
+> **SECURITY INVARIANT: feature-disabled isolation.** No Bunny network request
+> can leave this process while `BUNNY_STREAM_ENABLED=false`, even if stale
+> credentials remain configured. `createVideo`, `getVideo` and `deleteVideo` each
+> call `ensureEnabled()`, and so does the single outbound `request()` call site.
+> A purge that asks for remote deletion while Bunny is disabled therefore issues
+> no HTTP request, reports `remote.remoteAssetDeleted: false`, and writes the
+> `VIDEO_PURGE_STORAGE` audit row with `AuditStatus.FAIL`.
+
+The public browser receives the signed URL, its token and its expiry. It never
+receives `BUNNY_STREAM_API_KEY` or `BUNNY_STREAM_TOKEN_SECURITY_KEY`. The
+5-minute default TTL bounds post-revocation exposure the same way a media grant
+does - better than `DIRECT_URL`/Cloudinary/plain `EMBED`, which never expire,
+but not instant revocation.
+
+> **`VIDEO_EMBED_ALLOWED_HOSTS` deliberately does NOT include
+> `iframe.mediadelivery.net`.** That allowlist governs the generic
+> embed-creation path, where a pasted URL is stored permanently; adding the
+> Bunny host there would let an operator store a permanent **unsigned** Bunny
+> URL. Bunny embed URLs are built server-side from a fixed constant instead. The
+> public site allowlist and CSP `frame-src` were widened in the same change, so
+> the only Bunny URL the public site can ever render is one this backend signed.
 
 ### 4.2 `LOCAL_FILE` media authorization cache
 

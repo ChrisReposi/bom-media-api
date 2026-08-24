@@ -2255,6 +2255,7 @@ export class VideosService {
     }
 
     let disabledShareLinkCount = 0;
+    let reactivatedShareLinkCount = 0;
     const video = await this.prisma.$transaction(async (tx) => {
       const updatedVideo = await tx.videoAsset.update({
         where: { id },
@@ -2290,6 +2291,25 @@ export class VideosService {
           tx,
           id,
         );
+      } else if (
+        dto.status === VideoStatus.READY &&
+        existingVideo.status === VideoStatus.DISABLED
+      ) {
+        // THE RESTORE HALF OF THE REVERSIBLE LIFECYCLE.
+        //
+        // This is the transition the admin calls "Kich hoat lai" / restore:
+        // there is no dedicated restore route, so both directions arrive here
+        // as `PATCH { status }`. Disable already swept this video's ACTIVE
+        // share links to `DISABLED` on the way in; without the symmetric sweep
+        // on the way out, `DISABLED` was terminal and every share link the
+        // video had before it was disabled stayed dead forever.
+        //
+        // Deliberately keyed on READY specifically, not merely "not DISABLED":
+        // DISABLED -> FAILED / DRAFT / PROCESSING does NOT make the video
+        // publicly resolvable (public watch requires READY), so those links
+        // must stay dark. Only a return to READY earns them back.
+        reactivatedShareLinkCount =
+          await this.reactivateShareLinksDisabledWithVideo(tx, id);
       }
 
       return updatedVideo;
@@ -2307,6 +2327,7 @@ export class VideosService {
       previousStatus: existingVideo.status,
       nextStatus: video.status,
       disabledShareLinkCount,
+      reactivatedShareLinkCount,
     });
     this.invalidateAdminVideoCaches();
 
@@ -3101,6 +3122,83 @@ export class VideosService {
     });
 
     return result.count;
+  }
+
+  /**
+   * REVERSES `disableActiveShareLinksForVideo()` - the missing other half of
+   * the reversible lifecycle.
+   *
+   * Disabling a video sweeps every ACTIVE share link that contains it to
+   * `DISABLED`, so a credential already handed out cannot keep playing an
+   * administratively unavailable video. Until this helper existed nothing ever
+   * wrote that status back: `ShareLinkStatus.DISABLED` was written in exactly
+   * ONE place and read in NONE, which made it a one-way trapdoor. A single
+   * "disable" click therefore destroyed every existing share link for that
+   * video for good, and restoring the video could not bring any of them back -
+   * disable silently behaved like a PURGE of share-link availability.
+   *
+   * WHAT THIS MAY REVIVE, and nothing else:
+   *
+   *   - `DISABLED` links only. `REVOKED` is an explicit operator decision and
+   *     `EXPIRED` is a terminal clock fact; neither is derived from video
+   *     availability, so neither is eligible here. A link revoked while its
+   *     video was disabled STAYS revoked.
+   *   - links that still contain this video, so an emptied link can never be
+   *     revived by construction.
+   *   - links where no remaining member video is still `DISABLED`. A link went
+   *     dark because a member became unavailable, so it returns only once no
+   *     member is unavailable. Restoring one video out of two leaves the link
+   *     dark, which is the fail-closed direction.
+   *
+   * WHAT IT NEVER TOUCHES: `tokenHash`, `alias`, `websiteId`, `expiresAt`,
+   * `maxViews`, `currentViews`, `label`. A revived link resumes on exactly the
+   * credential, domain binding, expiry and remaining view budget it already
+   * had. An expired or view-exhausted link therefore returns to `ACTIVE` and is
+   * still denied, because `getDeniedReason()` reads those columns and not this
+   * status alone.
+   *
+   * MUST run inside the same transaction as - and AFTER - the video's own
+   * status update, so the video being restored no longer counts itself as an
+   * unavailable member.
+   *
+   * A read-then-update loop rather than one `updateMany`: the "no other member
+   * is disabled" predicate needs each candidate's member statuses, and the
+   * number of share links per video is small operational data.
+   */
+  private async reactivateShareLinksDisabledWithVideo(
+    tx: Prisma.TransactionClient,
+    videoId: string,
+  ): Promise<number> {
+    const candidates = await tx.shareLink.findMany({
+      where: {
+        status: ShareLinkStatus.DISABLED,
+        shareLinkVideos: { some: { videoId } },
+      },
+      select: {
+        id: true,
+        shareLinkVideos: { select: { video: { select: { status: true } } } },
+      },
+    });
+
+    let reactivatedCount = 0;
+
+    for (const candidate of candidates) {
+      const hasUnavailableMember = candidate.shareLinkVideos.some(
+        (member) => member.video.status === VideoStatus.DISABLED,
+      );
+
+      if (hasUnavailableMember) {
+        continue;
+      }
+
+      await tx.shareLink.update({
+        where: { id: candidate.id },
+        data: { status: ShareLinkStatus.ACTIVE },
+      });
+      reactivatedCount += 1;
+    }
+
+    return reactivatedCount;
   }
 
   /**

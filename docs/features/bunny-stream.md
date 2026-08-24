@@ -559,6 +559,17 @@ longer exist, and invisible billable Bunny orphans no record points at.
 > `DISABLED` asset stays `DISABLED` even when Bunny reports the video missing,
 > because an administrator's decision outranks a provider observation.
 
+> **And the reversal is real (2026-08-24).** Restoring the video to `READY`
+> re-activates the share links that disable had swept to `DISABLED`, so a
+> temporarily-disabled Bunny video does not lose its reviewer links. Restore
+> issues **no** Bunny request either, creates **no** new Bunny video, and
+> — critically — does **not** clear a confirmed
+> `metadataJson.bunnyStream.remoteMissing` marker. A remote-missing asset that
+> an operator pushes back to `READY` therefore still mints nothing, because the
+> authoritative database signing gate in §9.3 checks the marker independently of
+> status. Pinned by `test/video-lifecycle-disable-restore.test.ts`
+> (`BUNNY-RESTORE-01` … `04`).
+
 ### 9.2 PURGE with remote deletion — REMOTE FIRST
 
 Bunny remote deletion is folded into the existing purge flow and inherits every

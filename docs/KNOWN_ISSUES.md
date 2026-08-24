@@ -33,6 +33,7 @@ real friction) · `LOW` (hygiene, correctness of documentation, cleanup).
 | [KI-018](#ki-018) | Cloudinary upload can orphan a provider asset on DB failure | LOW | Backend | Yes |
 | [KI-019](#ki-019) | Concurrent refresh is conservatively treated as replay | LOW | Design/risk note | Yes |
 | [KI-020](#ki-020) | Unlimited LOCAL_FILE media authorization is cached | MED | Backend | Yes |
+| [KI-021](#ki-021) | Historical share links stranded DISABLED by the old one-way video disable | MEDIUM | Data | Yes — remedy exists, purge residual RESOLVED |
 
 ---
 
@@ -474,6 +475,53 @@ real friction) · `LOW` (hygiene, correctness of documentation, cleanup).
   `MEMORY_CACHE_ENABLED=false`.
 - **Safe to defer?** Yes, provided the window is documented — which it now is,
   in [SECURITY_MODEL.md §4.2](./SECURITY_MODEL.md#42-local_file-media-authorization-cache).
+
+---
+
+### KI-021
+
+**Historical share links stranded `DISABLED` by the old one-way video disable**
+
+- Status: CURRENT (data residue) · Severity: MEDIUM · Component: data
+- **Evidence.** Until 2026-08-24, `disableActiveShareLinksForVideo()` swept every
+  `ACTIVE` `ShareLink` containing a disabled video to `DISABLED`, and
+  `ShareLinkStatus.DISABLED` was written in that one place and read in **none** —
+  no code path ever wrote the status back. Public resolution requires
+  `shareLink.status === ACTIVE` (`public.service.ts`), so a single disable
+  permanently killed every existing share link for that video and restoring the
+  video could not recover them.
+- **Fixed going forward.** `reactivateShareLinksDisabledWithVideo()` makes the
+  sweep reversible for every FUTURE `DISABLED → READY` transition. It does
+  **not** heal rows stranded before it shipped, because no transition will ever
+  fire for them again.
+- **Impact.** Any production share link darkened by a video disable before
+  2026-08-24 is still `DISABLED` even if its video is `READY` again. Relations
+  are intact — disable never deleted `WebsiteVideo` or `ShareLinkVideo` — so this
+  is recoverable status residue, not lost data.
+- **Remedy.** `yarn reconcile:share-links` (dry run) reports the residue;
+  `--apply --confirm-env=<env>` heals it. Its only mutation is
+  `ShareLink.status: DISABLED → ACTIVE`, restricted by seven fail-closed guards
+  and applied only to links that are currently usable. Full contract in
+  [features/share-links.md §8.1](./features/share-links.md#81-yarn-reconcileshare-links--one-shot-historical-sweep).
+- **Purge residual — RESOLVED 2026-08-24.** The original sweep detected purge
+  damage only through a `sortOrder` gap, which cannot see a purge of the
+  **highest-indexed** member (the survivors stay contiguous). That is now closed
+  by two additional provenance sources, both available on historical rows:
+  `SHARE_LINK_CREATE.metadataJson.videoCount` — the membership size at creation,
+  present in **every commit** of this repository — and `CanonicalVideoShareLink`,
+  whose members are structurally purge-immune (`409
+  VIDEO_HAS_CANONICAL_SHARE_LINK` plus `onDelete: Restrict`). Comparing the
+  surviving member count against the recorded one detects a deleted membership
+  row whatever its index. Candidates are now classified `SAFE_PROVEN` /
+  `AMBIGUOUS_PURGE_HISTORY` / `PURGE_PROVEN`, and `--apply` writes only the
+  first. Missing or malformed provenance fails closed as ambiguous — a
+  best-effort audit row that never landed must not read as "nothing happened".
+- **Remaining limitation, stated plainly.** A link whose `SHARE_LINK_CREATE` row
+  did not survive is `AMBIGUOUS_PURGE_HISTORY` and is never auto-reactivated. It
+  is reported for manual review rather than guessed at. There is deliberately no
+  operator override.
+- **Safe to defer?** Yes. Nothing degrades further; the residue is static and the
+  remedy is idempotent and re-runnable.
 
 ---
 

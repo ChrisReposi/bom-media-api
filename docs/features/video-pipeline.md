@@ -219,6 +219,40 @@ view-limited links are never cached. See
 Bunny-backed video in particular, the Bunny asset is explicitly retained and no
 Bunny request is issued.
 
+### 10.0 DISABLE is REVERSIBLE; PURGE is the only destructive operation
+
+> **DISABLE != PURGE.** Disable must never destroy a relationship that restore
+> cannot recover, because "Vô hiệu hóa" is understood as temporary.
+
+The admin console drives **both** directions through `PATCH /admin/videos/:id`
+with `{ status }` — `DISABLED` to disable, `READY` to restore. (The dedicated
+`DELETE /admin/videos/:id` route exists, does the same disable, and is not
+currently used by the console; both paths share the same helpers, so they
+interoperate.)
+
+| Write | DISABLE | RESTORE (`→ READY`) | PURGE |
+|---|---|---|---|
+| `VideoAsset.status` | `→ DISABLED` | `→ READY` | row **deleted** |
+| `WebsiteVideo` | **untouched** | **untouched** — the surviving `ACTIVE` assignment simply becomes effective again | **deleted**, every status |
+| `ShareLinkVideo` | **untouched** | **untouched** | **deleted** |
+| `ShareLink.status` | every `ACTIVE` link containing the video `→ DISABLED` | eligible `DISABLED` links `→ ACTIVE` (see [share-links.md §5](./share-links.md#5-revocation-and-expiry) for the narrow eligibility rules) | remaining `ACTIVE` links `→ DISABLED` |
+| `VideoLocalFileAsset` / `DB_BLOB` bytes / thumbnails | untouched | untouched | deleted, best-effort after commit |
+| `metadataJson`, provider identifiers | untouched | untouched — in particular a confirmed `bunnyStream.remoteMissing` marker is **not** cleared, so a generic restore cannot launder a known-deleted remote asset | gone with the row |
+| Provider (Bunny / Cloudinary) | no request | no request | opt-in remote delete |
+
+Because disable preserves both relations, a restored video is **still assigned**
+to its websites. It therefore correctly appears as already-assigned rather than
+as newly assignable in
+`listVideoAssignmentOptions()` (`isAssigned: true`, `canAssign: false`), and its
+previously-issued share links resume without a new link being created. Only a
+video that was genuinely unassigned needs assigning again after a restore.
+
+Restore is keyed on `READY` specifically. `DISABLED → FAILED`/`DRAFT`/
+`PROCESSING` leaves share links dark, because none of those states is publicly
+resolvable.
+
+Pinned by `test/video-lifecycle-disable-restore.test.ts`.
+
 `POST /admin/videos/:id/purge` — **OWNER only**. Preconditions, each with its own
 failure:
 

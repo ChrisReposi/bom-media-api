@@ -343,6 +343,26 @@ of attempts inside a `Serializable` transaction.
 > The admin client names these functions `disable*` for exactly this reason. Do
 > not "correct" the naming; the verb is HTTP, the semantics are status.
 
+> **A video disable is REVERSIBLE, including its effect on share links (changed
+> 2026-08-24).** The admin console drives both directions through
+> `PATCH /admin/videos/:id` — `{ status: "DISABLED" }` to disable, `{ status:
+> "READY" }` to restore — and never calls `DELETE`. Disabling sweeps every
+> `ACTIVE` `ShareLink` containing the video to `DISABLED`; restoring to `READY`
+> sweeps the eligible ones back to `ACTIVE`. Previously nothing ever wrote that
+> status back, so one disable click permanently destroyed every existing share
+> link for the video and the restore could not recover them.
+>
+> `WebsiteVideo` and `ShareLinkVideo` rows are **not touched by either
+> direction** — only `PURGE` removes them — so a restored video keeps its
+> website assignments and its share-link memberships.
+>
+> The `VIDEO_UPDATE` audit row gained an additive
+> `metadataJson.reactivatedShareLinkCount` alongside the existing
+> `disabledShareLinkCount`. No response body changed and no client is affected.
+> The eligibility rules — `REVOKED` never revives, expiry and `maxViews` are
+> never rewritten — are in
+> [features/share-links.md §5](./features/share-links.md#5-revocation-and-expiry).
+
 Permanent removal is a separate, OWNER-only route:
 
 `POST /admin/videos/:id/purge` — body

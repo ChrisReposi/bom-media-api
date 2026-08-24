@@ -278,7 +278,10 @@ export class PurgeVideoResponse {
       activeWebsiteAssignmentCount: 0,
       disabledShareLinkCount: 0,
       detachedShareLinkVideoCount: 0,
+      detachedWebsiteAssignmentCount: 0,
     },
+    description:
+      "What the purge actually cleaned up. `activeWebsiteAssignmentCount` is the number of ACTIVE website assignments the video still had - it is reported, not a blocker, because a DISABLED video is already unavailable. `detachedWebsiteAssignmentCount` is how many assignment rows of any status were removed.",
   })
   safety!: {
     hadWebsiteAssignments: boolean;
@@ -286,6 +289,7 @@ export class PurgeVideoResponse {
     activeWebsiteAssignmentCount: number;
     disabledShareLinkCount: number;
     detachedShareLinkVideoCount: number;
+    detachedWebsiteAssignmentCount: number;
   };
 
   @ApiProperty({
@@ -377,4 +381,81 @@ export class SyncBunnyVideoStatusResponse {
 
   @ApiProperty({ example: false })
   statusChanged!: boolean;
+
+  /**
+   * True when Bunny answered an authoritative 404 for this video id.
+   *
+   * A structured field rather than an exception string, so the admin can react
+   * without parsing a message. When it is true the local record was PRESERVED
+   * and marked remote-missing, `bunnyStatus` and `encodeProgress` are null, and
+   * the asset is no longer publicly playable.
+   *
+   * A transient Bunny failure - timeout, network error, 401/403, 429, 5xx -
+   * never produces this. It surfaces as an error instead, leaving the local
+   * record untouched.
+   */
+  @ApiProperty({
+    example: false,
+    description:
+      "True when Bunny returned an authoritative 404. The local record is preserved and marked remote-missing; it is no longer publicly playable.",
+  })
+  remoteMissing!: boolean;
+}
+
+/**
+ * Short-lived signed Bunny embed URL for the authenticated Admin preview.
+ *
+ * NEVER PERSISTED. Minted per request by `BunnyStreamService.createSignedEmbedUrl()`
+ * and returned only to an authenticated admin. The token security key and the
+ * Stream API key are inputs to the signature and never appear in this response.
+ * The Admin console must render this URL rather than the stored unsigned
+ * `embedUrl`, which Bunny rejects with 403 while the library has Embed View
+ * Token Authentication enabled.
+ */
+export class BunnyVideoPreviewResponse {
+  @ApiProperty({
+    example:
+      "https://iframe.mediadelivery.net/embed/123456/11111111-2222-3333-4444-555555555555?token=<64 hex>&expires=1756000000",
+    description:
+      "Signed, short-lived Bunny embed URL. Expires on the configured embed token TTL.",
+  })
+  embedUrl!: string;
+
+  @ApiProperty({
+    example: 1756000000,
+    description:
+      "Unix seconds at which the signed embed URL stops being valid.",
+  })
+  expires!: number;
+}
+
+/**
+ * Result of uploading a custom thumbnail to Bunny Stream.
+ *
+ * `thumbnailUrl` is null when Bunny accepted the image but has not yet exposed
+ * a `thumbnailFileName` for it. That is a transient, non-fatal state: the video
+ * is unaffected and the next status sync backfills the poster. It is reported
+ * honestly rather than guessed at.
+ */
+export class BunnyVideoThumbnailResponse {
+  @ApiProperty({ example: "Bunny Stream thumbnail updated." })
+  message!: string;
+
+  @ApiProperty({ type: VideoResponse })
+  video!: VideoResponse;
+
+  @ApiProperty({
+    example: "https://vz-xxxxxxxx.b-cdn.net/<guid>/thumbnail_ab12cd34.jpg",
+    nullable: true,
+    description:
+      "CDN poster URL built from the pull-zone hostname, the Bunny GUID and the thumbnailFileName Bunny reported. Null when Bunny has not exposed a file name yet.",
+  })
+  thumbnailUrl!: string | null;
+
+  @ApiProperty({
+    example: true,
+    description:
+      "Whether the poster URL was resolved and persisted during this request. False means a later sync must backfill it.",
+  })
+  thumbnailPersisted!: boolean;
 }

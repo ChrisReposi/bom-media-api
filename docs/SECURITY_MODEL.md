@@ -284,6 +284,31 @@ issued - runs in stage 4. Consequences:
 - The stored `VideoAsset.embedUrl` for a Bunny asset is deliberately the
   **unsigned** base URL. It is never returned to a public client.
 
+> **SECURITY INVARIANT: a Bunny asset reconciled as REMOTE-MISSING fails
+> closed.** When Bunny answers an authoritative 404 for a video id, the local
+> record is preserved but demoted out of `READY` and marked in
+> `metadataJson.bunnyStream.remoteMissing`. Because public playability and
+> share-link eligibility both already require `status === READY`, no new signed
+> Bunny URL can be minted for it and no new share link can include it — with no
+> Bunny-specific gate added anywhere. A **transient** Bunny failure never
+> triggers this, so provider unavailability cannot un-publish a working
+> catalogue. Remote existence is eventual-consistency state maintained by sync
+> and by `yarn reconcile:bunny`; **no Bunny request is made during public watch
+> resolution.** See [features/bunny-stream.md](./features/bunny-stream.md) §9.3.
+
+> **SECURITY INVARIANT: Bunny playback signing does not trust the metadata
+> cache.** `MemoryCacheService` is process-local, so reconciliation running in
+> another process (`yarn reconcile:bunny --apply`, a second worker, a direct
+> database fix) cannot invalidate this process's `public:watch:` entries.
+> Immediately before minting a token — and after the atomic view consumption —
+> `loadSignableBunnyVideoIds()` re-reads the current `VideoAsset` rows and
+> requires existence, `status === READY`, the strict Bunny predicate, no
+> `remoteMissing` marker, and an unchanged Bunny video id. Any failure, a
+> mismatch, or an unreadable query fails closed: no token, and never a fallback
+> to the stored unsigned URL. It is **one** batched indexed local query per
+> response and adds no Bunny Management request. In-process invalidation is
+> retained but public security no longer depends on it succeeding.
+
 > **SECURITY INVARIANT: the Bunny EMBED shape fails closed.** A record that
 > structurally claims to be a new-style Bunny asset - `provider = BUNNY` **and**
 > `sourceType = EMBED` - but fails the complete identification predicate is
@@ -298,8 +323,11 @@ issued - runs in stage 4. Consequences:
 > credentials remain configured. `createVideo`, `getVideo` and `deleteVideo` each
 > call `ensureEnabled()`, and so does the single outbound `request()` call site.
 > A purge that asks for remote deletion while Bunny is disabled therefore issues
-> no HTTP request, reports `remote.remoteAssetDeleted: false`, and writes the
-> `VIDEO_PURGE_STORAGE` audit row with `AuditStatus.FAIL`.
+> no HTTP request — and, since 2026-08-23, **aborts the purge entirely** rather
+> than deleting the local row. `ensureEnabled()` throws inside the pre-commit
+> remote delete, so the record survives, `VIDEO_BUNNY_REMOTE_DELETE` is audited
+> `FAIL`, and no Bunny orphan is created. Previously the row was purged and the
+> Bunny asset was left behind.
 
 The public browser receives the signed URL, its token and its expiry. It never
 receives `BUNNY_STREAM_API_KEY` or `BUNNY_STREAM_TOKEN_SECURITY_KEY`. The

@@ -158,6 +158,13 @@ Permanent video deletion goes through `POST /admin/videos/:id/purge`
 deletes the remote Cloudinary **or** Bunny Stream asset — the two branches are
 mutually exclusive and each is gated on its own provider check).
 
+> **`WebsiteVideo` rows are removed by the purge, not a barrier to it**
+> (2026-08-23). `WebsiteVideo.video` is `onDelete: Cascade`, so the rows would
+> disappear with the `VideoAsset` regardless; the purge deletes them explicitly
+> — every status, not only `ACTIVE` — so the count can be reported in the
+> response and the audit row. The video must still be `DISABLED` first, and
+> canonical provenance still blocks with `409`.
+
 > **Bunny Stream needed no schema change.** It reuses `provider`,
 > `sourceType`, `providerAssetId`, `playbackId`, `embedProvider`, `embedUrl`,
 > `metadataJson` and `status`. No migration was added for it, and no column

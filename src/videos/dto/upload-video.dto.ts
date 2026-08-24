@@ -19,22 +19,10 @@ import {
   VIDEO_FILTER_KEY_MAX_LENGTH,
   normalizeVideoFilterKey,
 } from "../utils/video-filter-key.util";
-
-function toOptionalNumericString(value: unknown): string | undefined {
-  if (value === undefined || value === null || value === "") {
-    return undefined;
-  }
-
-  if (typeof value === "number" || typeof value === "bigint") {
-    return String(value);
-  }
-
-  if (typeof value === "string") {
-    return value.trim();
-  }
-
-  return String(value);
-}
+import {
+  IsCanonicalViewCount,
+  normalizeCanonicalViewCount,
+} from "../utils/view-count.util";
 
 export class UploadVideoDto {
   @ApiProperty({
@@ -83,10 +71,15 @@ export class UploadVideoDto {
   @Max(2147483647)
   durationSeconds?: number;
 
-  @ApiPropertyOptional({ example: "360000" })
+  @ApiPropertyOptional({
+    type: String,
+    example: "360000",
+    description:
+      "Non-negative integer as a DECIMAL DIGIT STRING. A JSON number is rejected.",
+  })
   @IsOptional()
-  @Transform(({ value }) => toOptionalNumericString(value))
-  @Matches(/^\d+$/, { message: "viewCount must be a non-negative integer" })
+  @Transform(({ value }) => normalizeCanonicalViewCount(value))
+  @IsCanonicalViewCount()
   viewCount?: string;
 
   @ApiPropertyOptional({ example: "2026-05-30T00:00:00.000Z" })

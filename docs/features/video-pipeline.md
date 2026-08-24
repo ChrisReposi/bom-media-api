@@ -215,7 +215,9 @@ view-limited links are never cached. See
 ## 10. Deleting
 
 `DELETE /admin/videos/:id` — write roles. **Soft-disable only**: sets
-`VideoStatus.DISABLED`. No row, file, blob or remote asset is removed.
+`VideoStatus.DISABLED`. No row, file, blob or remote asset is removed — for a
+Bunny-backed video in particular, the Bunny asset is explicitly retained and no
+Bunny request is issued.
 
 `POST /admin/videos/:id/purge` — **OWNER only**. Preconditions, each with its own
 failure:
@@ -226,7 +228,11 @@ failure:
 | No `CanonicalVideoShareLink` for the video | `409 VIDEO_HAS_CANONICAL_SHARE_LINK` |
 | Video exists | `404` |
 | Status is already `DISABLED` | `400` "Video must be disabled before it can be permanently deleted." |
-| Zero **ACTIVE** `WebsiteVideo` assignments | `400` "Video cannot be permanently deleted while it is assigned to active websites." |
+
+> **ACTIVE `WebsiteVideo` assignments are no longer a precondition** (changed
+> 2026-08-23). They are cleaned up inside the purge transaction instead. See
+> [../API_CONTRACTS.md](../API_CONTRACTS.md) §2.12 for the rationale; the
+> `DISABLED` requirement and the canonical provenance conflict are unchanged.
 
 ### 10.1 Purge is two phases and is not atomic end to end
 
@@ -234,22 +240,29 @@ failure:
 > transactional; the external cleanup that follows is not.
 
 ```
+PHASE 0 — BUNNY ONLY, before anything is mutated (added 2026-08-23)
+    if deleteRemoteAsset && readBunnyVideoAsset(video) !== null
+        validate the local preconditions WITHOUT mutating   ← prepareBunnyRemoteDelete
+        DELETE /library/{libraryId}/videos/{videoId}        ← deleteBunnyRemoteAssetOrThrow
+            2xx / 404  -> confirmed, continue to PHASE 1
+            anything else, including BUNNY_STREAM_ENABLED=false
+                       -> ABORT. The local row is never touched. 503 returned,
+                          VIDEO_BUNNY_REMOTE_DELETE audited FAIL
 PHASE 1 — inside a single Prisma transaction
     re-read the video (status, provider, sourceType, providerAssetId,
                        thumbnailUrl, metadataJson, local asset storage keys)
     enforce the preconditions above
     disable remaining ACTIVE share links for the video
     detach ShareLinkVideo rows
+    delete WebsiteVideo rows       ← every status; onDelete: Cascade would do it
+                                     anyway, but deleting explicitly makes the
+                                     count reportable
     videoAsset.delete()            ← satellites cascade
     audit VIDEO_PURGE_COMMIT
   ── COMMIT ──────────────────────────────────────────────────────────────────
 PHASE 2 — after the commit, no transaction, all best-effort
     if deleteRemoteAsset && provider === CLOUDINARY && providerAssetId
         deleteRemoteAssetBestEffort(providerAssetId)
-    else if deleteRemoteAsset && readBunnyVideoAsset(video) !== null
-        deleteBunnyRemoteAssetBestEffort(bunnyVideoId)   ← mutually exclusive
-        (throws before any HTTP request when BUNNY_STREAM_ENABLED=false,
-         so remoteAssetDeleted stays false and the audit row is FAIL)
     deleteOwnedThumbnailBestEffort(metadataJson, thumbnailUrl)
     deleteStorageKeyBestEffort(localFileAsset.storageKey)
     deleteStorageKeyBestEffort(localThumbnailAsset.storageKey)
@@ -261,6 +274,18 @@ PHASE 2 — after the commit, no transaction, all best-effort
 If phase 2 fails, **phase 1 is already committed**. The database row is gone and
 the file or provider asset remains — an orphan that no longer has a record
 pointing at it, so a later purge cannot find it.
+
+> **Bunny is deliberately not in phase 2.** It runs in phase 0, before the
+> commit, so an unreachable Bunny aborts the purge with the row intact instead
+> of producing exactly the orphan described above. The preferred failure
+> direction for Bunny is "remote gone + local row present", which the CMS can
+> see, reconcile and retry. If phase 1 then fails after a confirmed remote
+> delete, the request reports failure honestly, the row survives, and the retry
+> succeeds because Bunny answers 404. See
+> [bunny-stream.md](./bunny-stream.md) §9.2.
+>
+> Cloudinary and local storage keep their existing phase-2 best-effort
+> behaviour; this change is scoped to the Bunny branch.
 
 ### 10.2 Orphan reporting — this part is implemented
 

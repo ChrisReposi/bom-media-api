@@ -89,6 +89,13 @@ export interface ApiEnvironmentConfig {
   bunnyStream: {
     enabled: boolean;
     libraryId: string | null;
+    /**
+     * Stream CDN hostname of the library's pull zone, e.g.
+     * `vz-xxxxxxxx.b-cdn.net`. Hostname only - no scheme, port, path, query or
+     * fragment. Required when Bunny is enabled; it is what makes thumbnail
+     * delivery addressable. Not a secret.
+     */
+    pullZoneHostname: string | null;
     tusTtlSeconds: number;
     embedTokenTtlSeconds: number;
   };
@@ -395,6 +402,10 @@ export const apiConfig = registerAs("api", (): ApiEnvironmentConfig => {
     bunnyStream: {
       enabled: parseBoolean(process.env.BUNNY_STREAM_ENABLED, false),
       libraryId: readOptionalTrimmedEnv(process.env.BUNNY_STREAM_LIBRARY_ID),
+      pullZoneHostname:
+        readOptionalTrimmedEnv(
+          process.env.BUNNY_STREAM_PULL_ZONE_HOSTNAME,
+        )?.toLowerCase() ?? null,
       tusTtlSeconds: parseBoundedInteger(
         process.env.BUNNY_STREAM_TUS_TTL_SECONDS,
         DEFAULT_BUNNY_TUS_TTL_SECONDS,

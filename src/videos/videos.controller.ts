@@ -72,6 +72,8 @@ import { UpdateLocalVideoThumbnailDto } from "./dto/update-local-video-thumbnail
 import { UpdateVideoDto } from "./dto/update-video.dto";
 import { UploadVideoDto } from "./dto/upload-video.dto";
 import {
+  BunnyVideoPreviewResponse,
+  BunnyVideoThumbnailResponse,
   CancelLocalVideoUploadResponse,
   DisableVideoResponse,
   InitBunnyVideoUploadResponse,
@@ -568,6 +570,64 @@ export class VideosController {
     return this.videosService.getVideo(id);
   }
 
+  @Post(":id/bunny/thumbnail")
+  @AdminWriteRoles()
+  @HttpCode(HttpStatus.OK)
+  @UseFilters(ThumbnailUploadMulterExceptionFilter)
+  @UseInterceptors(
+    FileInterceptor("thumbnail", {
+      // In memory on purpose: the image is forwarded straight to Bunny and is
+      // never written to permanent storage. Thumbnails are small and already
+      // bounded by the shared limit below.
+      storage: memoryStorage(),
+      limits: { fileSize: MAX_THUMBNAIL_UPLOAD_LIMIT_BYTES },
+    }),
+  )
+  @ApiOperation({
+    summary: "Upload a custom thumbnail for a Bunny Stream video",
+    description:
+      "Forwards the image to Bunny's Set Thumbnail endpoint as application/octet-stream, then re-reads the authoritative thumbnailFileName and stores the resulting CDN URL. Removes the manual Bunny dashboard step. The video must already be READY, because thumbnailTime makes Bunny extract its own thumbnail during encoding. The Bunny API key is never returned.",
+  })
+  @ApiConsumes("multipart/form-data")
+  @ApiOkResponse({ type: BunnyVideoThumbnailResponse })
+  @ApiBadRequestResponse({
+    description:
+      "Bunny Stream is disabled, the video is not Bunny-backed or is malformed, the video is not READY, or the image is missing, too large, or not an allowed type.",
+  })
+  @ApiUnauthorizedResponse({
+    description: "Missing, invalid, expired, or inactive access token.",
+  })
+  @ApiNotFoundResponse({ description: "Video not found." })
+  setBunnyVideoThumbnail(
+    @Param("id") id: string,
+    @UploadedFile() thumbnail: Express.Multer.File | undefined,
+    @CurrentAdmin() admin: SafeAdminResponse,
+  ): Promise<BunnyVideoThumbnailResponse> {
+    return this.videosService.setBunnyVideoThumbnail(id, thumbnail, admin.id);
+  }
+
+  @Get(":id/bunny/preview")
+  @AdminReadRoles()
+  @ApiOperation({
+    summary: "Get a signed Bunny Stream embed URL for admin preview",
+    description:
+      "Mints a short-lived signed iframe URL for an authenticated admin. The stored embedUrl is deliberately unsigned, so rendering it directly is rejected by Bunny with 403 while the library has Embed View Token Authentication enabled. The signed URL is never persisted, and the response never contains the Bunny API key or token security key. Gated on the same strict classifier as public playback: a malformed Bunny record fails closed rather than falling back to the stored unsigned URL.",
+  })
+  @ApiOkResponse({ type: BunnyVideoPreviewResponse })
+  @ApiBadRequestResponse({
+    description:
+      "Bunny Stream is disabled or misconfigured, the video is not backed by Bunny Stream, the Bunny record is malformed, or the video is not READY.",
+  })
+  @ApiUnauthorizedResponse({
+    description: "Missing, invalid, expired, or inactive access token.",
+  })
+  @ApiNotFoundResponse({ description: "Video not found." })
+  getBunnyVideoPreview(
+    @Param("id") id: string,
+  ): Promise<BunnyVideoPreviewResponse> {
+    return this.videosService.getBunnyVideoPreview(id);
+  }
+
   @Get(":id/binary")
   @AdminReadRoles()
   @ApiOperation({
@@ -716,7 +776,9 @@ export class VideosController {
           title: "Cloudinary player video",
           embedCodeOrUrl:
             '<iframe src="https://player.cloudinary.com/embed/?cloud_name=dekft3yz7&public_id=demo"></iframe>',
-          viewCount: 1000,
+          // A STRING, deliberately: a JSON number is rejected because it cannot
+          // carry a BIGINT exactly. See src/videos/utils/view-count.util.ts.
+          viewCount: "1000",
           publishedAt: "2026-06-01T00:00:00.000Z",
         },
       },

@@ -17,6 +17,39 @@ Swagger is enabled — this document exists to record **who consumes what** and
   `500` is always the generic `{ statusCode: 500, message: "Internal server
   error", error: "Internal Server Error" }`.
 - `BigInt` fields (`viewCount`, `sizeBytes`) are serialised as **strings**.
+- **`viewCount` must be written as a JSON STRING of decimal digits.** Every DTO
+  that accepts it declares `viewCount?: string` validated with
+  `@IsCanonicalViewCount()` (`src/videos/utils/view-count.util.ts`), and the
+  service parses it with `BigInt()`. A canonical digit string is the only
+  accepted form: `"2.5"`, `"2e3"`, `"-1"`, `"+1"`, `"0x10"`, `"2.630.122"` and
+  `"abc"` are all rejected with *"viewCount must be a non-negative integer"*.
+  Surrounding whitespace is trimmed; an internal space is not. Values above the
+  column's signed `BIGINT` range (`9223372036854775807`) are rejected with
+  *"viewCount must not exceed 9223372036854775807"* rather than overflowing the
+  database. Omitting the field means "not supplied" — 0 on create, unchanged on
+  update. Pinned by `test/view-count-validation.test.ts`.
+
+  > **CHANGED 2026-08-23: a JSON NUMBER is now rejected.** `{ "viewCount":
+  > 2630122 }` returns `400` *"viewCount must be sent as a JSON string of
+  > decimal digits, not a JSON number"*. The DTOs previously ran the parsed
+  > number through `String(value)` **before** validation, which silently
+  > destroyed precision: `JSON.parse` turns the literal `9007199254740993` into
+  > the double `9007199254740992`, so the stringified `"9007199254740992"`
+  > passed `/^\d+$/` and was persisted as a different integer than the client
+  > sent. The transform now leaves a non-string untouched so the validator can
+  > see its type and refuse it. No numeric form is accepted, safe range or not,
+  > because the contract must not depend on JavaScript's number range.
+  >
+  > No shipped caller is affected: `bom-media-admin` sends the canonical string
+  > on every path (JSON and multipart alike) and `public_website` only ever
+  > READS the field. The one numeric occurrence in this repository was the
+  > Swagger example on `POST /admin/videos/embed`, now `"1000"`.
+  >
+  > **Human thousands grouping is a UI concern, not an API one.** The admin
+  > console canonicalises `2.630.122`, `2,630,122`, `2 630 122` and `2_630_122`
+  > to `"2630122"` before sending
+  > (`bom-media-admin/src/features/videos/viewCountUtils.ts`); the API accepts
+  > only the canonical form.
 - Validation is strict: unknown body properties are rejected with `400`.
 - Consumer column: **A** = `bom-media-admin`, **P** = `public_website`,
   **—** = no shipped consumer (operators, scripts, curl).
@@ -49,6 +82,8 @@ Swagger is enabled — this document exists to record **who consumes what** and
 | `/admin/videos/upload-local/*` | POST/GET | access token | write / read | **A** |
 | `/admin/videos/bunny/upload-init` | POST | access token | write | **A** |
 | `/admin/videos/:id/bunny/sync` | POST | access token | write | **A** |
+| `/admin/videos/:id/bunny/preview` | GET | access token | read | **A** |
+| `/admin/videos/:id/bunny/thumbnail` | POST | access token | write | **A** |
 | `/admin/videos/:id/binary`, `/:id/thumbnail-local` | PATCH | access token | write | **A** |
 | `/admin/videos/:id/purge` | POST | access token | **OWNER** | **A** |
 | `/admin/websites*`, `/admin/domains*`, `/admin/domain-groups*` | various | access token | read / write | **A** |
@@ -321,7 +356,20 @@ Preconditions, each with its own failure:
 | No `CanonicalVideoShareLink` for the video | `409 VIDEO_HAS_CANONICAL_SHARE_LINK` |
 | Video exists | `404` |
 | Video status is `DISABLED` | `400` "Video must be disabled before it can be permanently deleted." |
-| No **ACTIVE** `WebsiteVideo` assignments | `400` "Video cannot be permanently deleted while it is assigned to active websites." |
+
+> **An ACTIVE `WebsiteVideo` assignment no longer blocks the purge (changed
+> 2026-08-23).** It used to return `400 "Video cannot be permanently deleted
+> while it is assigned to active websites."`, which forced an operator to visit
+> every website and unassign by hand before removing a video they had **already
+> disabled**. `status === DISABLED` is the real safety property and is
+> unchanged: a `DISABLED` video is administratively unavailable, its `ACTIVE`
+> share links were already disabled by `disableVideo()`, and public resolution
+> requires `READY` — so no assignment can make it playable.
+>
+> The assignment is now relationship state the purge transaction cleans up,
+> exactly like `ShareLinkVideo`. **Unchanged:** the `DISABLED` requirement, the
+> `409 VIDEO_HAS_CANONICAL_SHARE_LINK` provenance conflict, the OWNER role gate
+> and the `confirmVideoId` check.
 
 **Purge is two phases and is not atomic end to end.** See
 [features/video-pipeline.md](./features/video-pipeline.md#10-deleting) for the
@@ -330,13 +378,66 @@ links, detaches `ShareLinkVideo` rows, deletes the `VideoAsset` and writes
 `VIDEO_PURGE_COMMIT`; **after that transaction commits**, external asset cleanup
 runs best-effort and non-transactionally.
 
+> **BUNNY IS THE EXCEPTION, and runs REMOTE FIRST (changed 2026-08-23).** When
+> `deleteRemoteAsset: true` is sent for a Bunny-backed asset, the local
+> preconditions are validated, the Bunny video is deleted, and **only then** does
+> the local purge transaction run. If Bunny does not confirm the delete — a
+> timeout, a 5xx, a 429, an auth failure, or the feature being disabled — the
+> purge **aborts with `503` and the local row survives**. A 404 counts as
+> confirmed, which is what makes a retry work.
+>
+> Rationale: "remote gone + local row present" is visible and retriable, while
+> "local row gone + remote present" is an invisible billable orphan. Cloudinary,
+> `DIRECT_URL`, `EMBED`, `LOCAL_FILE` and `DB_BLOB` keep their existing
+> post-transaction best-effort ordering unchanged.
+
+> **Bunny unavailable carries a stable code (added 2026-08-23).** When the purge
+> asks for remote deletion but Bunny cannot confirm it *at all* — the feature is
+> switched off, or the collaborator is not wired into the container — the
+> response is `400` with:
+>
+> ```jsonc
+> { "code": "BUNNY_STREAM_UNAVAILABLE_FOR_PURGE",
+>   "reason": "NOT_ENABLED" | "NOT_WIRED",
+>   "message": "Bunny Stream is not enabled on this server, so remote deletion
+>               cannot be confirmed. The local video was kept. Enable Bunny
+>               Stream and retry, or explicitly choose local-only purge if that
+>               is intentional." }
+> ```
+>
+> This replaces the bare `400 "Bunny Stream is not enabled."`, which told an
+> operator neither that the video survived nor what to do next, and was raised
+> by two unrelated conditions with no way to tell them apart. `reason` separates
+> them: `NOT_ENABLED` is a configuration choice, `NOT_WIRED` is a server defect.
+> Neither value discloses a key, a library id or a hostname.
+>
+> **The purge is ABORTED**, exactly as for any other unconfirmed remote delete:
+> the `VideoAsset`, its `WebsiteVideo` assignments and its `ShareLinkVideo`
+> memberships all survive, no `VIDEO_PURGE_COMMIT` is written, and
+> `VIDEO_BUNNY_REMOTE_DELETE` is audited `FAIL` with `localPurgeStage:
+> "ABORTED"`. A client must **never** respond by silently retrying local-only —
+> that recreates the orphan the remote-first ordering exists to prevent.
+> Retrying with `deleteRemoteAsset: false` is a legitimate operator decision and
+> is unaffected: it returns null from `prepareBunnyRemoteDelete()` before this
+> check and issues **zero** Bunny calls.
+>
+> A *transient* Bunny failure is a different response and keeps its existing
+> `503` — retrying that one can work, so it must not be conflated with this.
+>
+> The `deleteRemoteAsset` field itself is unchanged and still defaults to
+> `false` when omitted. What changed is the **Admin default**: the console now
+> shows a remote-deletion checkbox for Bunny assets, defaults it **ON**, and
+> **always sends the field explicitly** (`true` or `false`) rather than relying
+> on omission. Omitted and explicit `false` are equivalent and both mean
+> local-only purge; that compatibility is pinned by `test/video-purge.test.ts`.
+
 The response reports what actually happened, including orphans:
 
 ```jsonc
 { "message": "…", "videoId": "…", "sourceType": "…", "status": "PURGED",
   "safety":  { "hadWebsiteAssignments", "hadShareLinks",
                "activeWebsiteAssignmentCount", "disabledShareLinkCount",
-               "detachedShareLinkVideoCount" },
+               "detachedShareLinkVideoCount", "detachedWebsiteAssignmentCount" },
   "storage": { "localVideoDeleteAttempted", "localVideoDeleted",
                "localThumbnailDeleteAttempted", "localThumbnailDeleted",
                "bytesReclaimed" /* string */, "orphanCleanupRequired" },
@@ -351,14 +452,18 @@ The response reports what actually happened, including orphans:
 
 ### 2.13 Bunny Stream
 
-Two endpoints, both write-role, both on `VideosController` so they inherit the
-existing guards and the `admin` throttle profile. Both return
+Four endpoints — three write-role, one read-role — all on `VideosController` so
+they inherit the existing guards and the `admin` throttle profile. All return
 `400 "Bunny Stream is not enabled."` while `BUNNY_STREAM_ENABLED=false`.
 
 ```jsonc
 // POST /admin/videos/bunny/upload-init
 // request - only `title` is required
 { "title": "string(<=200)", "description"?, "slug"?, "viewCount"?, "publishedAt"?, "filterKey"? }
+//
+// The Bunny Create Video call this makes always carries `thumbnailTime` (ms),
+// so a video uploaded with NO custom image still gets an automatic poster
+// extracted during encoding. It is a server-side constant, not a request field.
 
 // 201
 { "message": "Bunny Stream upload initialized.",
@@ -389,16 +494,127 @@ There is deliberately **no `status` field** in the request: a Bunny asset starts
   "video": VideoResponse,
   "bunnyStatus": 4,        // raw Bunny code, or null
   "encodeProgress": 100,   // 0-100, or null. TRANSIENT - never persisted
-  "statusChanged": true }
+  "statusChanged": true,
+  "remoteMissing": false }
+
+// 200 - Bunny returned an authoritative 404
+{ "message": "Bunny Stream reports this video no longer exists. …",
+  "video": VideoResponse,  // status FAILED (or DISABLED if it already was)
+  "bunnyStatus": null,
+  "encodeProgress": null,
+  "statusChanged": true,
+  "remoteMissing": true }
 ```
 
 Errors: `400` when Bunny is disabled or the video is not Bunny-backed, `404`
 when the video does not exist, `503` when Bunny is unreachable.
 
+> **`remoteMissing` (added 2026-08-23) is a success response, not an error.**
+> Bunny answered an authoritative 404 for this video id, so the remote asset is
+> gone. The backend **keeps** the local record, marks it in
+> `metadataJson.bunnyStream.remoteMissing`, and demotes it out of `READY` so it
+> stops being publicly playable and stops being eligible for new share links.
+> Clients must branch on this field rather than parsing a message.
+>
+> A **transient** Bunny failure never sets it — that surfaces as `503`/`500`
+> with nothing changed locally, and in particular with `READY` not demoted. The
+> field is additive and defaults to `false`, so an existing client is unaffected.
+> Full lifecycle in [features/bunny-stream.md](./features/bunny-stream.md) §9.
+
 Status mapping - 4 (Finished) to `READY`; 5 (Error) and 6 (UploadFailed) to
 `FAILED`; everything else, including 3 (**Transcoding**), to `PROCESSING`.
-`DISABLED` and `READY` are never overwritten. Details in
+`DISABLED` and `READY` are never overwritten **by an encoding state**. Details in
 [features/bunny-stream.md](./features/bunny-stream.md) section 4.3.
+
+> **One exception, and only one: an authoritative 404.** `READY` IS demoted to
+> `FAILED` when Bunny states the video does not exist, because leaving it `READY`
+> would keep a nonexistent video publicly playable. `DISABLED` still wins even
+> then. No transient failure can trigger this. See
+> [features/bunny-stream.md](./features/bunny-stream.md) §9.3.
+
+> **Sync also persists the poster.** When the local `thumbnailUrl` is empty and
+> Bunny reports a `thumbnailFileName`, sync **builds**
+> `https://{BUNNY_STREAM_PULL_ZONE_HOSTNAME}/{videoGuid}/{thumbnailFileName}`
+> and stores it on the `VideoAsset`, so
+> `video.thumbnailUrl` becomes non-null in this response and in every later admin
+> list/detail read. It never overwrites a thumbnail an operator set, and it now
+> writes even when `statusChanged` is `false` — an already-`READY` asset is
+> exactly the backfill case. See
+> [features/bunny-stream.md](./features/bunny-stream.md) section 4.4.
+
+```jsonc
+// GET /admin/videos/:id/bunny/preview
+// no request body
+
+// 200
+{ "embedUrl": "https://iframe.mediadelivery.net/embed/<library>/<guid>?token=<64 hex>&expires=<unix>&autoplay=false",
+  "expires": 1756000000 }
+```
+
+> **`autoplay=false` is deliberate.** The Bunny library's Player settings
+> default to autoplay, so the embed renders `<video ... autoplay ...>`. Admin
+> preview must open paused. It is Bunny's documented per-embed override, is not
+> covered by the embed token (which hashes `videoId + expires` only), and
+> changes no library setting. The **public** reviewer URL carries the same
+> parameter for its own reason — see §3.1.2.
+
+Read-role (`@AdminReadRoles()`). Errors: `400` when Bunny is disabled or
+misconfigured, when the video is not Bunny-backed, when the Bunny record is
+`bunny-malformed`, or when the video is not `READY`; `404` when the video does
+not exist.
+
+> **CONTRACT INVARIANT: the admin console must render this signed URL, never the
+> stored `embedUrl`.** The stored value is deliberately unsigned
+> (`buildUnsignedEmbedUrl()`), and Bunny rejects it with **403** while the
+> library has Embed View Token Authentication enabled. The signed URL is minted
+> per request, **never persisted**, and the response never contains
+> `BUNNY_STREAM_API_KEY` or `BUNNY_STREAM_TOKEN_SECURITY_KEY` — the token
+> security key is only an input to the hash.
+
+> **CONTRACT INVARIANT: it fails closed and signs nothing on refusal.** The
+> endpoint is gated on the same strict `classifyBunnyVideoAsset()` predicate as
+> public playback, so a `bunny-malformed` record is refused rather than falling
+> back to generic embed handling, which would hand out a permanent unsigned
+> Bunny URL to an admin surface. Proven by `test/bunny-admin-preview.test.ts`,
+> which asserts a signing-spy count of zero on every refusal path.
+
+This is an **admin preview** path and is entirely separate from public watch
+resolution: it does not consume a view, does not touch share links, and does not
+change §3 in any way.
+
+```
+POST /admin/videos/:id/bunny/thumbnail      multipart/form-data, field: thumbnail
+
+// 200
+{ "message": "Bunny Stream thumbnail updated.",
+  "video": VideoResponse,
+  "thumbnailUrl": "https://vz-xxxxxxxx.b-cdn.net/<guid>/thumbnail_ab12cd34.jpg",
+  "thumbnailPersisted": true }
+```
+
+Write-role. Uploads an operator-chosen image to Bunny's Set Thumbnail endpoint
+as `application/octet-stream`, then re-reads `thumbnailFileName` and stores the
+built CDN URL on the `VideoAsset`. **This is what removes the manual Bunny
+dashboard step.**
+
+Errors: `400` when Bunny is disabled, the video is not Bunny-backed or is
+`bunny-malformed`, the video is **not `READY`**, or the image is missing, empty,
+too large, of an unsupported type, or its magic bytes contradict its declared
+type; `404` when the video does not exist.
+
+> **The video must be `READY` first.** `thumbnailTime` makes Bunny extract its
+> own main thumbnail *during* encoding, so an image set earlier can be replaced
+> by that extraction. The endpoint refuses a non-`READY` asset rather than
+> risking a silently discarded poster.
+
+> **`thumbnailPersisted: false` is a success, not an error.** It means Bunny
+> accepted the image but has not exposed a `thumbnailFileName` yet. Nothing is
+> written, the video stays `READY`, and the next status sync backfills the URL.
+> A file name is never guessed.
+
+> **Binary body only.** Bunny's `thumbnailUrl` query mode is deliberately not
+> used — accepting a caller-supplied URL would make this backend an SSRF
+> fetcher.
 
 ---
 
@@ -495,6 +711,31 @@ request occurs during playback.
 > that a browser already received keeps working for as long as the provider
 > serves it. Do not describe revocation as universal. See
 > [SECURITY_MODEL.md §4.1](./SECURITY_MODEL.md#41-backend-served-media-versus-providerdirect-media).
+
+### 3.1.2 The Bunny reviewer URL opens on the poster
+
+Since 2026-08-23 the signed Bunny `embedUrl` returned to the public site carries
+Bunny's documented per-embed override:
+
+```
+…/embed/<library>/<guid>?token=<64 hex>&expires=<unix>&autoplay=false
+```
+
+**Why.** The library's Player setting defaults to autoplay, so the embed renders
+`<video ... autoplay ...>` and playback began the instant the iframe loaded —
+the reviewer never saw a poster frame. Bunny's own embed already carries the
+correct `data-poster`, so suppressing autoplay is what makes it visible. A share
+link now opens on a recognisable still frame and plays on one click, which is
+the intended reviewer experience.
+
+**What did NOT change.** The parameter is appended *after* the credential pair
+and is not part of the embed token (`videoId + expires` only), so it cannot
+weaken or invalidate the signature. Authorization, the four-stage signing order
+and the atomic view consumption are untouched, and the full release-blocking
+share-link compatibility suite passes unchanged.
+
+> Clients must pass `embedUrl` through **verbatim**. Stripping the query — or
+> re-adding `autoplay=true` — is not a supported modification.
 
 The public site accepts both endpoints and tries `exchange` first, falling back
 to the legacy `GET` (`enableLegacyWatchFallback: true`). Removing the legacy

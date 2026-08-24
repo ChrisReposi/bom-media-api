@@ -17,6 +17,7 @@ import {
   MIN_BUNNY_EMBED_TOKEN_TTL_SECONDS,
   MIN_BUNNY_TUS_TTL_SECONDS,
 } from "../bunny/bunny-stream.constants";
+import { isBunnyPullZoneHostname } from "../bunny/bunny-thumbnail.util";
 import { isAbsolute } from "node:path";
 import proxyaddr from "proxy-addr";
 
@@ -898,6 +899,12 @@ export function validateEnv(
     config,
     "BUNNY_STREAM_TOKEN_SECURITY_KEY",
   );
+  // Hostname only, lower-cased. NOT a secret - it is the public CDN host that
+  // already appears in every thumbnail URL a browser loads.
+  const bunnyPullZoneHostname = readOptionalTrimmedString(
+    config,
+    "BUNNY_STREAM_PULL_ZONE_HOSTNAME",
+  )?.toLowerCase();
 
   if (validated.BUNNY_STREAM_ENABLED === "true") {
     if (bunnyLibraryId === undefined) {
@@ -918,6 +925,19 @@ export function validateEnv(
         "BUNNY_STREAM_TOKEN_SECURITY_KEY is required when BUNNY_STREAM_ENABLED=true",
       );
     }
+    // Fail fast rather than silently serving videos with no poster: thumbnail
+    // delivery is `https://{pull_zone}/{videoId}/{thumbnailFileName}`, so
+    // without this hostname no thumbnail URL can be built at all.
+    if (bunnyPullZoneHostname === undefined) {
+      throw new Error(
+        "BUNNY_STREAM_PULL_ZONE_HOSTNAME is required when BUNNY_STREAM_ENABLED=true",
+      );
+    }
+    if (!isBunnyPullZoneHostname(bunnyPullZoneHostname)) {
+      throw new Error(
+        "BUNNY_STREAM_PULL_ZONE_HOSTNAME must be a bare CDN hostname such as vz-xxxxxxxx.b-cdn.net (no scheme, port, path or trailing slash)",
+      );
+    }
   }
 
   if (bunnyLibraryId !== undefined) {
@@ -928,6 +948,9 @@ export function validateEnv(
   }
   if (bunnyTokenSecurityKey !== undefined) {
     validated.BUNNY_STREAM_TOKEN_SECURITY_KEY = bunnyTokenSecurityKey;
+  }
+  if (bunnyPullZoneHostname !== undefined) {
+    validated.BUNNY_STREAM_PULL_ZONE_HOSTNAME = bunnyPullZoneHostname;
   }
 
   validated.BUNNY_STREAM_TUS_TTL_SECONDS = String(

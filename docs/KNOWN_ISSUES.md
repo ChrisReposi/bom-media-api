@@ -144,10 +144,11 @@ real friction) · `LOW` (hygiene, correctness of documentation, cleanup).
   `BUNNY_STREAM_ENABLED`, `BUNNY_STREAM_LIBRARY_ID`, `BUNNY_STREAM_API_KEY`,
   `BUNNY_STREAM_TOKEN_SECURITY_KEY` and the two TTL variables are read by
   `BunnyStreamService` and `env.validation.ts`. `BUNNY_STREAM_SIGNING_KEY` was
-  removed from the templates; only `BUNNY_STREAM_PULL_ZONE_HOSTNAME` remains
-  reserved.
-- **Direction.** Keep `MUX_*` and `BUNNY_STREAM_PULL_ZONE_HOSTNAME` as
-  clearly-labelled reservations; remove or wire up the rest. Full table in
+  removed from the templates. **`BUNNY_STREAM_PULL_ZONE_HOSTNAME` is also read
+  since 2026-08-23** — thumbnail delivery is built from it, and it is required
+  when Bunny is enabled. **No `BUNNY_*` variable is inert any more.**
+- **Direction.** Keep `MUX_*` as a clearly-labelled reservation; remove or wire
+  up the rest. Full table in
   [ENVIRONMENT.md](./ENVIRONMENT.md#15-declared-but-not-read-by-any-code).
 - **Safe to defer?** Yes, now that they are documented.
 
@@ -390,6 +391,12 @@ real friction) · `LOW` (hygiene, correctness of documentation, cleanup).
   `remote.*` and `orphanCleanupRequired`, and the audit row is downgraded to
   `FAIL`. `scripts/storage/find-orphan-local-files.example.sh` reconciles the
   local storage root — but **not** orphaned Cloudinary assets.
+- **Narrowed 2026-08-23 for Bunny only.** The Bunny remote delete was moved
+  *before* the transaction, so an unreachable Bunny now aborts the purge with the
+  local row intact instead of committing the delete and orphaning the Bunny
+  asset. Bunny orphans are additionally discoverable with `yarn reconcile:bunny`.
+  This entry still stands in full for Cloudinary and for local storage, which
+  keep the post-commit best-effort ordering.
 - **Direction.** Keep the ordering; deleting files before the commit would risk
   destroying assets for a transaction that then rolls back. Ensure operators
   actually read `orphanCleanupRequired`, and add Cloudinary-side reconciliation

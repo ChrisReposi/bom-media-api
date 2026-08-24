@@ -72,6 +72,19 @@ Auth actions: `ADMIN_LOGIN_SUCCESS`, `ADMIN_LOGIN_FAILURE`,
 `ADMIN_SESSION_REVOKE_SUCCESS`. Domain modules add their own
 (`VIDEO_UPLOAD`, `VIDEO_EMBED_CREATE`, `SHARE_LINK_CREATE`, …).
 
+Offline maintenance writes its **own** actions with `adminId: null`, because
+attributing an unattended sweep to a person would falsify the trail:
+
+| Action | Written by | `entityType` |
+|---|---|---|
+| `VIDEO_BUNNY_REMOTE_MISSING` / `VIDEO_BUNNY_REMOTE_RECOVERED` | `yarn reconcile:bunny --apply` | `VideoAsset` |
+| `SHARE_LINK_STATUS_RECONCILE` | `yarn reconcile:share-links --apply` | `ShareLink` |
+
+`SHARE_LINK_STATUS_RECONCILE` records `{ previousStatus: "DISABLED", nextStatus:
+"ACTIVE", memberCount, source }` and deliberately **no** credential — the sweep
+never selects `alias` or `tokenHash`. One row per link actually flipped, so
+`COUNT(*)` over it is the exact size of the historical residue that was healed.
+
 Audit writes are best effort: a failure is logged as a warning and never fails
 the request. Indexed by `createdAt`, `adminId`, `module` and
 `(entityType, entityId)`.

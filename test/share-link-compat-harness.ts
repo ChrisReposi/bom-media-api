@@ -951,6 +951,53 @@ export class CompatPrismaService {
       return record === undefined ? null : { ...record };
     },
 
+    /**
+     * Backs the share-link REACTIVATION candidate read in
+     * `reactivateShareLinksDisabledWithVideo()`.
+     *
+     * Every predicate is applied ONLY when the query supplies it, matching the
+     * rest of this fake: dropping `status` from production would surface as
+     * "a REVOKED or EXPIRED link came back to life" and dropping the membership
+     * filter as "an unrelated link came back to life", rather than as a blanket
+     * "nothing reactivates".
+     *
+     * The member projection returns each row's video `status`, which is what
+     * the "no member is still DISABLED" rule reads. It resolves through
+     * `findVideo()` - the live fixture row - so a status mutated earlier in the
+     * same transaction is visible here, exactly as it would be in the database.
+     */
+    findMany: async (args: {
+      where?: {
+        status?: ShareLinkStatus;
+        shareLinkVideos?: { some?: { videoId?: string } };
+      };
+    }) => {
+      const wantedStatus = args.where?.status;
+      const memberVideoId = args.where?.shareLinkVideos?.some?.videoId;
+
+      return this.shareLinks
+        .filter((link) => {
+          if (wantedStatus !== undefined && link.status !== wantedStatus) {
+            return false;
+          }
+          if (
+            memberVideoId !== undefined &&
+            !link.shareLinkVideos.some((row) => row.videoId === memberVideoId)
+          ) {
+            return false;
+          }
+
+          return true;
+        })
+        .map((link) => ({
+          ...link,
+          shareLinkVideos: link.shareLinkVideos.map((row) => ({
+            ...row,
+            video: { status: this.findVideo(row.videoId).status },
+          })),
+        }));
+    },
+
     findUniqueOrThrow: async (args: {
       where: { id: string };
       include?: { shareLinkVideos?: ShareLinkVideosQuery };

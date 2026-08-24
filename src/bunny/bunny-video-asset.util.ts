@@ -194,7 +194,9 @@ export type BunnyRemoteMissingMarker = {
 export function readBunnyRemoteMissing(
   metadataJson: unknown,
 ): BunnyRemoteMissingMarker | null {
-  const bunnyStream = asRecord(asRecord(metadataJson)?.[BUNNY_STREAM_METADATA_KEY]);
+  const bunnyStream = asRecord(
+    asRecord(metadataJson)?.[BUNNY_STREAM_METADATA_KEY],
+  );
   if (bunnyStream === null) {
     return null;
   }
@@ -264,9 +266,10 @@ export function applyBunnyRemoteMissingMarker(
  * an earlier 404 can never poison a record permanently. Everything else is
  * preserved, exactly as in `applyBunnyRemoteMissingMarker()`.
  */
-export function clearBunnyRemoteMissingMarker(
-  metadataJson: unknown,
-): { metadata: Record<string, unknown>; changed: boolean } {
+export function clearBunnyRemoteMissingMarker(metadataJson: unknown): {
+  metadata: Record<string, unknown>;
+  changed: boolean;
+} {
   const metadata = { ...(asRecord(metadataJson) ?? {}) };
   const bunnyStream = asRecord(metadata[BUNNY_STREAM_METADATA_KEY]);
 

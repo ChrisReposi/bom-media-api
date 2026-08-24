@@ -423,7 +423,8 @@ export class BunnyVideoPreviewResponse {
 
   @ApiProperty({
     example: 1756000000,
-    description: "Unix seconds at which the signed embed URL stops being valid.",
+    description:
+      "Unix seconds at which the signed embed URL stops being valid.",
   })
   expires!: number;
 }

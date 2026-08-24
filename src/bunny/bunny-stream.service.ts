@@ -273,10 +273,7 @@ export class BunnyStreamService {
    * failure propagates truthfully - this never reports a success Bunny did not
    * give. The API key is an internal header and is never returned or logged.
    */
-  async setVideoThumbnail(
-    videoId: string,
-    thumbnail: Buffer,
-  ): Promise<void> {
+  async setVideoThumbnail(videoId: string, thumbnail: Buffer): Promise<void> {
     this.ensureEnabled();
     const libraryId = this.getLibraryId();
 

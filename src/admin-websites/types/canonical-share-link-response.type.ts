@@ -28,6 +28,13 @@ export class CanonicalShareLinkResponse {
   })
   publicUrl!: string;
 
+  @ApiProperty({
+    example: "https://plushcomedystudios.com/watch#k=G3tqak0",
+    description:
+      "The V2 reviewer URL an operator copies. Built from the same snapshotted host and the same alias, so it is byte-identical for the pair forever. `publicUrl` above stays in the pinned provenance shape for records already filed.",
+  })
+  reviewUrl!: string;
+
   @ApiProperty({ example: "G3tqak0" })
   alias!: string;
 

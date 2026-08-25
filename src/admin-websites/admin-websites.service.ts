@@ -1878,10 +1878,22 @@ export class AdminWebsitesService {
     };
   }
 
+  /**
+   * The MULTI-VIDEO share-link path. An exact single-video request never
+   * reaches this method: `CanonicalShareLinkService.createShareLinkForRequest()`
+   * routes those to the canonical get-or-create so the pair keeps one identity.
+   *
+   * `resolvedVideoIds` is supplied by that router, which already resolved the
+   * set in order to make the routing decision. Re-resolving here would open a
+   * window in which the set changes between the two reads, and a request routed
+   * as multi-video could then create a single-video link outside the canonical
+   * mapping — the exact duplicate this change exists to prevent.
+   */
   async createShareLink(
     websiteId: string,
     dto: CreateShareLinkDto,
     adminId: string,
+    resolvedVideoIds?: string[],
   ): Promise<CreateShareLinkResponse> {
     let stage = "start";
 
@@ -1899,10 +1911,9 @@ export class AdminWebsitesService {
       await this.ensureActiveWebsiteExists(websiteId);
 
       stage = "resolve-video-ids";
-      const selectedVideoIds = await this.resolveShareLinkVideoIds(
-        websiteId,
-        dto,
-      );
+      const selectedVideoIds =
+        resolvedVideoIds ??
+        (await this.resolveShareLinkVideoIds(websiteId, dto));
       if (selectedVideoIds.length === 0) {
         throw new BadRequestException("No playable videos selected.");
       }
@@ -2034,6 +2045,8 @@ export class AdminWebsitesService {
         shareLink: this.toShareLinkResponse(shareLink, publicUrl),
         rawToken,
         publicUrl,
+        outcome: "CREATED",
+        isCanonical: false,
       };
     } catch (error) {
       this.logger.error(
@@ -2971,7 +2984,14 @@ export class AdminWebsitesService {
     }
   }
 
-  private async resolveShareLinkVideoIds(
+  /**
+   * Public because canonical routing must decide "is this request for EXACTLY
+   * one video?" against the SAME resolved set this method produces, not against
+   * the raw `dto.videoIds`. An omitted `videoIds` resolves to the website's
+   * whole active assignment set, so a website holding one video yields a
+   * genuine single-video link and must reach the canonical path too.
+   */
+  async resolveShareLinkVideoIds(
     websiteId: string,
     dto: CreateShareLinkDto,
   ): Promise<string[]> {

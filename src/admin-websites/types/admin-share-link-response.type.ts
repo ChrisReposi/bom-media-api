@@ -68,13 +68,29 @@ export class CreateShareLinkResponse {
   @ApiProperty({ type: AdminShareLinkResponse })
   shareLink!: AdminShareLinkResponse;
 
-  @ApiProperty({
-    description: "Raw token is returned only once during creation.",
+  @ApiPropertyOptional({
+    description:
+      "Raw token is returned only once during creation, and only on the multi-video path. It is ABSENT for an exact single-video request, which resolves the canonical link: on reuse no token was minted, and on first creation the canonical contract deliberately does not expose one — the alias in `publicUrl` is the credential.",
   })
-  rawToken!: string;
+  rawToken?: string;
 
   @ApiPropertyOptional({ nullable: true })
   publicUrl!: string | null;
+
+  @ApiProperty({
+    enum: ["CREATED", "REUSED"],
+    example: "REUSED",
+    description:
+      "`REUSED` means no row was written: an exact single-video request resolved the canonical link that already existed for this website+video pair. Multi-video requests are always `CREATED`.",
+  })
+  outcome!: "CREATED" | "REUSED";
+
+  @ApiProperty({
+    example: false,
+    description:
+      "True when this link is the canonical one for a website+video pair, i.e. the request was for exactly one video.",
+  })
+  isCanonical!: boolean;
 }
 
 export class RevokeShareLinkResponse {

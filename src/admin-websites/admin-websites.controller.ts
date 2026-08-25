@@ -533,10 +533,17 @@ export class AdminWebsitesController {
   @ApiOperation({
     summary: "Create share link",
     description:
-      "Returns rawToken and publicUrl only once. tokenHash is never returned.",
+      "Multi-video: creates a new bundle link and returns rawToken and publicUrl once. tokenHash is never returned. EXACTLY ONE video: idempotently resolves the canonical link for that website+video pair — the same id, alias and publicUrl every time, `outcome: REUSED` when nothing was written, and no rawToken. A canonical request must not carry label, expiresAt or maxViews.",
   })
   @ApiCreatedResponse({ type: CreateShareLinkResponse })
-  @ApiBadRequestResponse()
+  @ApiBadRequestResponse({
+    description:
+      "Includes CANONICAL_LINK_OPTIONS_NOT_ALLOWED when a single-video request carries label, expiresAt or maxViews.",
+  })
+  @ApiConflictResponse({
+    description:
+      "Single-video only, and never accompanied by a replacement link. CANONICAL_LINK_REVOKED, CANONICAL_LINK_INACTIVE, CANONICAL_DOMAIN_UNAVAILABLE, CANONICAL_EVIDENCE_DRIFT, CANONICAL_EVIDENCE_INCOMPLETE and CANONICAL_VIDEO_NOT_SHAREABLE mean the pair's canonical link exists but is not currently usable. CANONICAL_LINK_AMBIGUOUS (with candidateCount) means several historical links already contain exactly this video on this website and no mapping records which is official — an owner must adopt one; nothing was written.",
+  })
   @ApiUnauthorizedResponse()
   @ApiNotFoundResponse()
   createShareLink(
@@ -544,7 +551,11 @@ export class AdminWebsitesController {
     @Body() dto: CreateShareLinkDto,
     @CurrentAdmin() admin: SafeAdminResponse,
   ): Promise<CreateShareLinkResponse> {
-    return this.websitesService.createShareLink(websiteId, dto, admin.id);
+    return this.canonicalShareLinkService.createShareLinkForRequest(
+      websiteId,
+      dto,
+      admin.id,
+    );
   }
 
   @Get("websites/:websiteId/videos/:videoId/canonical-share-link")

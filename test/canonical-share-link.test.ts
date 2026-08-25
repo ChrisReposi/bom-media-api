@@ -75,6 +75,13 @@ class FakePrisma {
   audits: { action: string; entityId: string }[] = [];
   failNextShareLinkCreateWith: unknown = null;
   failNextCanonicalCreateWith: unknown = null;
+  /**
+   * Simulates losing the pair race honestly: a P2002 means a row for this pair
+   * NOW EXISTS, so the hook commits the winner's mapping before throwing. A
+   * bare throw would let the loser's reload find nothing, which is a state the
+   * database cannot actually produce.
+   */
+  raceWinnerShareLinkIdOnNextCanonicalCreate: string | null = null;
   lastVideoFindUniqueArgs: Record<string, unknown> | null = null;
   private sequence = 0;
 
@@ -166,6 +173,54 @@ class FakePrisma {
       const link = this.shareLinks.get(args.where.id);
       return link ? this.withVideos(link) : null;
     },
+    /**
+     * Models ONLY the predicates the production query actually sends, each
+     * applied only when present. Dropping one from the service therefore
+     * surfaces as a wrong candidate set — the failure this harness exists to
+     * catch — rather than as "nothing matches".
+     */
+    findMany: async (args: {
+      where: {
+        websiteId: string;
+        canonicalVideoShareLink?: { is: null };
+        shareLinkVideos?: { some: { videoId: string } };
+      };
+      orderBy?: { createdAt: "asc" };
+    }): Promise<
+      {
+        id: string;
+        alias: string | null;
+        shareLinkVideos: { videoId: string }[];
+      }[]
+    > => {
+      const anchored = new Set(
+        [...this.canonicals.values()].map((row) => row.shareLinkId),
+      );
+      const needle = args.where.shareLinkVideos?.some.videoId;
+
+      return [...this.shareLinks.values()]
+        .filter((link) => link.websiteId === args.where.websiteId)
+        .filter(
+          (link) =>
+            args.where.canonicalVideoShareLink === undefined ||
+            !anchored.has(link.id),
+        )
+        .filter(
+          (link) =>
+            needle === undefined ||
+            this.shareLinkVideos.some(
+              (row) => row.shareLinkId === link.id && row.videoId === needle,
+            ),
+        )
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+        .map((link) => ({
+          id: link.id,
+          alias: link.alias,
+          shareLinkVideos: this.shareLinkVideos
+            .filter((row) => row.shareLinkId === link.id)
+            .map((row) => ({ videoId: row.videoId })),
+        }));
+    },
   };
 
   shareLinkVideo = {
@@ -204,6 +259,24 @@ class FakePrisma {
     create: async (args: {
       data: Omit<FakeCanonical, "id" | "createdAt" | "updatedAt">;
     }): Promise<FakeCanonical> => {
+      if (this.raceWinnerShareLinkIdOnNextCanonicalCreate !== null) {
+        const winnerShareLinkId =
+          this.raceWinnerShareLinkIdOnNextCanonicalCreate;
+        this.raceWinnerShareLinkIdOnNextCanonicalCreate = null;
+        const winner: FakeCanonical = {
+          ...args.data,
+          shareLinkId: winnerShareLinkId,
+          id: this.nextId("canonical"),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        this.canonicals.set(winner.id, winner);
+        throw new Prisma.PrismaClientKnownRequestError("unique", {
+          code: "P2002",
+          clientVersion: "7.8.0",
+          meta: { target: "CanonicalVideoShareLink_websiteId_videoId_key" },
+        });
+      }
       if (this.failNextCanonicalCreateWith !== null) {
         const error = this.failNextCanonicalCreateWith;
         this.failNextCanonicalCreateWith = null;
@@ -752,32 +825,24 @@ describe("canonical create-or-get", () => {
   it("returns REUSED when losing the unique-pair race", async () => {
     const { prisma, service } = createService();
     const winner = await service.createOrGetCanonical("site-a", "video-1", "x");
+    const winnerShareLinkId = winner.shareLink.id;
 
-    // Simulate a racing request that passed the findUnique gate before the
-    // winner committed: force the next canonical create into the P2002 path.
-    prisma.canonicals.delete([...prisma.canonicals.keys()][0]);
-    prisma.failNextCanonicalCreateWith =
-      new Prisma.PrismaClientKnownRequestError("unique", {
-        code: "P2002",
-        clientVersion: "7.8.0",
-        meta: { target: "CanonicalVideoShareLink_websiteId_videoId_key" },
-      });
-    // Restore the winner row so the loser can reload it.
-    const restored = await service.createOrGetCanonical(
-      "site-a",
-      "video-1",
-      "x",
-    );
-    assert.equal(restored.outcome, "CREATED");
-    prisma.failNextCanonicalCreateWith = null;
+    // Drop the mapping so the next call gets past the early gate, exactly as a
+    // racer that read before the winner committed would. The link itself stays,
+    // so the request resolves it as the pair's existing single-video link and
+    // races to pin it.
+    prisma.canonicals.clear();
+    prisma.raceWinnerShareLinkIdOnNextCanonicalCreate = winnerShareLinkId;
 
     const loser = await service.createOrGetCanonical("site-a", "video-1", "x");
+
     assert.equal(loser.outcome, "REUSED");
-    assert.equal(loser.alias, restored.alias);
-    assert.notEqual(
-      loser.alias,
-      winner.alias === loser.alias ? "" : winner.alias,
-    );
+    assert.equal(loser.shareLink.id, winnerShareLinkId);
+    assert.equal(loser.alias, winner.alias);
+    assert.equal(loser.publicUrl, winner.publicUrl);
+    // The whole point: losing the race must not leave a second link behind.
+    assert.equal(prisma.shareLinks.size, 1);
+    assert.equal(prisma.canonicals.size, 1);
   });
 
   it("retries alias/token collisions and still creates exactly one mapping", async () => {

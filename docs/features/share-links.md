@@ -1,7 +1,7 @@
 # Feature: Share links
 
 Status: CURRENT
-Last verified: 2026-08-21
+Last verified: 2026-08-25
 Verified against: `src/admin-websites/admin-websites.service.ts`, `src/admin-websites/utils/share-url.util.ts`, `src/admin-websites/canonical-share-link.service.ts`, `src/public/public.service.ts`, `prisma/schema.prisma`
 
 A share link is a revocable viewing pass: it grants access to a chosen subset of
@@ -14,7 +14,7 @@ one website's videos, on that website's domains only.
 | Field | Meaning |
 |---|---|
 | `tokenHash` | `sha256(SHARE_TOKEN_PEPPER + rawToken)`; unique. The raw token is never stored |
-| `alias` | ~7-char `base64url`, unique, stored in clear; the customer-facing credential |
+| `alias` | `base64url`, unique, stored in clear; the customer-facing credential. **16 chars / 96 bits for links created since 2026-08-25; 7 chars / 40 bits before that.** Existing short aliases are never rotated — see §2.3 |
 | `label` | Operator note |
 | `expiresAt` | Optional absolute expiry |
 | `maxViews` / `currentViews` | Optional view budget and its counter |
@@ -29,6 +29,81 @@ design is in [ADR 0003](../adr/0003-share-link-alias-and-peppered-token.md).
 `POST /admin/websites/:websiteId/share-links` (write roles). Body: optional
 `label`, `videoIds` (≤ 50, unique), `expiresAt` (ISO-8601), `maxViews` (≥ 1).
 
+### 2.1 One video is not a small bundle — it is the canonical link
+
+> **The resolved video set decides which path runs.** `CanonicalShareLinkService.createShareLinkForRequest()`
+> resolves `videoIds` first (an omitted list still means the website's whole
+> active assignment set), then branches on the COUNT.
+
+| Resolved set | Path | Result |
+|---|---|---|
+| Exactly one video | `createOrGetCanonical()` | The canonical link for that `(websiteId, videoId)` pair. Same id, same alias, byte-identical `publicUrl` on every call. `outcome: "REUSED"` when nothing was written, and **no `rawToken`** |
+| Two or more | `createShareLink()` below | A new bundle link each time, unchanged |
+| Zero | — | `400` |
+
+Until 2026-08-25 this branch did not exist: every call minted a new ShareLink
+with a new alias and a new token, so pressing Create twice for one video
+produced two links with two different reviewer URLs, and ten presses produced
+ten. The `CanonicalVideoShareLink` mapping that exists to prevent exactly that
+was only reachable through §6's dedicated endpoint, which no client called.
+
+Routing lives on the **server** because no client-side "check first, then
+create" can be correct — two operators can both check, both miss, and both
+create. The `@@unique([websiteId, videoId])` constraint is the arbiter; a loser
+of that race recovers by returning the winner's link.
+
+#### 2.1.1 A pair with history but no mapping
+
+Most production pairs are in this state: links were created long before any
+canonical mapping existed, because §6's endpoint had no client. Minting a new
+canonical link for such a pair would produce exactly the duplicate this feature
+exists to prevent, so `createOrGetCanonical()` looks for what is already there
+first. The scan runs **inside** the Serializable transaction, alongside the
+writes, so a link committed by a concurrent request cannot slip through the gap
+between deciding and inserting.
+
+| Exact single-video links found | Result |
+|---|---|
+| 0 | Create a new canonical link. **The only case that mints one.** |
+| 1 | **Adopt it.** Its `id`, `alias`, `tokenHash`, `createdAt`, `label`, `status`, `expiresAt`, `maxViews`, `currentViews` and membership are all preserved untouched; only the mapping row is written. Audited `CANONICAL_SHARE_LINK_ADOPT` |
+| 2 or more | `409 CANONICAL_LINK_AMBIGUOUS`. **Nothing is written** |
+
+> **"Exact" is proven, not assumed.** A bundle `[A, B]` contains A, so a
+> `some: { videoId }` condition matches it — and adopting a bundle as the
+> canonical link for A would publish B to everyone who follows A's canonical
+> URL. `findExactSingleVideoCandidates()` therefore fetches the membership rows
+> and requires `length === 1` with that one member being the requested video.
+
+> **Adoption pins identity, not usability.** A revoked, disabled, expired or
+> exhausted historical link is still adopted — the pair gets its one permanent
+> answer — and the request then fails with that link's own status code. No
+> replacement is minted and nothing is revived, which is the point: a pair whose
+> only link was revoked must stay revoked.
+
+> **Ambiguity is never resolved by guessing.** `createdAt`, status, and alias
+> order are all available and all deliberately unused: nothing in the data says
+> which already-circulated URL a reviewer was given, and silently blessing one
+> would quietly demote the other. The refusal routes the operator to
+> `yarn audit:canonical-share-links` and `yarn remediate:local:adopt-canonical`,
+> where an owner chooses. Once one is adopted, every later request returns it.
+
+**A canonical request carries no options.** `label`, `expiresAt` and `maxViews`
+are refused with `400 CANONICAL_LINK_OPTIONS_NOT_ALLOWED`, because a canonical
+link is permanent and unlimited by construction. Accepting and dropping them
+would be worse — `maxViews` is an access control, and an operator told "link
+created" would believe a budget applied that does not exist. Honouring them on
+first creation would be worse still: the pair's single identity could then
+expire, with no way to mint a replacement. Bundles still take all three.
+
+**A canonical link that is unusable is refused, never replaced.** Revoked,
+disabled, expired, view-exhausted, domain drifted, evidence drifted, video no
+longer shareable — each returns a `409` with its own stable code (§6) and
+writes nothing. Minting a fresh credential in any of those cases would hand
+back access an owner had deliberately taken away, which is the whole reason the
+refusal exists. `POST` never revives a `REVOKED` link.
+
+### 2.2 The multi-video path
+
 ```
 require SHARE_TOKEN_PEPPER
 require the website to be ACTIVE
@@ -37,7 +112,7 @@ validate eligibility    → each video must be assigned to this website
 require one ACTIVE assigned domain, else 400
 retry loop (bounded):
     rawToken = "s_" + randomBytes(32).base64url
-    alias    = randomBytes(5).base64url
+    alias    = randomBytes(12).base64url   # 16 chars, 96 bits - see 2.3
     Serializable transaction:
         re-check creation scope
         create ShareLink + ordered ShareLinkVideo rows
@@ -56,20 +131,46 @@ audit SHARE_LINK_CREATE, invalidate public caches
 > `publicUrl` is **computed on read, never persisted.** No table stores a share
 > URL string, so changing its shape converts no data and mutates no row.
 
+### 2.3 The alias is a bearer credential
+
+`resolvePublicWatch()` accepts the alias in place of a raw share token, so on
+the bound host **the alias alone authorizes the watch**. A canonical alias is
+additionally permanent, because a canonical link never expires.
+
+`generateShareAlias()` was `randomBytes(5)` — 7 base64url characters, **40
+bits**. That is thin for a bearer credential and the canonical work made it
+worse by giving those aliases unlimited lifetime. It is now `randomBytes(12)`:
+**16 characters, 96 bits**, which is the full width of `alias VARCHAR(16)` and
+therefore needed no migration.
+
+> **Existing aliases are never rotated.** Length is not part of any lookup — the
+> resolver matches `alias` by equality with no length or charset assumption in
+> the backend, the public site or the Admin — so 7- and 16-character aliases
+> coexist indefinitely. Rewriting one would break every reviewer URL already
+> handed out, which the compatibility contract forbids.
+
+The alphabet is unchanged (`[A-Za-z0-9_-]`), so nothing about parsing, encoding
+or URL shape changes: `encodeURIComponent()` remains a no-op on an alias, which
+is what keeps a canonical URL byte-identical whichever client rebuilds it.
+Collisions still retry against the `@unique` constraint with fresh CSPRNG
+material — never a counter or a suffix.
+
+Pinned by `test/share-url-util.test.ts`.
+
 ## 3. URL forms
 
 **V2 — what is generated now:**
 
 | Form | Emitted by |
 |---|---|
-| `https://<domain>/watch#k=<alias>` | `buildPublicShareUrl()`; also what Admin copies |
+| `https://<domain>/watch#k=<alias>` | `buildPublicShareUrl()` (bundles) and `buildCanonicalReviewUrl()` (single-video canonical links); both are what Admin copies |
 | `https://<domain>/watch#k=<alias>&v=<videoId>` | Admin, when a single video is selected |
 
 **V1 — permanent legacy contract. Still accepted, never re-issued:**
 
 | Form | Note |
 |---|---|
-| `https://<domain>/#/s/<alias>/videos` | Also still generated by `buildCanonicalPublicShareUrl()` — see §7 |
+| `https://<domain>/#/s/<alias>/videos` | Still generated by `buildCanonicalPublicShareUrl()` as the pinned **provenance** string — never as a link handed to a reviewer. See §6 |
 | `https://<domain>/s/<alias>#/videos` | Previous `buildPublicShareUrl()` output |
 | `https://<domain>/?token=<rawToken>#/videos` | Previous token branch |
 | `/watch/<token>`, `?t=<code>` | Parser compatibility |
@@ -172,12 +273,23 @@ cached *watch metadata* is policy-revalidated on every hit.
 for provenance and takedown work.
 
 - `GET|POST /admin/websites/:websiteId/videos/:videoId/canonical-share-link`
-  (read / write roles). **Not used by the admin UI today.**
+  (read / write roles). The Admin console does not call these directly; it
+  reaches the same `createOrGetCanonical()` through §2.1, by sending exactly one
+  video id to the ordinary create endpoint.
 - `canonicalHostSnapshot` and `canonicalProtocol` are frozen at creation, so the
   URL never follows a later change of primary domain.
-- `buildCanonicalPublicShareUrl()` always emits the hash form
-  `https://<host>/#/s/<alias>/videos`, byte-for-byte stable no matter which
-  client rebuilds it.
+- **Two URLs, one credential, different jobs.** Both are built from the same
+  snapshot and the same alias, and the public site resolves either to the same
+  ShareLink:
+
+  | Field | Builder | Shape | Why |
+  |---|---|---|---|
+  | `publicUrl` | `buildCanonicalPublicShareUrl()` | `https://<host>/#/s/<alias>/videos` | **Provenance.** Copies of this exact string already sit in filed DMCA submissions, so its shape is pinned forever — re-shaping it would make filed evidence disagree with what the system reports |
+  | `reviewUrl` | `buildCanonicalReviewUrl()` | `https://<host>/watch#k=<alias>` | **What an operator copies and a reviewer opens.** New links are V2 everywhere else, and this is the link handed out most often |
+
+  `shareLink.publicUrl` inside the response carries `reviewUrl`, matching every
+  other share-link response in the API. Only the top-level `publicUrl` is
+  pinned to the legacy shape.
 - All four relations are `onDelete: Restrict` —
   [ADR 0005](../adr/0005-canonical-share-link-restrict-deletes.md).
 

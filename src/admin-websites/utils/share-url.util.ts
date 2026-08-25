@@ -6,8 +6,37 @@ export function generateShareToken(): string {
   return `s_${randomBytes(32).toString("base64url")}`;
 }
 
+/**
+ * Bytes of CSPRNG material behind a new alias. 12 bytes encode to exactly 16
+ * unpadded base64url characters, which is the full width of
+ * `ShareLink.alias VARCHAR(16)` — so this is the strongest alias the existing
+ * column can hold, and it needs no migration.
+ */
+const SHARE_ALIAS_RANDOM_BYTES = 12;
+
+/**
+ * The alias is a BEARER CREDENTIAL, not a short display code.
+ * `PublicService.resolvePublicWatch()` accepts it in place of a raw share
+ * token, so on the bound host the alias alone authorizes the watch — and a
+ * canonical alias never expires, because a canonical link is permanent by
+ * construction.
+ *
+ * It was previously `randomBytes(5)`: 7 base64url characters, **40 bits**.
+ * That is far below what a long-lived bearer credential should carry, and the
+ * canonical work made it materially worse by giving those aliases unlimited
+ * lifetime. 12 bytes raises a NEW alias to **96 bits** at 16 characters.
+ *
+ * EXISTING ALIASES ARE NEVER TOUCHED. They remain valid forever — rotating one
+ * would break every reviewer URL already handed out, which is the exact
+ * regression the compatibility contract forbids. Length is not part of the
+ * lookup: the public resolver matches `alias` by equality with no length or
+ * charset assumption anywhere, so 7- and 16-character aliases coexist.
+ *
+ * base64url is deliberate: `[A-Za-z0-9_-]` survives a URL fragment untouched,
+ * so `encodeURIComponent()` is a no-op and the emitted URL is byte-stable.
+ */
 export function generateShareAlias(): string {
-  return randomBytes(5).toString("base64url");
+  return randomBytes(SHARE_ALIAS_RANDOM_BYTES).toString("base64url");
 }
 
 /**
@@ -119,6 +148,52 @@ export function buildCanonicalPublicShareUrl(params: {
 
   const protocol = resolvePublicSiteProtocol(host, params.protocol);
   return `${protocol}://${host}/#/s/${encodeURIComponent(alias)}/videos`;
+}
+
+/**
+ * The V2 REVIEWER URL for a canonical link.
+ *
+ * Same website+video pair → same `alias` → byte-identical string, forever.
+ * Host and protocol come from the canonical SNAPSHOT, exactly as
+ * `buildCanonicalPublicShareUrl()` does, so this never follows a later change
+ * of preferred domain either.
+ *
+ * WHY THIS EXISTS ALONGSIDE `buildCanonicalPublicShareUrl()`.
+ * Those two answer different questions about the same ShareLink:
+ *
+ * - `buildCanonicalPublicShareUrl()` is the PROVENANCE record. Its hash-router
+ *   shape is pinned because copies of that exact string already sit in filed
+ *   DMCA submissions; re-shaping it would make filed evidence disagree with
+ *   what the system reports. It must never change.
+ * - this is what an OPERATOR copies and a REVIEWER opens. New links are V2
+ *   everywhere else in the product, and a canonical link is the one an operator
+ *   hands out most often, so emitting the V1 shape here would be the visible
+ *   regression.
+ *
+ * Both carry the same credential and resolve to the same ShareLink — the
+ * public site parses either form identically. Only the recorded text is pinned,
+ * not the presented one.
+ */
+export function buildCanonicalReviewUrl(params: {
+  host: string;
+  alias: string;
+  protocol: string;
+}): string {
+  const host = normalizeWebsiteDomain(params.host.trim());
+  if (host === null) {
+    throw new BadRequestException("Canonical share host is invalid.");
+  }
+
+  const alias = params.alias.trim();
+  if (!alias) {
+    throw new BadRequestException("Canonical share alias is required.");
+  }
+
+  return buildCleanPublicShareUrl({
+    protocol: resolvePublicSiteProtocol(host, params.protocol),
+    domain: host,
+    credential: alias,
+  });
 }
 
 export function resolvePublicSiteProtocol(

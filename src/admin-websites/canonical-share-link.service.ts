@@ -22,6 +22,8 @@ import {
 } from "../generated/prisma/client";
 import { hashShareToken } from "../public/utils/share-token.util";
 import { AdminWebsitesService } from "./admin-websites.service";
+import type { CreateShareLinkDto } from "./dto/create-share-link.dto";
+import type { CreateShareLinkResponse } from "./types/admin-share-link-response.type";
 import type { CanonicalShareLinkResponse } from "./types/canonical-share-link-response.type";
 import {
   isShareLinkTokenOrAliasCollision,
@@ -29,6 +31,7 @@ import {
 } from "./utils/share-link-errors.util";
 import {
   buildCanonicalPublicShareUrl,
+  buildCanonicalReviewUrl,
   generateShareAlias,
   generateShareToken,
 } from "./utils/share-url.util";
@@ -44,6 +47,8 @@ export const CANONICAL_ERROR_CODES = {
   evidenceIncomplete: "CANONICAL_EVIDENCE_INCOMPLETE",
   videoNotShareable: "CANONICAL_VIDEO_NOT_SHAREABLE",
   notFound: "CANONICAL_LINK_NOT_FOUND",
+  optionsNotAllowed: "CANONICAL_LINK_OPTIONS_NOT_ALLOWED",
+  ambiguousHistory: "CANONICAL_LINK_AMBIGUOUS",
 } as const;
 
 type VideoWithEvidenceAssets = VideoAsset & {
@@ -132,6 +137,98 @@ export class CanonicalShareLinkService {
     });
   }
 
+  /**
+   * The single entry point behind `POST /admin/websites/:id/share-links`.
+   *
+   * A request for EXACTLY ONE video is a request for that website+video pair's
+   * canonical link, whoever makes it — the Admin console, a retry after a
+   * network timeout, a second operator clicking Create at the same moment, or a
+   * direct API call. Routing lives HERE, on the server, for that reason: an
+   * Admin-side "look for an existing link first" cannot be correct, because two
+   * clients can both look, both miss, and both create.
+   *
+   * Multi-video requests are untouched and keep minting a fresh bundle link.
+   * The two are different products and may coexist for the same video: a
+   * canonical `[A]` and a bundle `[A, B]` collide nowhere, because canonical
+   * identity is carried by the dedicated `CanonicalVideoShareLink` mapping and
+   * never by `ShareLinkVideo` membership.
+   */
+  async createShareLinkForRequest(
+    websiteId: string,
+    dto: CreateShareLinkDto,
+    adminId: string,
+  ): Promise<CreateShareLinkResponse> {
+    const resolvedVideoIds =
+      await this.adminWebsitesService.resolveShareLinkVideoIds(websiteId, dto);
+
+    if (resolvedVideoIds.length !== 1) {
+      return this.adminWebsitesService.createShareLink(
+        websiteId,
+        dto,
+        adminId,
+        resolvedVideoIds,
+      );
+    }
+
+    this.assertCanonicalOptionsAbsent(dto);
+
+    const canonical = await this.createOrGetCanonical(
+      websiteId,
+      resolvedVideoIds[0],
+      adminId,
+    );
+
+    // Deliberately no `rawToken`. On REUSED none was minted, and on CREATED the
+    // canonical contract does not expose one (see the create transaction: the
+    // token is hashed and the plaintext is dropped inside this service). The
+    // alias carried in `publicUrl` is the credential a reviewer uses.
+    return {
+      message:
+        canonical.outcome === "CREATED"
+          ? "Canonical share link created."
+          : "Existing canonical share link reused.",
+      shareLink: canonical.shareLink,
+      publicUrl: canonical.reviewUrl,
+      outcome: canonical.outcome,
+      isCanonical: true,
+    };
+  }
+
+  /**
+   * A canonical link is permanent and unlimited by construction: it is the one
+   * stable identity for the pair, and `createOrGetCanonical()` writes
+   * `label: null, expiresAt: null, maxViews: null`.
+   *
+   * Accepting these options and silently dropping them would be worse than
+   * refusing — `maxViews` is an access control, and an operator told "link
+   * created" would believe a budget applied that does not exist. Accepting them
+   * and honouring them on first creation is worse still: the pair's one identity
+   * would then be able to expire, with no way to mint a replacement.
+   *
+   * So the request is refused, and the operator chooses deliberately: clear the
+   * options for the canonical link, or build a multi-video bundle where limits
+   * do apply.
+   */
+  private assertCanonicalOptionsAbsent(dto: CreateShareLinkDto): void {
+    const rejected: string[] = [];
+    if (dto.expiresAt !== undefined && dto.expiresAt !== null) {
+      rejected.push("expiresAt");
+    }
+    if (dto.maxViews !== undefined && dto.maxViews !== null) {
+      rejected.push("maxViews");
+    }
+    if (typeof dto.label === "string" && dto.label.trim() !== "") {
+      rejected.push("label");
+    }
+
+    if (rejected.length > 0) {
+      throw new BadRequestException({
+        message: `A single-video share link is the canonical link for this website and video, and cannot carry ${rejected.join(", ")}. Clear ${rejected.length === 1 ? "it" : "them"}, or select more than one video.`,
+        code: CANONICAL_ERROR_CODES.optionsNotAllowed,
+      });
+    }
+  }
+
   async createOrGetCanonical(
     websiteId: string,
     videoId: string,
@@ -208,28 +305,59 @@ export class CanonicalShareLinkService {
       });
 
       try {
-        const created = await this.prisma.$transaction(
+        const settled = await this.prisma.$transaction(
           async (tx) => {
-            const shareLink = await tx.shareLink.create({
-              data: {
-                websiteId,
-                tokenHash,
-                alias,
-                label: null,
-                expiresAt: null,
-                maxViews: null,
-                currentViews: 0,
-                status: ShareLinkStatus.ACTIVE,
-              },
-            });
-            await tx.shareLinkVideo.create({
-              data: { shareLinkId: shareLink.id, videoId, sortOrder: 0 },
-            });
+            // THE CANDIDATE SCAN LIVES INSIDE THE TRANSACTION, DELIBERATELY.
+            //
+            // A pair that already has an exact single-video link must adopt it
+            // rather than mint a second one — that is the whole product rule.
+            // Scanning outside the transaction would leave a window in which
+            // this request sees no candidate, another request commits one, and
+            // this one still mints the duplicate the rule exists to prevent.
+            // Serializable + the scan in the same transaction closes it.
+            const candidates = await this.findExactSingleVideoCandidates(
+              tx,
+              websiteId,
+              videoId,
+            );
+
+            if (candidates.length > 1) {
+              // No provenance says WHICH already-circulated URL is the official
+              // one, and guessing would silently bless one reviewer's link over
+              // another's. Refuse and let an owner adopt deliberately. Nothing
+              // is written: this throw rolls the transaction back.
+              this.throwAmbiguousHistory(candidates.length);
+            }
+
+            const adopted = candidates[0] ?? null;
+            const shareLinkId =
+              adopted?.id ??
+              (
+                await (async () => {
+                  const shareLink = await tx.shareLink.create({
+                    data: {
+                      websiteId,
+                      tokenHash,
+                      alias,
+                      label: null,
+                      expiresAt: null,
+                      maxViews: null,
+                      currentViews: 0,
+                      status: ShareLinkStatus.ACTIVE,
+                    },
+                  });
+                  await tx.shareLinkVideo.create({
+                    data: { shareLinkId: shareLink.id, videoId, sortOrder: 0 },
+                  });
+                  return shareLink;
+                })()
+              ).id;
+
             const canonical = await tx.canonicalVideoShareLink.create({
               data: {
                 websiteId,
                 videoId,
-                shareLinkId: shareLink.id,
+                shareLinkId,
                 canonicalDomainId: domain.id,
                 canonicalHostSnapshot: domain.domain,
                 canonicalProtocol: protocol ?? "https",
@@ -241,7 +369,12 @@ export class CanonicalShareLinkService {
             await tx.adminAuditLog.create({
               data: {
                 adminId,
-                action: "CANONICAL_SHARE_LINK_CREATE",
+                // Adoption of a pre-existing link is a different fact from
+                // minting a new one, and the audit trail must not conflate
+                // them: only one of the two brought a credential into being.
+                action: adopted
+                  ? "CANONICAL_SHARE_LINK_ADOPT"
+                  : "CANONICAL_SHARE_LINK_CREATE",
                 module: "admin-websites",
                 entityType: "CanonicalVideoShareLink",
                 entityId: canonical.id,
@@ -249,12 +382,13 @@ export class CanonicalShareLinkService {
                 metadataJson: {
                   websiteId,
                   videoId,
-                  shareLinkId: shareLink.id,
+                  shareLinkId,
+                  ...(adopted ? { adoptedHistoricalLink: true } : {}),
                 } as Prisma.InputJsonValue,
               },
             });
 
-            return tx.canonicalVideoShareLink.findUniqueOrThrow({
+            const row = await tx.canonicalVideoShareLink.findUniqueOrThrow({
               where: { id: canonical.id },
               include: {
                 shareLink: {
@@ -267,11 +401,27 @@ export class CanonicalShareLinkService {
                 },
               },
             });
+
+            return { row, adopted: adopted !== null };
           },
           { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
         );
 
-        return this.toResponse(created as CanonicalWithRelations, {
+        const canonical = settled.row as CanonicalWithRelations;
+
+        if (settled.adopted) {
+          // The mapping is committed: the pair now has one permanent identity,
+          // whatever state the adopted link is in. Usability is a separate
+          // question, and a revoked or expired link must answer it truthfully
+          // rather than be replaced.
+          await this.assertReusable(canonical, websiteId, videoId);
+          return this.toResponse(canonical, {
+            outcome: "REUSED",
+            evidenceDrift: false,
+          });
+        }
+
+        return this.toResponse(canonical, {
           outcome: "CREATED",
           evidenceDrift: false,
         });
@@ -461,6 +611,61 @@ export class CanonicalShareLinkService {
     if (website === null) {
       throw new NotFoundException("Active website not found.");
     }
+  }
+
+  /**
+   * Every EXACT single-video share link for this pair that is not already
+   * anchoring some other canonical mapping.
+   *
+   * "Exact" is the load-bearing word. A bundle `[A, B]` contains A, so any
+   * `some: { videoId }` condition would match it — and adopting a bundle as
+   * the canonical link for A would publish B to everyone who follows A's
+   * canonical URL. The cardinality is therefore PROVEN, not assumed: the rows
+   * are fetched and filtered on `length === 1 && [0].videoId === videoId`,
+   * which no `where` clause can express directly.
+   *
+   * `canonicalVideoShareLink: null` excludes a link already anchoring another
+   * pair's mapping, because `shareLinkId` is unique on that table and reusing
+   * one would fail the constraint anyway.
+   *
+   * Ordering is by `createdAt` purely for determinism in the >1 case, where the
+   * result is a refusal. It is NEVER used to pick a winner — see
+   * `throwAmbiguousHistory()`.
+   */
+  private async findExactSingleVideoCandidates(
+    tx: Pick<PrismaService, "shareLink">,
+    websiteId: string,
+    videoId: string,
+  ): Promise<{ id: string; alias: string | null }[]> {
+    const rows = await tx.shareLink.findMany({
+      where: {
+        websiteId,
+        canonicalVideoShareLink: { is: null },
+        shareLinkVideos: { some: { videoId } },
+      },
+      orderBy: { createdAt: "asc" },
+      select: {
+        id: true,
+        alias: true,
+        shareLinkVideos: { select: { videoId: true } },
+      },
+    });
+
+    return rows
+      .filter(
+        (row) =>
+          row.shareLinkVideos.length === 1 &&
+          row.shareLinkVideos[0]?.videoId === videoId,
+      )
+      .map((row) => ({ id: row.id, alias: row.alias }));
+  }
+
+  private throwAmbiguousHistory(candidateCount: number): never {
+    throw new ConflictException({
+      message: `${candidateCount} existing share links already contain exactly this video on this website. Which one is the official URL cannot be inferred, and creating another is not an option — adopt one of them as the canonical link first.`,
+      code: CANONICAL_ERROR_CODES.ambiguousHistory,
+      candidateCount,
+    });
   }
 
   private async loadCanonical(
@@ -690,8 +895,19 @@ export class CanonicalShareLinkService {
     );
   }
 
+  /**
+   * A lost race for this pair's mapping. Both unique constraints on
+   * `CanonicalVideoShareLink` can report it, and which one fires depends on the
+   * index the engine checks first: `(websiteId, videoId)` when two requests
+   * raced the same pair, or `shareLinkId` when two requests raced to adopt the
+   * SAME historical link. Matching only the first would leave the adoption race
+   * unrecovered, so both are treated as "someone else won; reload theirs".
+   */
   private isCanonicalPairConflict(error: unknown): boolean {
-    return isUniqueViolationOn(error, "websiteId_videoId");
+    return (
+      isUniqueViolationOn(error, "websiteId_videoId") ||
+      isUniqueViolationOn(error, "shareLinkId")
+    );
   }
 
   private toResponse(
@@ -706,6 +922,11 @@ export class CanonicalShareLinkService {
       alias: canonical.shareLink.alias ?? "",
       protocol: canonical.canonicalProtocol,
     });
+    const reviewUrl = buildCanonicalReviewUrl({
+      host: canonical.canonicalHostSnapshot,
+      alias: canonical.shareLink.alias ?? "",
+      protocol: canonical.canonicalProtocol,
+    });
 
     return {
       message:
@@ -715,11 +936,15 @@ export class CanonicalShareLinkService {
       outcome: options.outcome,
       isCanonical: true,
       evidenceDrift: options.evidenceDrift,
+      // The nested `shareLink.publicUrl` is the REVIEWER url, matching what
+      // every other share-link response carries. The pinned provenance shape
+      // stays on the top-level `publicUrl` alone.
       shareLink: this.adminWebsitesService.toShareLinkResponse(
         canonical.shareLink,
-        publicUrl,
+        reviewUrl,
       ),
       publicUrl,
+      reviewUrl,
       alias: canonical.shareLink.alias ?? "",
       evidenceSnapshot:
         (canonical.evidenceSnapshotJson as CanonicalEvidenceSnapshot | null) ??

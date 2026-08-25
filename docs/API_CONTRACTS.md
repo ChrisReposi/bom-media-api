@@ -1,7 +1,7 @@
 # API Contracts
 
 Status: CURRENT
-Last verified: 2026-08-23
+Last verified: 2026-08-25
 Verified against: all `src/**/*.controller.ts`, `src/**/dto/*.ts`, `src/**/types/*.ts`, and the consuming code in `../bom-media-admin/src/features/**` and `../public_website/assets/app.js`
 
 Base URL: `{origin}/api/v1` (`API_PREFIX`). Interactive schema at `/docs` when
@@ -92,7 +92,7 @@ Swagger is enabled — this document exists to record **who consumes what** and
 | `/admin/websites/:websiteId/video-assignment-options` | GET | access token | read | — |
 | `/admin/websites/:websiteId/video-assignments` | PATCH | access token | write | — |
 | `/admin/websites/:websiteId/videos/assign` | POST | access token | write | — |
-| `/admin/websites/:websiteId/videos/:videoId/canonical-share-link` | GET/POST | access token | read / write | — |
+| `/admin/websites/:websiteId/videos/:videoId/canonical-share-link` | GET/POST | access token | read / write | — (the Admin reaches the same logic through `POST …/share-links` with one video) |
 | `/public/watch` | GET | none | — | **P** (legacy fallback) |
 | `/public/watch/exchange` | POST | none | — | **P** (preferred) |
 | `/public/watch/:token/videos/:videoId/view` | POST | none | — | **P** |
@@ -313,14 +313,74 @@ src>`.
   "shareLink": { "id", "websiteId", "alias", "label", "status",
                  "expiresAt", "maxViews", "currentViews", "createdAt",
                  "videos": [ … ], "publicUrl" },
-  "rawToken": "s_…",     // returned EXACTLY ONCE, never retrievable again
-  "publicUrl": "https://<domain>/s/<alias>#/videos" }
+  "rawToken": "s_…",     // MULTI-VIDEO ONLY. Returned EXACTLY ONCE, never
+                         // retrievable again. ABSENT on the canonical path
+  "publicUrl": "https://<domain>/watch#k=<alias>",
+  "outcome": "CREATED" | "REUSED",   // added 2026-08-25
+  "isCanonical": false }             // added 2026-08-25
 ```
 
 Preconditions enforced server-side: the website is `ACTIVE`, it has at least one
 `ACTIVE` assigned domain, and every selected video is eligible (assigned to the
 website and playable). Alias/token collisions are retried up to a bounded number
 of attempts inside a `Serializable` transaction.
+
+> **CONTRACT INVARIANT (added 2026-08-25): a request for EXACTLY ONE video is
+> idempotent.** The resolved video set — not the raw `videoIds`, which may be
+> omitted and default to the website's whole active assignment set — decides the
+> path. One video resolves that website+video pair's **canonical** ShareLink:
+> the same `id`, the same `alias` and a byte-identical `publicUrl` on every
+> call, forever, with `outcome: "REUSED"` and **no row written** after the
+> first. Two or more videos keep creating a new bundle link each time.
+>
+> This closed a real defect: every call used to mint a new ShareLink with a new
+> alias and a new token, so pressing Create twice for one video produced two
+> links with two different reviewer URLs. `CanonicalVideoShareLink` existed to
+> prevent that but was reachable only through §2.11a, which no client called.
+>
+> Enforcement is server-side because it must be: two clients can both check for
+> an existing link, both miss, and both create. The `@@unique([websiteId,
+> videoId])` constraint arbitrates and the loser returns the winner's link.
+
+> **`rawToken` is now OPTIONAL in the response.** It is absent whenever
+> `isCanonical` is true — on reuse nothing was minted, and on first canonical
+> creation the contract deliberately withholds it. The alias inside `publicUrl`
+> is the credential. A client must not assume the field is present.
+
+> **A canonical request must carry no `label`, `expiresAt` or `maxViews`**, and
+> is refused with `400 CANONICAL_LINK_OPTIONS_NOT_ALLOWED` if it does. A
+> canonical link is permanent and unlimited by construction. Accepting the
+> options and dropping them would misreport an access control that was never
+> applied; honouring them would let the pair's one identity expire with no way
+> to mint a replacement. Bundles still take all three.
+
+> **A canonical link that exists but is unusable is refused, never replaced.**
+> Revoked, disabled, expired, exhausted, domain drifted, evidence drifted, or
+> the video no longer shareable — each returns the `409` code listed in §2.11a
+> and writes nothing. Minting a fresh credential in any of those cases would
+> restore access an owner had deliberately removed.
+
+> **A pair that already has a link but no mapping ADOPTS it.** Almost every
+> production pair is in this state, because the canonical endpoint had no
+> client. The resolver looks for share links on this website whose membership is
+> **exactly** the requested video — a bundle `[A, B]` never qualifies for A —
+> and then:
+>
+> | Exact single-video links found | Result |
+> |---|---|
+> | 0 | A new canonical link is created. The only case that mints one |
+> | 1 | It is adopted unchanged: same `id`, same `alias`, same `publicUrl`, same views and budget. `outcome: "REUSED"` |
+> | 2 or more | `409 CANONICAL_LINK_AMBIGUOUS`, with `candidateCount`. **Nothing is written** |
+>
+> Adoption pins *identity*, not usability: a revoked or expired historical link
+> is still adopted and the request then fails with that link's own code, so the
+> pair keeps one permanent answer and no replacement appears.
+>
+> The ambiguous case is **never** resolved by picking the newest, the oldest or
+> the only `ACTIVE` one — nothing in the data says which already-circulated URL
+> a reviewer holds. An owner resolves it with
+> `yarn audit:canonical-share-links` then `yarn remediate:local:adopt-canonical`,
+> after which every request returns the adopted link.
 
 > **CONTRACT INVARIANT: `rawToken` is write-once.** Any client that discards it
 > has permanently lost the raw token; only the alias remains usable. The admin

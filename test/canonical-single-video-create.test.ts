@@ -186,19 +186,39 @@ class FakePrisma {
     findMany: async (args: {
       where: {
         websiteId: string;
-        canonicalVideoShareLink?: { is: null };
         shareLinkVideos?: { some: { videoId: string } };
       };
-      orderBy?: { createdAt: "asc" };
+      /**
+       * The ORDER IS THE POLICY, so the fake reproduces it rather than
+       * ignoring it: `createdAt DESC` then `id DESC`. A harness that sorted
+       * ascending would let a service bug that picks the oldest link pass.
+       *
+       * NOTE THE ABSENT FILTERS. The production query no longer removes rows by
+       * status, nor rows that already anchor a mapping — removing either would
+       * make an OLDER link silently become the winner. The fake models exactly
+       * that, and SELECTS the anchor relation so the service can refuse on it.
+       */
+      orderBy?: [{ createdAt: "desc" }, { id: "desc" }];
     }): Promise<
       {
         id: string;
         alias: string | null;
+        status: string;
+        expiresAt: Date | null;
+        maxViews: number | null;
+        createdAt: Date;
         shareLinkVideos: { videoId: string }[];
+        canonicalVideoShareLink: {
+          websiteId: string;
+          videoId: string;
+        } | null;
       }[]
     > => {
-      const anchored = new Set(
-        [...this.canonicals.values()].map((row) => row.shareLinkId),
+      const anchoredByShareLinkId = new Map(
+        [...this.canonicals.values()].map((row) => [
+          row.shareLinkId,
+          { websiteId: row.websiteId, videoId: row.videoId },
+        ]),
       );
       const needle = args.where.shareLinkVideos?.some.videoId;
 
@@ -206,23 +226,27 @@ class FakePrisma {
         .filter((link) => link.websiteId === args.where.websiteId)
         .filter(
           (link) =>
-            args.where.canonicalVideoShareLink === undefined ||
-            !anchored.has(link.id),
-        )
-        .filter(
-          (link) =>
             needle === undefined ||
             this.shareLinkVideos.some(
               (row) => row.shareLinkId === link.id && row.videoId === needle,
             ),
         )
-        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+        .sort(
+          (a, b) =>
+            b.createdAt.getTime() - a.createdAt.getTime() ||
+            (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+        )
         .map((link) => ({
           id: link.id,
           alias: link.alias,
+          status: link.status,
+          expiresAt: link.expiresAt,
+          maxViews: link.maxViews,
+          createdAt: link.createdAt,
           shareLinkVideos: this.shareLinkVideos
             .filter((row) => row.shareLinkId === link.id)
             .map((row) => ({ videoId: row.videoId })),
+          canonicalVideoShareLink: anchoredByShareLinkId.get(link.id) ?? null,
         }));
     },
   };
@@ -319,7 +343,21 @@ class FakePrisma {
    * AsyncLocalStorage journal, so a concurrent transaction that committed in
    * the meantime is untouched.
    */
+  /**
+   * Callbacks fired the moment a transaction OPENS, before its body runs.
+   *
+   * This is how a TOCTOU window is made deterministic: a hook stands in for a
+   * concurrent writer that committed between the request's pre-flight reads and
+   * the canonical write. Any precondition still read outside the transaction
+   * cannot see the hook's mutation, so a test that asserts the mutation was
+   * honoured fails exactly when the read moved back out.
+   */
+  transactionOpenHooks: Array<() => void> = [];
+
   async $transaction<T>(fn: (tx: this) => Promise<T>): Promise<T> {
+    for (const hook of this.transactionOpenHooks.splice(0)) {
+      hook();
+    }
     const journal: TransactionJournal = {
       shareLinkIds: [],
       canonicalIds: [],
@@ -373,6 +411,8 @@ type Harness = {
   service: CanonicalShareLinkService;
   /** Every call the MULTI-VIDEO path received, in order. */
   multiVideoCalls: { websiteId: string; videoIds: string[] }[];
+  /** Live switches a transaction-open hook can flip. */
+  control: { eligibilityError: Error | null };
 };
 
 function createHarness(options?: {
@@ -422,10 +462,20 @@ function createHarness(options?: {
 
   const multiVideoCalls: { websiteId: string; videoIds: string[] }[] = [];
 
+  /**
+   * Mutable so a transaction-open hook can revoke eligibility mid-flight. A
+   * static option could only model "was never eligible", which is a different
+   * and much weaker property than "stopped being eligible after the pre-flight
+   * read".
+   */
+  const control: { eligibilityError: Error | null } = {
+    eligibilityError: options?.eligibilityError ?? null,
+  };
+
   const websitesStub = {
     validateShareLinkVideoEligibility: async () => {
-      if (options?.eligibilityError) {
-        throw options.eligibilityError;
+      if (control.eligibilityError) {
+        throw control.eligibilityError;
       }
     },
     getConfiguredPublicSiteProtocol: () => undefined,
@@ -499,7 +549,7 @@ function createHarness(options?: {
     websitesStub as never,
   );
 
-  return { prisma, service, multiVideoCalls };
+  return { prisma, service, multiVideoCalls, control };
 }
 
 function singleVideoRequest(videoId: string): CreateShareLinkDto {
@@ -795,7 +845,21 @@ describe("canonical reuse never rotates credentials or resets budgets", () => {
     assert.equal(prisma.shareLinks.get(first.shareLink.id)?.currentViews, 37);
   });
 
-  it("CANON-10 leaves expiresAt and maxViews untouched on reuse", async () => {
+  it("CANON-10 leaves expiresAt and maxViews untouched, and now refuses rather than reporting a permanent URL", async () => {
+    // THE INVARIANT IS UNCHANGED AND STRENGTHENED. The columns must never be
+    // rewritten by a reuse — that is what this case has always pinned, and it
+    // still holds below.
+    //
+    // What changed is the verdict around it. This used to SUCCEED: the pair's
+    // canonical URL was handed back for a link that will lapse or run out,
+    // described to the operator as permanent, with no replacement possible once
+    // it does. `assertReusable()` read neither column. It now refuses with
+    // `CANONICAL_LINK_OPTIONS_PRESENT` and still writes nothing.
+    //
+    // No production share link is broken by this: the link itself is untouched
+    // and public resolution — which enforces both columns independently and
+    // never reads the canonical mapping — is unchanged. Only the admin-side
+    // claim that the URL is permanent is withdrawn.
     const { prisma, service } = createHarness();
 
     const first = await service.createShareLinkForRequest(
@@ -809,15 +873,26 @@ describe("canonical reuse never rotates credentials or resets budgets", () => {
     link.expiresAt = pinnedExpiry;
     link.maxViews = 5;
 
-    await service.createShareLinkForRequest(
-      "site-a",
-      singleVideoRequest("video-1"),
-      "admin-1",
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      ),
+      expectConflictCode("CANONICAL_LINK_OPTIONS_PRESENT"),
     );
 
     const after = prisma.shareLinks.get(first.shareLink.id);
     assert.equal(after?.expiresAt?.toISOString(), pinnedExpiry.toISOString());
     assert.equal(after?.maxViews, 5);
+
+    // Refusing must not become a licence to mint or repoint.
+    assert.equal(prisma.shareLinks.size, 1, "no replacement link");
+    assert.equal(prisma.canonicals.size, 1, "no second mapping");
+    assert.equal(
+      canonicalFor(prisma, "site-a", "video-1")?.shareLinkId,
+      first.shareLink.id,
+    );
   });
 
   it("CANON-16 keeps the token hash and alias byte-identical across reuse", async () => {
@@ -1144,9 +1219,11 @@ function seedHistoricalLink(
     expiresAt?: Date | null;
     maxViews?: number | null;
     currentViews?: number;
+    /** Explicit id, for pinning the `id DESC` tie-break deterministically. */
+    id?: string;
   },
 ): string {
-  const id = prisma.nextId("historical");
+  const id = params.id ?? prisma.nextId("historical");
   prisma.shareLinks.set(id, {
     id,
     websiteId: params.websiteId,
@@ -1167,8 +1244,27 @@ function seedHistoricalLink(
   return id;
 }
 
+/**
+ * HISTORICAL RECOVERY POLICY — IDENTITY IS NOT USABILITY.
+ *
+ * Production created single-video ShareLinks long before any canonical mapping
+ * existed, so almost every pair arrives here with history and no mapping.
+ *
+ *   1. an existing mapping ALWAYS wins, and is never repointed;
+ *   2. otherwise the NEWEST exact single-video link is the identity —
+ *      `createdAt DESC`, `id DESC` — whatever its status;
+ *   3. only a pair with NO history at all mints a fresh canonical link.
+ *
+ * THE STATUS OF THE WINNER IS NOT A SELECTION INPUT, and these tests exist
+ * mostly to keep it that way. Filtering to "usable" candidates first reads as
+ * the safer choice and is the opposite: it lets a deliberate revoke be routed
+ * around, either by promoting an older ACTIVE link or by minting a fresh one.
+ * A revoked winner is pinned and then DENIES.
+ *
+ * Legacy rows are never deleted, revoked, renamed or re-scoped by any of it.
+ */
 describe("canonical adoption of historical single-video links", () => {
-  it("CANON-HIST-01 creates a canonical link when no historical candidate exists", async () => {
+  it("C1 mints a canonical link when the pair has NO history at all", async () => {
     const { prisma, service } = createHarness();
 
     const created = await service.createShareLinkForRequest(
@@ -1182,7 +1278,7 @@ describe("canonical adoption of historical single-video links", () => {
     assert.equal(prisma.canonicals.size, 1);
   });
 
-  it("CANON-HIST-02 adopts the one historical link instead of minting a second", async () => {
+  it("C2 adopts the one historical link instead of minting a second", async () => {
     const { prisma, service } = createHarness();
     const historicalId = seedHistoricalLink(prisma, {
       websiteId: "site-a",
@@ -1222,7 +1318,7 @@ describe("canonical adoption of historical single-video links", () => {
     assert.equal(after?.label, before.label, "adoption must not rename");
   });
 
-  it("CANON-HIST-02 the adopted link is what every later request returns", async () => {
+  it("C14 the adopted link is what every later request returns", async () => {
     const { prisma, service } = createHarness();
     const historicalId = seedHistoricalLink(prisma, {
       websiteId: "site-a",
@@ -1247,37 +1343,113 @@ describe("canonical adoption of historical single-video links", () => {
     assert.equal(prisma.shareLinks.size, 1);
   });
 
-  it("CANON-HIST-02 audits adoption distinctly from creation, with no credential", async () => {
+  it("C3 newest ACTIVE beats older ACTIVE", async () => {
     const { prisma, service } = createHarness();
-    seedHistoricalLink(prisma, {
+    const older = seedHistoricalLink(prisma, {
       websiteId: "site-a",
       videoIds: ["video-1"],
-      alias: "hist-alias-1",
+      alias: "hist-jan",
+      createdAt: new Date("2026-01-01"),
+    });
+    const newer = seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-mar",
+      createdAt: new Date("2026-03-01"),
     });
 
-    await service.createShareLinkForRequest(
+    const resolved = await service.createShareLinkForRequest(
       "site-a",
       singleVideoRequest("video-1"),
       "admin-1",
     );
 
-    assert.equal(prisma.audits.length, 1);
-    assert.equal(prisma.audits[0].action, "CANONICAL_SHARE_LINK_ADOPT");
-    assert.equal(JSON.stringify(prisma.audits).includes("hist-alias-1"), false);
+    assert.equal(resolved.outcome, "REUSED");
+    assert.equal(resolved.shareLink.id, newer);
+    assert.notEqual(resolved.shareLink.id, older);
+    assert.equal(prisma.shareLinks.size, 2, "nothing new was minted");
+    assert.equal(prisma.shareLinks.get(older)?.status, "ACTIVE");
+    assert.equal(prisma.shareLinks.get(older)?.alias, "hist-jan");
   });
 
-  for (const [label, status, code] of [
-    ["CANON-HIST-03 revoked", "REVOKED", "CANONICAL_LINK_REVOKED"],
-    ["CANON-HIST-04 disabled", "DISABLED", "CANONICAL_LINK_INACTIVE"],
-    ["CANON-HIST-05 expired", "EXPIRED", "CANONICAL_LINK_INACTIVE"],
-  ] as const) {
-    it(`${label} historical link is pinned, never replaced`, async () => {
+  it("C4 breaks an exact createdAt tie deterministically on id DESC", async () => {
+    const sameInstant = new Date("2026-05-05T10:00:00.000Z");
+    const winners = new Set<string>();
+
+    // Repeated because a non-deterministic tie-break would only show up
+    // sometimes: the point is that the SAME row wins every single time.
+    for (let run = 0; run < 5; run += 1) {
       const { prisma, service } = createHarness();
-      const historicalId = seedHistoricalLink(prisma, {
+      seedHistoricalLink(prisma, {
+        id: "hist-aaa",
         websiteId: "site-a",
         videoIds: ["video-1"],
-        alias: "hist-alias-1",
+        alias: "hist-alias-aaa",
+        createdAt: sameInstant,
+      });
+      seedHistoricalLink(prisma, {
+        id: "hist-zzz",
+        websiteId: "site-a",
+        videoIds: ["video-1"],
+        alias: "hist-alias-zzz",
+        createdAt: sameInstant,
+      });
+
+      const resolved = await service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      );
+      winners.add(resolved.shareLink.id);
+      assert.equal(prisma.shareLinks.size, 2);
+    }
+
+    assert.deepEqual([...winners], ["hist-zzz"]);
+  });
+
+  // -------------------------------------------------------------------------
+  // THE SECURITY HALF. A restricted newest link must never be routed around.
+  // -------------------------------------------------------------------------
+
+  /**
+   * FOUR DISTINCT CONDITIONS, NEVER CONFLATED.
+   *
+   * "Expired" is ambiguous here and is deliberately never used unqualified:
+   *
+   *   status === REVOKED        status enum -> PIN, then CANONICAL_LINK_REVOKED
+   *   status === DISABLED       status enum -> PIN, then CANONICAL_LINK_INACTIVE
+   *   status === EXPIRED        status enum -> PIN, then CANONICAL_LINK_INACTIVE
+   *   expiresAt !== null        time COLUMN -> REFUSE pre-write, HAS_EXPIRY
+   *   maxViews  !== null        budget COL. -> REFUSE pre-write, HAS_MAX_VIEWS
+   *
+   * The two groups behave differently on purpose: a status says "this link is
+   * over", which a permanent identity can honestly represent; a column says
+   * "this link is limited", which the canonical contract cannot represent at
+   * all. The loop below covers the three STATUS values only.
+   */
+  for (const [label, status, code] of [
+    ["C5 status=REVOKED", "REVOKED", "CANONICAL_LINK_REVOKED"],
+    ["C5 status=DISABLED", "DISABLED", "CANONICAL_LINK_INACTIVE"],
+    [
+      "C5 status=EXPIRED (the enum, NOT expiresAt)",
+      "EXPIRED",
+      "CANONICAL_LINK_INACTIVE",
+    ],
+  ] as const) {
+    it(`${label} newest is pinned and DENIES — the older ACTIVE link is NOT promoted`, async () => {
+      const { prisma, service } = createHarness();
+      const olderActive = seedHistoricalLink(prisma, {
+        websiteId: "site-a",
+        videoIds: ["video-1"],
+        alias: "hist-older-active",
+        createdAt: new Date("2026-01-01"),
+      });
+      const newestRestricted = seedHistoricalLink(prisma, {
+        websiteId: "site-a",
+        videoIds: ["video-1"],
+        alias: "hist-newest-restricted",
         status,
+        createdAt: new Date("2026-06-01"),
       });
 
       await assert.rejects(
@@ -1289,17 +1461,24 @@ describe("canonical adoption of historical single-video links", () => {
         expectConflictCode(code),
       );
 
-      // The identity IS pinned — the pair now has one permanent answer — but
-      // no replacement credential was minted and the link was not revived.
+      // IDENTITY IS PINNED to the restricted link...
       assert.equal(
         canonicalFor(prisma, "site-a", "video-1")?.shareLinkId,
-        historicalId,
+        newestRestricted,
+        "the newest link is the identity, whatever its status",
       );
-      assert.equal(prisma.shareLinks.size, 1, "no replacement link");
-      assert.equal(prisma.shareLinks.get(historicalId)?.status, status);
+      // ...and the older ACTIVE link was NOT blessed in its place, which is the
+      // bypass this whole test exists to forbid.
+      assert.notEqual(
+        canonicalFor(prisma, "site-a", "video-1")?.shareLinkId,
+        olderActive,
+      );
+      assert.equal(prisma.shareLinks.size, 2, "no replacement was minted");
+      assert.equal(prisma.shareLinks.get(newestRestricted)?.status, status);
+      assert.equal(prisma.shareLinks.get(olderActive)?.status, "ACTIVE");
 
-      // The pinning is durable: the next attempt takes the mapping path and
-      // still refuses rather than creating anything.
+      // The refusal is DURABLE: the next attempt takes the existing-mapping
+      // path and still denies, rather than reconsidering the older link.
       await assert.rejects(
         service.createShareLinkForRequest(
           "site-a",
@@ -1308,108 +1487,158 @@ describe("canonical adoption of historical single-video links", () => {
         ),
         expectConflictCode(code),
       );
-      assert.equal(prisma.shareLinks.size, 1);
+      assert.equal(prisma.shareLinks.size, 2);
       assert.equal(prisma.canonicals.size, 1);
     });
   }
 
-  it("CANON-HIST-06 an exhausted historical link keeps its spent budget", async () => {
-    const { prisma, service } = createHarness();
-    const historicalId = seedHistoricalLink(prisma, {
-      websiteId: "site-a",
-      videoIds: ["video-1"],
-      alias: "hist-alias-1",
-      status: "EXPIRED",
-      maxViews: 3,
-      currentViews: 3,
-    });
+  /**
+   * THE FOUR-WAY DISTINCTION, ASSERTED AS A SINGLE MATRIX.
+   *
+   * Each row states the condition by its EXACT name — a `status` enum value or a
+   * nullable column — and the exact outcome. Nothing here says "expired" on its
+   * own, because that word maps to two unrelated conditions with two different
+   * behaviours, and conflating them is how a status check and a column check get
+   * swapped for one another during a later edit.
+   */
+  for (const row of [
+    {
+      label: "status === REVOKED",
+      overrides: { status: "REVOKED" as const },
+      pinned: true,
+      code: "CANONICAL_LINK_REVOKED",
+    },
+    {
+      label: "status === DISABLED",
+      overrides: { status: "DISABLED" as const },
+      pinned: true,
+      code: "CANONICAL_LINK_INACTIVE",
+    },
+    {
+      label: "status === EXPIRED (enum, not a time)",
+      overrides: { status: "EXPIRED" as const },
+      pinned: true,
+      code: "CANONICAL_LINK_INACTIVE",
+    },
+    {
+      label: "expiresAt !== null, in the FUTURE, status ACTIVE",
+      overrides: { expiresAt: new Date("2099-01-01") },
+      pinned: false,
+      code: "CANONICAL_HISTORICAL_OPTIONS_PRESENT",
+    },
+    {
+      label: "expiresAt !== null, already in the PAST, status ACTIVE",
+      overrides: { expiresAt: new Date("2020-01-01") },
+      pinned: false,
+      code: "CANONICAL_HISTORICAL_OPTIONS_PRESENT",
+    },
+    {
+      label: "maxViews !== null, budget UNSPENT",
+      overrides: { maxViews: 10, currentViews: 0 },
+      pinned: false,
+      code: "CANONICAL_HISTORICAL_OPTIONS_PRESENT",
+    },
+    {
+      label: "maxViews !== null, budget EXHAUSTED by views",
+      overrides: { maxViews: 3, currentViews: 3 },
+      pinned: false,
+      code: "CANONICAL_HISTORICAL_OPTIONS_PRESENT",
+    },
+  ]) {
+    it(`C-MATRIX ${row.label} -> ${row.pinned ? "PIN then" : "refuse pre-write with"} ${row.code}`, async () => {
+      const { prisma, service } = createHarness();
+      const olderActive = seedHistoricalLink(prisma, {
+        websiteId: "site-a",
+        videoIds: ["video-1"],
+        alias: "hist-older-active",
+        createdAt: new Date("2026-01-01"),
+      });
+      const newest = seedHistoricalLink(prisma, {
+        websiteId: "site-a",
+        videoIds: ["video-1"],
+        alias: "hist-newest",
+        createdAt: new Date("2026-06-01"),
+        ...row.overrides,
+      });
 
-    await assert.rejects(
-      service.createShareLinkForRequest(
-        "site-a",
-        singleVideoRequest("video-1"),
-        "admin-1",
-      ),
-      expectConflictCode("CANONICAL_LINK_INACTIVE"),
-    );
-
-    const after = prisma.shareLinks.get(historicalId);
-    assert.equal(after?.currentViews, 3, "views must not be reset");
-    assert.equal(after?.maxViews, 3, "budget must not be replaced");
-    assert.equal(prisma.shareLinks.size, 1);
-  });
-
-  it("CANON-HIST-07 refuses when two historical candidates exist, creating nothing", async () => {
-    const { prisma, service } = createHarness();
-    seedHistoricalLink(prisma, {
-      websiteId: "site-a",
-      videoIds: ["video-1"],
-      alias: "hist-alias-1",
-      createdAt: new Date("2026-01-01"),
-    });
-    seedHistoricalLink(prisma, {
-      websiteId: "site-a",
-      videoIds: ["video-1"],
-      alias: "hist-alias-2",
-      createdAt: new Date("2026-02-01"),
-    });
-
-    await assert.rejects(
-      service.createShareLinkForRequest(
-        "site-a",
-        singleVideoRequest("video-1"),
-        "admin-1",
-      ),
-      (error: unknown) => {
-        assert.ok(error instanceof ConflictException, String(error));
-        assert.equal(error.getStatus(), 409);
-        const body = error.getResponse() as {
-          code?: string;
-          candidateCount?: number;
-        };
-        assert.equal(body.code, "CANONICAL_LINK_AMBIGUOUS");
-        assert.equal(body.candidateCount, 2);
-        return true;
-      },
-    );
-
-    // No L3, no mapping, and no winner silently picked by createdAt or status.
-    assert.equal(prisma.shareLinks.size, 2);
-    assert.equal(prisma.canonicals.size, 0);
-    assert.equal(prisma.audits.length, 0);
-  });
-
-  it("CANON-HIST-07 stays refused on retry until an owner adopts one", async () => {
-    const { prisma, service } = createHarness();
-    const firstId = seedHistoricalLink(prisma, {
-      websiteId: "site-a",
-      videoIds: ["video-1"],
-      alias: "hist-alias-1",
-    });
-    seedHistoricalLink(prisma, {
-      websiteId: "site-a",
-      videoIds: ["video-1"],
-      alias: "hist-alias-2",
-    });
-
-    for (let attempt = 0; attempt < 3; attempt += 1) {
       await assert.rejects(
         service.createShareLinkForRequest(
           "site-a",
           singleVideoRequest("video-1"),
           "admin-1",
         ),
-        expectConflictCode("CANONICAL_LINK_AMBIGUOUS"),
+        expectConflictCode(row.code),
       );
-    }
-    assert.equal(prisma.shareLinks.size, 2);
 
-    // The operator resolves it through the existing deliberate adoption path.
-    await service.adoptExistingShareLink({
+      // COMMON TO EVERY ROW: no fallback, no mint, nothing rewritten.
+      assert.equal(prisma.shareLinks.size, 2, "no replacement was minted");
+      assert.notEqual(
+        canonicalFor(prisma, "site-a", "video-1")?.shareLinkId,
+        olderActive,
+        "the older ACTIVE link must NEVER be promoted",
+      );
+      assert.equal(prisma.shareLinks.get(olderActive)?.status, "ACTIVE");
+      assert.equal(
+        prisma.shareLinks.get(newest)?.status,
+        row.overrides.status ?? "ACTIVE",
+      );
+      assert.equal(
+        prisma.shareLinks.get(newest)?.expiresAt ?? null,
+        row.overrides.expiresAt ?? null,
+      );
+      assert.equal(
+        prisma.shareLinks.get(newest)?.maxViews ?? null,
+        row.overrides.maxViews ?? null,
+      );
+      assert.equal(
+        prisma.shareLinks.get(newest)?.currentViews,
+        row.overrides.currentViews ?? 0,
+        "an exhausted budget is never reset",
+      );
+
+      // DIFFERS BY GROUP: a status pins the identity; a column refuses the pin.
+      if (row.pinned) {
+        assert.equal(
+          canonicalFor(prisma, "site-a", "video-1")?.shareLinkId,
+          newest,
+          "a status value still yields a permanent identity",
+        );
+        assert.equal(prisma.audits.length, 1, "the pin is audited");
+      } else {
+        assert.equal(
+          canonicalFor(prisma, "site-a", "video-1"),
+          undefined,
+          "a limit COLUMN must leave no mapping at all",
+        );
+        assert.equal(prisma.audits.length, 0, "and no audit row");
+      }
+
+      // And the verdict is DURABLE — a retry never reconsiders the older link.
+      await assert.rejects(
+        service.createShareLinkForRequest(
+          "site-a",
+          singleVideoRequest("video-1"),
+          "admin-1",
+        ),
+        expectConflictCode(row.code),
+      );
+      assert.equal(prisma.shareLinks.size, 2);
+    });
+  }
+
+  it("C-MATRIX status=ACTIVE with a null expiresAt and null maxViews is the ONLY pin-and-work case", async () => {
+    const { prisma, service } = createHarness();
+    seedHistoricalLink(prisma, {
       websiteId: "site-a",
-      videoId: "video-1",
-      shareLinkId: firstId,
-      adminId: "owner-1",
+      videoIds: ["video-1"],
+      alias: "hist-older",
+      createdAt: new Date("2026-01-01"),
+    });
+    const newest = seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-newest",
+      createdAt: new Date("2026-06-01"),
     });
 
     const resolved = await service.createShareLinkForRequest(
@@ -1417,22 +1646,350 @@ describe("canonical adoption of historical single-video links", () => {
       singleVideoRequest("video-1"),
       "admin-1",
     );
+
     assert.equal(resolved.outcome, "REUSED");
-    assert.equal(resolved.shareLink.id, firstId);
-    assert.equal(prisma.shareLinks.size, 2, "the other link is left alone");
+    assert.equal(resolved.shareLink.id, newest);
+    assert.equal(prisma.shareLinks.size, 2);
+  });
+  it("C-ALL-REVOKED every historical link is REVOKED — nothing is minted", async () => {
+    const { prisma, service } = createHarness();
+    const ids = [
+      seedHistoricalLink(prisma, {
+        websiteId: "site-a",
+        videoIds: ["video-1"],
+        alias: "hist-rev-1",
+        status: "REVOKED",
+        createdAt: new Date("2026-01-01"),
+      }),
+      seedHistoricalLink(prisma, {
+        websiteId: "site-a",
+        videoIds: ["video-1"],
+        alias: "hist-rev-2",
+        status: "REVOKED",
+        createdAt: new Date("2026-05-01"),
+      }),
+    ];
+
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      ),
+      expectConflictCode("CANONICAL_LINK_REVOKED"),
+    );
+
+    // Minting here would manufacture a working credential for a pair whose
+    // every link an owner had deliberately revoked. It must not happen.
+    assert.equal(prisma.shareLinks.size, 2, "NO new share link");
+    assert.equal(
+      canonicalFor(prisma, "site-a", "video-1")?.shareLinkId,
+      ids[1],
+    );
+    for (const id of ids) {
+      assert.equal(prisma.shareLinks.get(id)?.status, "REVOKED");
+    }
   });
 
-  it("CANON-HIST-08 adopts the exact [A] link and ignores the [A,B] bundle", async () => {
+  it("C-EXPIRY newest carries expiresAt — refused, no fallback and no mint", async () => {
+    const { prisma, service } = createHarness();
+    const olderActive = seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-older-active",
+      createdAt: new Date("2026-01-01"),
+    });
+    seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-expiring",
+      expiresAt: new Date("2027-01-01"),
+      createdAt: new Date("2026-06-01"),
+    });
+
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      ),
+      expectConflictCode("CANONICAL_HISTORICAL_OPTIONS_PRESENT"),
+    );
+
+    // Adopting it would ignore the expiry (`assertReusable()` does not read
+    // it); minting would bypass it outright; promoting the older link would
+    // bypass it too. All three are refused, and NOTHING is written.
+    assert.equal(prisma.canonicals.size, 0, "no mapping written");
+    assert.equal(prisma.shareLinks.size, 2, "no replacement minted");
+    assert.equal(prisma.audits.length, 0, "no success audit row");
+    assert.equal(prisma.shareLinks.get(olderActive)?.status, "ACTIVE");
+  });
+
+  it("C-MAXVIEWS newest carries maxViews — refused, no fallback and no mint", async () => {
+    const { prisma, service } = createHarness();
+    seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-older-active",
+      createdAt: new Date("2026-01-01"),
+    });
+    const limited = seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-limited",
+      maxViews: 5,
+      currentViews: 5,
+      createdAt: new Date("2026-06-01"),
+    });
+
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      ),
+      expectConflictCode("CANONICAL_HISTORICAL_OPTIONS_PRESENT"),
+    );
+
+    assert.equal(prisma.canonicals.size, 0);
+    assert.equal(prisma.shareLinks.size, 2, "an exhausted budget is not reset");
+    assert.equal(prisma.shareLinks.get(limited)?.maxViews, 5);
+    assert.equal(prisma.shareLinks.get(limited)?.currentViews, 5);
+    assert.equal(prisma.audits.length, 0);
+  });
+
+  it("C8 newest has a null alias — refused, no fallback and no mint", async () => {
+    const { prisma, service } = createHarness();
+    const olderActive = seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-older-active",
+      createdAt: new Date("2026-01-01"),
+    });
+    const aliasLess = seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: null,
+      createdAt: new Date("2026-06-01"),
+    });
+
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      ),
+      expectConflictCode("CANONICAL_HISTORICAL_ALIAS_MISSING"),
+    );
+
+    // THE ONE CASE THAT MUST NOT PIN. The alias IS the canonical URL's
+    // credential, so a pinned alias-less row would commit a mapping whose
+    // response construction throws forever, with no HTTP path to undo it.
+    // Refusing keeps the pair REMEDIABLE: restore the alias and retry.
+    assert.equal(prisma.canonicals.size, 0, "no unremediable mapping");
+    assert.equal(prisma.shareLinks.size, 2, "no replacement minted");
+    assert.equal(prisma.audits.length, 0);
+    assert.equal(
+      prisma.shareLinks.get(aliasLess)?.alias,
+      null,
+      "left as it was",
+    );
+    assert.equal(prisma.shareLinks.get(olderActive)?.status, "ACTIVE");
+
+    // Remediation works, and only then does the pair resolve — to the NEWEST
+    // link, not the older one that was available all along.
+    prisma.shareLinks.get(aliasLess)!.alias = "restored-alias";
+    const resolved = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    assert.equal(resolved.shareLink.id, aliasLess);
+    assert.equal(prisma.shareLinks.size, 2);
+  });
+
+  it("C9 newest already anchors ANOTHER pair — integrity conflict, no fallback", async () => {
+    const { prisma, service } = createHarness();
+    const olderActive = seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-older-active",
+      createdAt: new Date("2026-01-01"),
+    });
+    const anchored = seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-anchored",
+      createdAt: new Date("2026-06-01"),
+    });
+    // `CanonicalVideoShareLink.shareLinkId` is UNIQUE, so this state cannot
+    // arise by design. Meeting it means the data is corrupt, and silently
+    // skipping to the older candidate would hide that and hand out an identity
+    // nobody chose.
+    prisma.canonicals.set("canonical-foreign", {
+      id: "canonical-foreign",
+      websiteId: "site-a",
+      videoId: "video-2",
+      shareLinkId: anchored,
+      canonicalDomainId: "dom-a",
+      canonicalHostSnapshot: "plushcomedystudios.com",
+      canonicalProtocol: "https",
+      evidenceFingerprint: null,
+      evidenceSnapshotJson: null,
+      createdAt: new Date("2026-01-01"),
+      updatedAt: new Date("2026-01-01"),
+    });
+
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      ),
+      expectConflictCode("CANONICAL_HISTORICAL_INTEGRITY_CONFLICT"),
+    );
+
+    assert.equal(
+      canonicalFor(prisma, "site-a", "video-1"),
+      undefined,
+      "no mapping for the requested pair",
+    );
+    assert.equal(prisma.shareLinks.size, 2, "no replacement minted");
+    assert.equal(prisma.shareLinks.get(olderActive)?.status, "ACTIVE");
+  });
+
+  it("C-MINT-ONLY zero historical links is the ONLY path that mints", async () => {
+    // Exhaustive over the shapes that previously (wrongly) minted. Each must
+    // now either pin or refuse; none may create a ShareLink.
+    const restricted = [
+      { alias: "s-revoked", status: "REVOKED" as const },
+      { alias: "s-disabled", status: "DISABLED" as const },
+      { alias: "s-expired", status: "EXPIRED" as const },
+      { alias: "s-expiring", expiresAt: new Date("2027-01-01") },
+      { alias: "s-limited", maxViews: 3 },
+      { alias: null },
+    ];
+
+    for (const overrides of restricted) {
+      const { prisma, service } = createHarness();
+      seedHistoricalLink(prisma, {
+        websiteId: "site-a",
+        videoIds: ["video-1"],
+        alias: "unused",
+        ...overrides,
+      });
+
+      await assert.rejects(
+        service.createShareLinkForRequest(
+          "site-a",
+          singleVideoRequest("video-1"),
+          "admin-1",
+        ),
+        (error: unknown) => error instanceof ConflictException,
+        `${JSON.stringify(overrides)} must refuse, never mint`,
+      );
+      assert.equal(
+        prisma.shareLinks.size,
+        1,
+        `${JSON.stringify(overrides)} must not create a ShareLink`,
+      );
+    }
+
+    // ...and the empty-history control still mints, so the assertions above
+    // cannot be passing for the wrong reason.
+    const { prisma, service } = createHarness();
+    const created = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    assert.equal(created.outcome, "CREATED");
+    assert.equal(prisma.shareLinks.size, 1);
+  });
+
+  it("C16 audits AUTO_ADOPT with the pinned status and no credential", async () => {
+    const { prisma, service } = createHarness();
+    seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-alias-1",
+      createdAt: new Date("2026-03-01"),
+    });
+    seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-alias-2",
+      createdAt: new Date("2026-04-01"),
+    });
+
+    await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+
+    assert.equal(prisma.audits.length, 1);
+    assert.equal(prisma.audits[0].action, "CANONICAL_SHARE_LINK_AUTO_ADOPT");
+    const metadata = prisma.audits[0].metadata as Record<string, unknown>;
+    assert.equal(metadata.historicalCandidateCount, 2);
+    assert.equal(metadata.selectionPolicy, "LATEST_CREATED_AT");
+    assert.equal(metadata.adoptedHistoricalLink, true);
+    assert.equal(metadata.adoptedStatus, "ACTIVE");
+
+    // The alias is a BEARER CREDENTIAL — on the bound host it authorizes a
+    // watch by itself — so it must never reach an audit row, nor may the token
+    // or its peppered hash.
+    const serialized = JSON.stringify(prisma.audits);
+    assert.equal(serialized.includes("hist-alias-1"), false);
+    assert.equal(serialized.includes("hist-alias-2"), false);
+    assert.equal(serialized.includes("hash-"), false);
+    assert.equal(serialized.includes("test-pepper"), false);
+  });
+
+  it("C16 records the pinned status when the identity is a REVOKED link", async () => {
+    const { prisma, service } = createHarness();
+    seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-revoked",
+      status: "REVOKED",
+    });
+
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      ),
+      expectConflictCode("CANONICAL_LINK_REVOKED"),
+    );
+
+    // The pin is a real, audited fact even though the request failed: it is
+    // what stops the next call minting a replacement.
+    assert.equal(prisma.audits.length, 1);
+    assert.equal(prisma.audits[0].action, "CANONICAL_SHARE_LINK_AUTO_ADOPT");
+    assert.equal(
+      (prisma.audits[0].metadata as Record<string, unknown>).adoptedStatus,
+      "REVOKED",
+    );
+  });
+
+  it("C10 adopts the exact [A] link and ignores the [A,B] bundle", async () => {
     const { prisma, service } = createHarness();
     const exactId = seedHistoricalLink(prisma, {
       websiteId: "site-a",
       videoIds: ["video-1"],
       alias: "hist-exact",
+      createdAt: new Date("2026-01-01"),
     });
     const bundleId = seedHistoricalLink(prisma, {
       websiteId: "site-a",
       videoIds: ["video-1", "video-2"],
       alias: "hist-bundle",
+      // NEWER than the exact link: if cardinality were not proven, the
+      // newest-first ordering would hand the bundle the win and publish
+      // video-2 to everyone who follows video-1's canonical URL.
+      createdAt: new Date("2026-06-01"),
     });
 
     const resolved = await service.createShareLinkForRequest(
@@ -1452,7 +2009,7 @@ describe("canonical adoption of historical single-video links", () => {
     );
   });
 
-  it("CANON-HIST-09 a bundle alone is NOT a candidate — adopting it would leak B", async () => {
+  it("C10 a bundle alone is NOT a candidate — adopting it would leak B", async () => {
     const { prisma, service } = createHarness();
     const bundleId = seedHistoricalLink(prisma, {
       websiteId: "site-a",
@@ -1466,10 +2023,11 @@ describe("canonical adoption of historical single-video links", () => {
       "admin-1",
     );
 
+    // A bundle is not history FOR THIS PAIR at all, so this is genuinely the
+    // zero-history case and minting is correct.
     assert.equal(created.outcome, "CREATED");
     assert.notEqual(created.shareLink.id, bundleId);
     assert.equal(prisma.shareLinks.size, 2);
-    // The canonical link contains video-1 ONLY.
     assert.deepEqual(created.shareLink.videos, [{ videoId: "video-1" }]);
     assert.equal(
       canonicalFor(prisma, "site-a", "video-1")?.shareLinkId,
@@ -1477,7 +2035,7 @@ describe("canonical adoption of historical single-video links", () => {
     );
   });
 
-  it("CANON-HIST-09 a same-video link on ANOTHER website is not a candidate", async () => {
+  it("C11 a same-video link on ANOTHER website is not a candidate", async () => {
     const { prisma, service } = createHarness();
     const otherSiteId = seedHistoricalLink(prisma, {
       websiteId: "site-b",
@@ -1495,16 +2053,36 @@ describe("canonical adoption of historical single-video links", () => {
     assert.notEqual(created.shareLink.id, otherSiteId);
   });
 
-  it("CANON-HIST-10 eight concurrent requests all adopt the one historical link", async () => {
+  it("C15 twenty concurrent requests converge on the newest historical link", async () => {
     const { prisma, service } = createHarness();
-    const historicalId = seedHistoricalLink(prisma, {
+    // Four historical duplicates, exactly the shape production holds.
+    seedHistoricalLink(prisma, {
       websiteId: "site-a",
       videoIds: ["video-1"],
-      alias: "hist-alias-1",
+      alias: "hist-1",
+      createdAt: new Date("2026-01-01"),
+    });
+    seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-2",
+      createdAt: new Date("2026-02-01"),
+    });
+    seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-3",
+      createdAt: new Date("2026-03-01"),
+    });
+    const expectedWinner = seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-4",
+      createdAt: new Date("2026-04-01"),
     });
 
     const results = await Promise.all(
-      Array.from({ length: 8 }, () =>
+      Array.from({ length: 20 }, () =>
         service.createShareLinkForRequest(
           "site-a",
           singleVideoRequest("video-1"),
@@ -1513,16 +2091,58 @@ describe("canonical adoption of historical single-video links", () => {
       ),
     );
 
-    assert.equal(prisma.canonicals.size, 1);
-    assert.equal(prisma.shareLinks.size, 1, "zero new share links");
+    assert.equal(prisma.canonicals.size, 1, "one mapping");
+    assert.equal(prisma.shareLinks.size, 4, "zero newly minted share links");
     for (const result of results) {
-      assert.equal(result.shareLink.id, historicalId);
+      assert.equal(result.shareLink.id, expectedWinner);
       assert.equal(result.outcome, "REUSED");
     }
     assert.equal(new Set(results.map((row) => row.publicUrl)).size, 1);
+    // Exactly one adoption was audited, however many requests raced.
+    assert.equal(prisma.audits.length, 1);
+    assert.equal(prisma.audits[0].action, "CANONICAL_SHARE_LINK_AUTO_ADOPT");
   });
 
-  it("CANON-HIST-11 an adopt racing a create leaves one canonical each and no orphan", async () => {
+  it("C15 concurrent requests on a REVOKED newest all deny, and mint nothing", async () => {
+    const { prisma, service } = createHarness();
+    seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-older-active",
+      createdAt: new Date("2026-01-01"),
+    });
+    const revoked = seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-revoked",
+      status: "REVOKED",
+      createdAt: new Date("2026-06-01"),
+    });
+
+    const outcomes = await Promise.allSettled(
+      Array.from({ length: 12 }, () =>
+        service.createShareLinkForRequest(
+          "site-a",
+          singleVideoRequest("video-1"),
+          "admin-1",
+        ),
+      ),
+    );
+
+    assert.equal(
+      outcomes.every((result) => result.status === "rejected"),
+      true,
+      "a race must not let one request through",
+    );
+    assert.equal(prisma.canonicals.size, 1);
+    assert.equal(
+      canonicalFor(prisma, "site-a", "video-1")?.shareLinkId,
+      revoked,
+    );
+    assert.equal(prisma.shareLinks.size, 2, "no replacement minted under load");
+  });
+
+  it("C-ADOPT-RACE an adopt racing a create leaves one canonical each and no orphan", async () => {
     const { prisma, service } = createHarness();
     const historicalId = seedHistoricalLink(prisma, {
       websiteId: "site-a",
@@ -1567,7 +2187,7 @@ describe("canonical adoption of historical single-video links", () => {
     assert.equal(results[2].shareLink.id, results[3].shareLink.id);
   });
 
-  it("CANON-HIST-12 an existing mapping wins over any historical duplicate", async () => {
+  it("C13 an existing mapping wins over any newer duplicate", async () => {
     const { prisma, service } = createHarness();
     // A mapping already pins one link...
     const pinned = await service.createShareLinkForRequest(
@@ -1575,17 +2195,20 @@ describe("canonical adoption of historical single-video links", () => {
       singleVideoRequest("video-1"),
       "admin-1",
     );
-    // ...and duplicates appear afterwards, which WOULD be ambiguous if the
-    // scan ran. Authoritative provenance must short-circuit it entirely.
-    seedHistoricalLink(prisma, {
+    // ...and NEWER duplicates appear afterwards. Under the selection policy
+    // alone they would win. Authoritative provenance must short-circuit the
+    // scan entirely: canonical identity, once established, does not move.
+    const newerA = seedHistoricalLink(prisma, {
       websiteId: "site-a",
       videoIds: ["video-1"],
-      alias: "hist-alias-1",
+      alias: "hist-newer-a",
+      createdAt: new Date("2030-01-01"),
     });
-    seedHistoricalLink(prisma, {
+    const newerB = seedHistoricalLink(prisma, {
       websiteId: "site-a",
       videoIds: ["video-1"],
-      alias: "hist-alias-2",
+      alias: "hist-newer-b",
+      createdAt: new Date("2031-01-01"),
     });
 
     const resolved = await service.createShareLinkForRequest(
@@ -1596,7 +2219,210 @@ describe("canonical adoption of historical single-video links", () => {
 
     assert.equal(resolved.outcome, "REUSED");
     assert.equal(resolved.shareLink.id, pinned.shareLink.id);
+    assert.notEqual(resolved.shareLink.id, newerA);
+    assert.notEqual(resolved.shareLink.id, newerB);
     assert.equal(resolved.publicUrl, pinned.publicUrl);
     assert.equal(prisma.canonicals.size, 1);
+    // And it stays that way on every later call.
+    const again = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    assert.equal(again.shareLink.id, pinned.shareLink.id);
+  });
+
+  it("C17 a revoked EXISTING canonical mapping still fails closed, replacing nothing", async () => {
+    const { prisma, service } = createHarness();
+    const pinned = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    prisma.shareLinks.get(pinned.shareLink.id)!.status = "REVOKED";
+    // A perfectly usable newer duplicate exists. It must NOT be promoted:
+    // that would hand back working access an owner deliberately removed.
+    const tempting = seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-tempting",
+      createdAt: new Date("2030-01-01"),
+    });
+
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      ),
+      expectConflictCode("CANONICAL_LINK_REVOKED"),
+    );
+
+    assert.equal(
+      canonicalFor(prisma, "site-a", "video-1")?.shareLinkId,
+      pinned.shareLink.id,
+      "the mapping is not repointed",
+    );
+    assert.equal(prisma.shareLinks.get(tempting)?.status, "ACTIVE");
+    assert.equal(prisma.canonicals.size, 1);
+  });
+
+  it("C16 never returns a raw token or hash on the adoption path", async () => {
+    const { prisma, service } = createHarness();
+    seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-only",
+    });
+
+    const resolved = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+
+    assert.equal("rawToken" in resolved, false);
+    const serialized = JSON.stringify(resolved);
+    assert.equal(serialized.includes("tokenHash"), false);
+    assert.equal(serialized.includes("test-pepper"), false);
+    assert.equal(serialized.includes("s_"), false);
+    assert.equal(prisma.shareLinks.size, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C19 — TOCTOU. Every precondition must be read INSIDE the transaction.
+//
+// `transactionOpenHooks` stands in for a concurrent writer that committed after
+// this request's pre-flight reads and before its canonical write. A precondition
+// still evaluated outside the transaction cannot see the mutation, so each of
+// these fails the moment a read moves back out.
+// ---------------------------------------------------------------------------
+
+describe("canonical create closes its time-of-check/time-of-use windows", () => {
+  it("C19 a website disabled after the pre-flight check writes nothing", async () => {
+    const { prisma, service } = createHarness();
+    prisma.transactionOpenHooks.push(() => {
+      prisma.websites.set("site-a", { id: "site-a", status: "DISABLED" });
+    });
+
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      ),
+      (error: unknown) => error instanceof Error,
+    );
+
+    assert.equal(prisma.canonicals.size, 0, "no mapping was committed");
+    assert.equal(prisma.shareLinks.size, 0, "no orphan share link");
+    assert.equal(prisma.audits.length, 0, "no success audit row");
+  });
+
+  it("C19 a video that stops being eligible after the pre-flight writes nothing", async () => {
+    const { prisma, service, control } = createHarness();
+    prisma.transactionOpenHooks.push(() => {
+      control.eligibilityError = new BadRequestException({
+        code: "VIDEO_NOT_ACTIVE_FOR_WEBSITE",
+      });
+    });
+
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      ),
+      (error: unknown) => error instanceof BadRequestException,
+    );
+
+    assert.equal(prisma.canonicals.size, 0);
+    assert.equal(prisma.shareLinks.size, 0);
+    assert.equal(prisma.audits.length, 0);
+  });
+
+  it("C19 a domain disabled after the pre-flight is never anchored", async () => {
+    const { prisma, service } = createHarness();
+    prisma.transactionOpenHooks.push(() => {
+      prisma.domains.get("dom-a")!.status = "DISABLED";
+    });
+
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      ),
+      (error: unknown) => error instanceof BadRequestException,
+    );
+
+    // The relation is `onDelete: Restrict`, so a mapping anchored to a disabled
+    // domain would fail `assertReusable()` forever with no HTTP way back.
+    assert.equal(prisma.canonicals.size, 0);
+    assert.equal(prisma.shareLinks.size, 0);
+    assert.equal(prisma.audits.length, 0);
+  });
+
+  it("C19 the evidence fingerprint describes the video AT COMMIT, not before", async () => {
+    const { prisma, service } = createHarness();
+    prisma.transactionOpenHooks.push(() => {
+      const video = prisma.videos.get("video-1")!;
+      video.title = "Retitled between the pre-flight and the write";
+    });
+
+    const created = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    assert.equal(created.outcome, "CREATED");
+
+    // Reading it back recomputes the fingerprint over the CURRENT row. If the
+    // snapshot had been taken before the transaction opened, the stored
+    // fingerprint would already disagree and this brand-new mapping would
+    // report drift on its very first read.
+    const readBack = await service.getCanonical("site-a", "video-1");
+    assert.equal(readBack.evidenceDrift, false);
+    assert.equal(
+      (readBack.evidenceSnapshot as { title?: string } | null)?.title,
+      "Retitled between the pre-flight and the write",
+    );
+  });
+
+  it("C19 a link revoked after the pin still denies, and mints no replacement", async () => {
+    const { prisma, service } = createHarness();
+    const historicalId = seedHistoricalLink(prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-alias-1",
+    });
+    // The winner is ACTIVE when the transaction commits and REVOKED by the time
+    // the post-commit usability verdict runs — the narrow window the
+    // identity/usability split is designed to answer truthfully.
+    prisma.transactionOpenHooks.push(() => {
+      queueMicrotask(() => {
+        const link = prisma.shareLinks.get(historicalId);
+        if (link) {
+          link.status = "REVOKED";
+        }
+      });
+    });
+
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      ),
+      expectConflictCode("CANONICAL_LINK_REVOKED"),
+    );
+
+    assert.equal(
+      canonicalFor(prisma, "site-a", "video-1")?.shareLinkId,
+      historicalId,
+      "identity is pinned; only usability failed",
+    );
+    assert.equal(prisma.shareLinks.size, 1, "no replacement minted");
   });
 });

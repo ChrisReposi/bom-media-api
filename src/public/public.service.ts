@@ -5,7 +5,12 @@ import {
   Optional,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
+import {
+  isBunnyPullZoneUrl,
+  resolveBunnyThumbnailUpstreamUrl,
+} from "../bunny/bunny-cdn-thumbnail.util";
 import { BunnyStreamService } from "../bunny/bunny-stream.service";
+import { BunnyThumbnailProxyService } from "../bunny/bunny-thumbnail-proxy.service";
 import {
   classifyBunnyVideoAsset,
   isBunnyRemoteMissing,
@@ -126,6 +131,19 @@ export type PublicLocalThumbnail = {
   stream: NodeJS.ReadableStream;
 };
 
+/**
+ * What the public thumbnail route returns, for any provider.
+ *
+ * `contentLength` is nullable because an upstream CDN is not obliged to send
+ * `Content-Length`. A local asset always has one; a proxied one may not, and
+ * the controller must then omit the header rather than emit a wrong number.
+ */
+export type PublicThumbnail = {
+  mimeType: string;
+  contentLength: number | null;
+  stream: NodeJS.ReadableStream;
+};
+
 type PublicBinaryAssetMetadata = {
   mimeType: string;
   sizeBytes: bigint;
@@ -180,6 +198,11 @@ export class PublicService {
     // Appended and optional on purpose. Public watch resolution for every
     // legacy source type must work with no Bunny collaborator at all.
     @Optional() private readonly bunnyStreamService?: BunnyStreamService,
+    // Same reasoning, and additionally OFF by default: a deployment that has
+    // not opted into the backend-mediated poster keeps its previous behaviour
+    // byte for byte.
+    @Optional()
+    private readonly bunnyThumbnailProxyService?: BunnyThumbnailProxyService,
   ) {}
 
   async resolvePublicWatch(
@@ -485,6 +508,172 @@ export class PublicService {
       viewCount: result.viewCount,
       publishedAt: result.publishedAt,
     };
+  }
+
+  /**
+   * Serves the reviewer-facing poster for one video, whatever provider backs it.
+   *
+   * ROUTE PRESERVED ON PURPOSE. This is still
+   * `GET|HEAD /public/watch/:token/videos/:videoId/thumbnail?host=…[&grant=…]`.
+   * A second route would mean a second copy of the authorization chain, and two
+   * copies drift; `docs/API_CONTRACTS.md` §3.2 already documents this URL and
+   * both public clients already call it.
+   *
+   * LOCAL_FILE behaviour is byte-identical to before. The Bunny branch is
+   * additive and only reachable when the proxy is explicitly enabled.
+   */
+  async getPublicThumbnail(
+    params: PublicLocalThumbnailParams,
+  ): Promise<PublicThumbnail> {
+    const normalizedHost = normalizePublicHost(params.host);
+    const trimmedToken = this.normalizePublicToken(params.token);
+
+    if (
+      normalizedHost === null ||
+      trimmedToken === null ||
+      !this.isValidPublicVideoId(params.videoId) ||
+      !this.isValidMediaGrantInput(params.grant)
+    ) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    // LOCAL_FILE FAST PATH, PRESERVED EXACTLY. A cached LOCAL_FILE
+    // authorization must keep costing ZERO queries: that cache is the whole
+    // point of KI-020/§4.2, and routing every thumbnail through the generic
+    // loader first would silently double the query count on a public route.
+    // The cached entry carries the video row, so its `sourceType` is enough to
+    // dispatch, and the delegation below then hits the very same entry.
+    const cachedVideo =
+      this.memoryCache?.get<PublicWatchVideoWithBinary>(
+        this.buildPublicLocalMediaMetadataCacheKey(
+          normalizedHost,
+          trimmedToken,
+          params.videoId,
+        ),
+      ) ?? null;
+    if (cachedVideo?.sourceType === VideoSourceType.LOCAL_FILE) {
+      return this.getPublicLocalThumbnail(params);
+    }
+
+    // The Bunny branch deliberately does NOT consult that cache. A Bunny poster
+    // is decided from a FRESH read, for the same reason
+    // `loadSignableBunnyVideoIds()` exists — this process's cache cannot be
+    // invalidated by reconciliation running anywhere else, so a stale READY row
+    // would keep serving a poster for a video Bunny has already deleted. Only
+    // LOCAL_FILE entries are ever written to it, so the lookup above can never
+    // return a Bunny row.
+    const { shareLink, video } = await this.loadAuthorizedPublicMediaVideo({
+      normalizedHost,
+      trimmedToken,
+      videoId: params.videoId,
+    });
+    if (!this.hasValidMediaGrant(shareLink, params, normalizedHost)) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    if (video.sourceType === VideoSourceType.LOCAL_FILE) {
+      return this.getPublicLocalThumbnail(params);
+    }
+
+    return this.getPublicBunnyThumbnail(video);
+  }
+
+  /**
+   * The Bunny half of the public poster route.
+   *
+   * THREE INDEPENDENT GATES, all of which must pass, and every failure is the
+   * same generic `404 "Video not found."`:
+   *
+   *   1. AUTHORITATIVE BUNNY IDENTITY. `classifyBunnyVideoAsset()` — the same
+   *      strict predicate playback signing uses, not a weaker copy — plus the
+   *      absence of `metadataJson.bunnyStream.remoteMissing`. A
+   *      `bunny-malformed` record fails closed and never falls through to its
+   *      stored URL.
+   *   2. URL VALIDATION. The stored `thumbnailUrl` is parsed and every
+   *      component checked against the proven identity, then the upstream URL
+   *      is REBUILT from that identity. See
+   *      `resolveBunnyThumbnailUpstreamUrl()`.
+   *   3. UPSTREAM RESPONSE VALIDATION. Status, redirect refusal, content type
+   *      and size, in `BunnyThumbnailProxyService`.
+   *
+   * The caller has already proven the share authorization chain, so nothing
+   * about the reviewer's entitlement is decided here.
+   */
+  private async getPublicBunnyThumbnail(
+    video: PublicWatchVideoWithBinary,
+  ): Promise<PublicThumbnail> {
+    const upstreamUrl = this.resolveBunnyThumbnailUpstream(video);
+    if (upstreamUrl === null) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    const result =
+      await this.bunnyThumbnailProxyService!.fetchThumbnail(upstreamUrl);
+    if (!result.ok) {
+      // The reason is internal diagnostics only. A reviewer must not be able to
+      // tell an upstream 403 from an upstream 404 from a size rejection: that
+      // is the same non-enumerability rule every other public denial follows.
+      this.logger.warn(
+        { videoId: video.id, reason: result.reason },
+        "Public Bunny thumbnail could not be served.",
+      );
+
+      throw new NotFoundException("Video not found.");
+    }
+
+    return {
+      mimeType: result.contentType,
+      contentLength: result.contentLength,
+      stream: result.stream,
+    };
+  }
+
+  /**
+   * The upstream Bunny poster URL for a video, or null when there is not one
+   * this backend is willing to fetch.
+   *
+   * Pure and I/O-free, so `toPublicVideoResponses()` can use the SAME decision
+   * to choose which URL shape to advertise. If serialization advertised the
+   * backend route while the route itself refused, every Bunny card would render
+   * a broken image; one function means the two answers cannot disagree.
+   */
+  private resolveBunnyThumbnailUpstream(
+    video: PublicWatchVideoWithBinary,
+  ): string | null {
+    if (
+      this.bunnyThumbnailProxyService === undefined ||
+      !this.bunnyThumbnailProxyService.isEnabled() ||
+      this.bunnyStreamService === undefined
+    ) {
+      return null;
+    }
+
+    // (1) AUTHORITATIVE IDENTITY. `bunny-malformed` and `not-bunny` both stop
+    // here: the first must never reach its stored URL, and the second is not
+    // this branch's business.
+    const classification = classifyBunnyVideoAsset(video);
+    if (classification.kind !== "bunny") {
+      return null;
+    }
+
+    // Reconciliation has proven the remote asset is gone. Serving its cached
+    // poster would advertise a video that cannot play.
+    if (isBunnyRemoteMissing(video.metadataJson)) {
+      return null;
+    }
+
+    const pullZoneHostname = this.bunnyStreamService.getPullZoneHostname();
+    if (pullZoneHostname === null) {
+      return null;
+    }
+
+    // (2) URL VALIDATION against the proven identity, then reconstruction.
+    const resolved = resolveBunnyThumbnailUpstreamUrl(video.thumbnailUrl, {
+      bunnyVideoId: classification.bunnyVideoId,
+      pullZoneHostname,
+    });
+
+    return resolved.ok ? resolved.url : null;
   }
 
   async getPublicLocalThumbnail(
@@ -825,7 +1014,35 @@ export class PublicService {
       const localThumbnailUrl =
         video.sourceType === VideoSourceType.LOCAL_FILE &&
         this.isPlayableImageAsset(video.localThumbnailAsset ?? null)
-          ? this.buildPublicLocalThumbnailUrl({
+          ? this.buildPublicThumbnailUrl({
+              token: playbackContext.token,
+              videoId: video.id,
+              host: playbackContext.host,
+              grant,
+            })
+          : null;
+      // BUNNY POSTERS ARE BACKEND-MEDIATED.
+      //
+      // The raw pull-zone URL used to go straight to the reviewer's browser,
+      // which is why every poster 403'''d behind Worldfold'''s
+      // `Referrer-Policy: no-referrer`: the browser sent no `Referer` and
+      // Bunny'''s hotlink protection refused. Returning THIS API'''s route
+      // instead makes poster delivery independent of any browser referrer
+      // policy, keeps the reviewer'''s IP away from Bunny, and puts the poster
+      // behind the same share authorization as everything else.
+      //
+      // `resolveBunnyThumbnailUpstream()` is the SAME function the route uses,
+      // so a URL is only advertised when the route would actually serve it.
+      const bunnyThumbnailUrl =
+        video.sourceType !== VideoSourceType.LOCAL_FILE &&
+        signableBunnyVideoIds.has(video.id) &&
+        // The SAME authoritative gate the embed URL is signed behind, reused at
+        // no extra cost: it was already computed for this response. Without it
+        // a stale cached row could advertise a poster URL while the route — which
+        // re-reads the current row — refuses it, leaving a broken image next to
+        // a correctly-null `embedUrl`.
+        this.resolveBunnyThumbnailUpstream(video) !== null
+          ? this.buildPublicThumbnailUrl({
               token: playbackContext.token,
               videoId: video.id,
               host: playbackContext.host,
@@ -835,7 +1052,7 @@ export class PublicService {
       const thumbnailUrl =
         video.sourceType === VideoSourceType.LOCAL_FILE
           ? localThumbnailUrl
-          : this.toSafePublicMediaUrl(video.thumbnailUrl);
+          : (bunnyThumbnailUrl ?? this.toSafePublicBunnyAwareUrl(video));
       // Bunny-backed assets only. Every other source type - including a
       // legacy `provider: BUNNY` DIRECT_URL record - falls through with
       // `video.embedUrl` untouched.
@@ -868,6 +1085,11 @@ export class PublicService {
         embedProvider: video.embedProvider,
         embedAllow: video.embedAllow,
         thumbnailUrl,
+        // Both fields carry the same value for a proxied Bunny poster.
+        // `private-share-contract.js` in Worldfold reads `publicThumbnailUrl`
+        // first and falls back to `thumbnailUrl`, while older public bundles
+        // read only `thumbnailUrl`; populating both is what lets an
+        // already-deployed client pick up the protected URL with no change.
         publicThumbnailUrl:
           video.sourceType === VideoSourceType.LOCAL_FILE
             ? localThumbnailUrl
@@ -1376,7 +1598,31 @@ export class PublicService {
     return video;
   }
 
-  private async loadAuthorizedPublicLocalVideo(params: {
+  /**
+   * THE PROVIDER-INDEPENDENT PUBLIC MEDIA AUTHORIZATION CHAIN.
+   *
+   * One implementation, so a second media route cannot drift away from it. It
+   * proves, in this order and with no shortcuts:
+   *
+   *   normalized host -> ACTIVE `WebsiteDomain` -> ACTIVE `Website`
+   *   -> a ShareLink belonging to THAT website, matched by alias or peppered
+   *      token hash -> ShareLink ACTIVE and not expired
+   *   -> `ShareLinkVideo` membership for the exact requested video
+   *   -> ACTIVE `WebsiteVideo` assignment of that video to that website
+   *   -> `VideoStatus.READY`
+   *
+   * It deliberately stops there. PROVIDER-SPECIFIC asset validity is the
+   * caller's job — `isPlayableLocalAsset()` for LOCAL_FILE, the authoritative
+   * Bunny gate for a Bunny poster — because those are different questions with
+   * different fail-closed rules, and folding them in here is how one branch
+   * quietly becomes weaker than the other.
+   *
+   * INCREMENTS NOTHING. Media routes never consume a view: the view was claimed
+   * once, atomically, when the watch was resolved. `maxViews` is re-checked by
+   * the caller through `hasValidMediaGrant()`, which verifies the HMAC grant
+   * rather than spending another view.
+   */
+  private async loadAuthorizedPublicMediaVideo(params: {
     normalizedHost: string;
     trimmedToken: string;
     videoId: string;
@@ -1473,9 +1719,28 @@ export class PublicService {
 
     const video = shareLink.shareLinkVideos[0]?.video;
 
+    if (video === undefined || video.status !== VideoStatus.READY) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    return { shareLink, video };
+  }
+
+  /**
+   * The LOCAL_FILE narrowing of the shared chain, byte-compatible with what the
+   * `local-file` and `thumbnail` routes enforced before the chain was
+   * extracted: the same source-type assertion and the same playable-asset
+   * predicate, in the same order.
+   */
+  private async loadAuthorizedPublicLocalVideo(params: {
+    normalizedHost: string;
+    trimmedToken: string;
+    videoId: string;
+  }): Promise<{ shareLink: ShareLink; video: PublicWatchVideoWithBinary }> {
+    const { shareLink, video } =
+      await this.loadAuthorizedPublicMediaVideo(params);
+
     if (
-      video === undefined ||
-      video.status !== VideoStatus.READY ||
       video.sourceType !== VideoSourceType.LOCAL_FILE ||
       !this.isPlayableLocalAsset(video.localFileAsset ?? null)
     ) {
@@ -1782,7 +2047,50 @@ export class PublicService {
     )}/videos/${encodeURIComponent(params.videoId)}/local-file?${query.toString()}`;
   }
 
-  private buildPublicLocalThumbnailUrl(params: {
+  /**
+   * The stored poster URL a NON-proxied record may still expose.
+   *
+   * Fails closed for a record that structurally claims to be a Bunny EMBED but
+   * is not addressable through the proxy: emitting its stored pull-zone URL
+   * would put back exactly the raw CDN link the proxy exists to remove, and for
+   * a `bunny-malformed` record it would hand out an unvalidated provider URL.
+   *
+   * A Bunny-provider video carrying an OPERATOR-SET poster on some other host
+   * is a different case and keeps its existing pass-through behaviour: sync
+   * only fills an empty `thumbnailUrl` and never overwrites one, so that value
+   * was a deliberate choice and nulling it would silently delete a working
+   * image. Everything else — DIRECT_URL, Cloudinary, generic EMBED — is
+   * untouched.
+   */
+  private toSafePublicBunnyAwareUrl(
+    video: PublicWatchVideoWithBinary,
+  ): string | null {
+    // PROXY OFF IS THE DEFAULT, AND IT CHANGES NOTHING. A deployment that has
+    // not opted into backend-mediated posters keeps the exact serialization it
+    // had before this branch existed — the stored URL, filtered only by
+    // `toSafePublicMediaUrl()` — for every source type including Bunny.
+    if (this.bunnyThumbnailProxyService?.isEnabled() !== true) {
+      return this.toSafePublicMediaUrl(video.thumbnailUrl);
+    }
+
+    const classification = classifyBunnyVideoAsset(video);
+    if (classification.kind === "not-bunny") {
+      return this.toSafePublicMediaUrl(video.thumbnailUrl);
+    }
+
+    if (classification.kind === "bunny-malformed") {
+      return null;
+    }
+
+    const pullZoneHostname =
+      this.bunnyStreamService?.getPullZoneHostname() ?? null;
+
+    return isBunnyPullZoneUrl(video.thumbnailUrl, pullZoneHostname)
+      ? null
+      : this.toSafePublicMediaUrl(video.thumbnailUrl);
+  }
+
+  private buildPublicThumbnailUrl(params: {
     token: string;
     videoId: string;
     host: string;

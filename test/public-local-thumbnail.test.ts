@@ -300,6 +300,70 @@ function createService(
   return { prisma, service };
 }
 
+/**
+ * THE CACHED LOCAL_FILE THUMBNAIL MUST STILL COST ZERO QUERIES.
+ *
+ * The route was generalised to serve Bunny posters too (2026-08-28). Routing
+ * every request through the provider-independent chain first would have
+ * silently doubled the query count on a public media route and defeated the
+ * authorization cache that KI-020 / SECURITY_MODEL §4.2 document. This pins the
+ * fast path rather than trusting the dispatch order.
+ */
+describe("PublicService thumbnail route keeps the LOCAL_FILE fast path", () => {
+  it("issues no database query for a cached LOCAL_FILE thumbnail", async () => {
+    const { prisma, service } = createService(createLocalFileVideo(), {
+      memoryCache: true,
+    });
+
+    // Cold: populates the authorization cache.
+    const first = await service.getPublicThumbnail({
+      host,
+      token,
+      videoId: "video-1",
+    });
+    assert.equal(first.mimeType, "image/jpeg");
+    const domainCallsAfterCold = prisma.websiteDomainFindUniqueCalls;
+    const shareLinkCallsAfterCold = prisma.shareLinkFindFirstCalls;
+    assert.ok(shareLinkCallsAfterCold > 0, "the cold request did query");
+
+    // Warm: must add nothing.
+    const second = await service.getPublicThumbnail({
+      host,
+      token,
+      videoId: "video-1",
+    });
+
+    assert.equal(second.mimeType, "image/jpeg");
+    assert.equal(
+      prisma.websiteDomainFindUniqueCalls,
+      domainCallsAfterCold,
+      "a cached LOCAL_FILE thumbnail must not re-resolve the domain",
+    );
+    assert.equal(
+      prisma.shareLinkFindFirstCalls,
+      shareLinkCallsAfterCold,
+      "a cached LOCAL_FILE thumbnail must not re-query the share link",
+    );
+    assert.equal(
+      prisma.shareLinkUpdateManyCalls,
+      0,
+      "a thumbnail must never consume a view",
+    );
+  });
+
+  it("still enforces the chain for a LOCAL_FILE thumbnail on a cold cache", async () => {
+    const { prisma, service } = createService(createLocalFileVideo(), {
+      memoryCache: true,
+    });
+    prisma.assignmentActive = false;
+
+    await assert.rejects(
+      service.getPublicThumbnail({ host, token, videoId: "video-1" }),
+      NotFoundException,
+    );
+  });
+});
+
 describe("PublicService LOCAL_FILE thumbnail serialization", () => {
   it("returns token-gated public thumbnail URLs for image local thumbnails", async () => {
     const { service } = createService(createLocalFileVideo());

@@ -64,9 +64,24 @@ between deciding and inserting.
 
 | Exact single-video links found | Result |
 |---|---|
-| 0 | Create a new canonical link. **The only case that mints one.** |
-| 1 | **Adopt it.** Its `id`, `alias`, `tokenHash`, `createdAt`, `label`, `status`, `expiresAt`, `maxViews`, `currentViews` and membership are all preserved untouched; only the mapping row is written. Audited `CANONICAL_SHARE_LINK_ADOPT` |
-| 2 or more | `409 CANONICAL_LINK_AMBIGUOUS`. **Nothing is written** |
+| 0 | Create a new canonical link. **The only case that mints one** |
+| ≥ 1 | The **NEWEST** (`createdAt DESC`, `id DESC`) becomes the identity. Its `id`, `alias`, `tokenHash`, `createdAt`, `label`, `status`, `expiresAt`, `maxViews`, `currentViews` and membership are all preserved untouched; only the mapping row is written. Audited `CANONICAL_SHARE_LINK_AUTO_ADOPT` |
+
+> **Adoption pins IDENTITY, not usability — and the winner's status is not a
+> selection input.** A revoked, disabled or expired newest link is still adopted;
+> the pair gets its one permanent answer and the request then fails with that
+> link's own status code. No replacement is minted and nothing is revived, which
+> is the point: **a pair whose newest link was revoked must stay revoked.**
+>
+> Filtering to "usable" candidates first reads as safer and is the opposite. Two
+> concrete bypasses it creates:
+>
+> - L1 (Jan, `ACTIVE`) and L2 (Apr) which an owner REVOKED after a leak →
+>   filtering picks L1 and returns a **working** URL.
+> - Only L2, revoked → filtering finds nothing usable and **mints a fresh working
+>   link** for a video whose only share link the owner deliberately removed.
+>
+> `currentViews`, `updatedAt` and `lastViewedAt` are never consulted either.
 
 > **"Exact" is proven, not assumed.** A bundle `[A, B]` contains A, so a
 > `some: { videoId }` condition matches it — and adopting a bundle as the
@@ -74,18 +89,55 @@ between deciding and inserting.
 > URL. `findExactSingleVideoCandidates()` therefore fetches the membership rows
 > and requires `length === 1` with that one member being the requested video.
 
-> **Adoption pins identity, not usability.** A revoked, disabled, expired or
-> exhausted historical link is still adopted — the pair gets its one permanent
-> answer — and the request then fails with that link's own status code. No
-> replacement is minted and nothing is revived, which is the point: a pair whose
-> only link was revoked must stay revoked.
+> **The candidate query filters by NOTHING ELSE.** It carries no status filter
+> and no `canonicalVideoShareLink: null` filter, and that absence is load-bearing:
+> a `where` clause that removes a row makes it invisible, and an invisible newest
+> link means an OLDER link silently wins. The anchor relation is SELECTED instead,
+> so an integrity fault can be refused explicitly rather than skipped.
 
-> **Ambiguity is never resolved by guessing.** `createdAt`, status, and alias
-> order are all available and all deliberately unused: nothing in the data says
-> which already-circulated URL a reviewer was given, and silently blessing one
-> would quietly demote the other. The refusal routes the operator to
-> `yarn audit:canonical-share-links` and `yarn remediate:local:adopt-canonical`,
-> where an owner chooses. Once one is adopted, every later request returns it.
+> **Three structural faults refuse the pin outright, writing NOTHING** — no
+> mapping, no replacement link, no fallback to an older candidate:
+>
+> | Blocker | `409` code |
+> |---|---|
+> | newest link has no usable `alias` | `CANONICAL_HISTORICAL_ALIAS_MISSING` |
+> | newest link carries `expiresAt` or `maxViews` | `CANONICAL_HISTORICAL_OPTIONS_PRESENT` |
+> | newest link already anchors a **different** pair | `CANONICAL_HISTORICAL_INTEGRITY_CONFLICT` |
+>
+> `expiresAt` / `maxViews` are legacy **access controls** the canonical contract
+> cannot *represent*. **Neither can be bypassed by pinning**: public resolution
+> enforces both independently and never consults the canonical mapping (§4).
+> What breaks is the canonical contract — `assertReusable()` reads neither, so
+> the **admin** side would keep reporting a "permanent" URL while reviewers were
+> denied, and once the link lapses the pair's identity is dead with no
+> replacement. Minting or falling back WOULD bypass the control; refusing does
+> neither.
+>
+> `alias` is the one genuinely **unremediable** pin: the alias IS the canonical
+> URL's credential, so the mapping would commit and `buildCanonicalReviewUrl()`
+> would then throw on this request and every later one, with no HTTP path to undo
+> it. Refusing keeps the pair fixable — restore the alias and retry.
+
+> **`409 CANONICAL_LINK_AMBIGUOUS` is no longer emitted.** There is exactly one
+> newest link, so no irreducible ambiguity remains. The constant is retained for
+> client compatibility and produced by nothing.
+
+> **An existing mapping always wins and is never repointed.** Once one exists,
+> history is not re-scanned. A newer duplicate created afterwards does not
+> displace it. Moving canonical identity is an explicit, OWNER-driven operation
+> (`adoptExistingShareLink()`), never a side effect of pressing "Get link".
+
+> **Legacy rows are never rewritten.** Automatic resolution chooses which
+> existing row becomes canonical. It never deletes, revokes, renames, re-aliases,
+> re-scopes or re-budgets any of them — they may already be cited in DMCA
+> evidence or bookmarked by a reviewer.
+
+> **Every precondition is read inside the Serializable transaction** — website
+> status, video eligibility, the active domain and the evidence snapshot — so a
+> concurrent disable, unassignment or domain change cannot be committed against.
+> `yarn audit:canonical-share-links` predicts the outcome per pair in advance,
+> including `ADOPT_HISTORICAL_THEN_DENY`, using the **same** policy function the
+> request path uses.
 
 **A canonical request carries no options.** `label`, `expiresAt` and `maxViews`
 are refused with `400 CANONICAL_LINK_OPTIONS_NOT_ALLOWED`, because a canonical

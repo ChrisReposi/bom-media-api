@@ -10,11 +10,18 @@ import {
   MARIADB_COLLATION_PROBE_DISABLED,
 } from "../common/diagnostics/mariadb-collation-probe.constants";
 import {
+  BUNNY_THUMBNAIL_PROXY_AUTH_MODES,
   DEFAULT_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+  DEFAULT_BUNNY_THUMBNAIL_PROXY_MAX_BYTES,
+  DEFAULT_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS,
   DEFAULT_BUNNY_TUS_TTL_SECONDS,
   MAX_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+  MAX_BUNNY_THUMBNAIL_PROXY_MAX_BYTES,
+  MAX_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS,
   MAX_BUNNY_TUS_TTL_SECONDS,
   MIN_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+  MIN_BUNNY_THUMBNAIL_PROXY_MAX_BYTES,
+  MIN_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS,
   MIN_BUNNY_TUS_TTL_SECONDS,
 } from "../bunny/bunny-stream.constants";
 import { isBunnyPullZoneHostname } from "../bunny/bunny-thumbnail.util";
@@ -185,6 +192,29 @@ function readOptionalTrimmedString(
   const trimmed = value.trim();
   process.env[key] = trimmed;
   return trimmed;
+}
+
+/**
+ * Whether a configured upstream `Referer` is safe to send to Bunny's CDN.
+ *
+ * Validated at BOOT as well as at use, so a malformed value fails the deploy
+ * rather than silently disabling every reviewer poster. It must be absolute and
+ * `https:` — a scheme-relative or `http:` value is not a referrer any
+ * Allowed-Referrers list should be configured for — and it must carry no
+ * embedded credentials, which would otherwise be transmitted to a third party
+ * on every poster request.
+ */
+function isValidUpstreamReferer(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return (
+      parsed.protocol === "https:" &&
+      parsed.username === "" &&
+      parsed.password === ""
+    );
+  } catch {
+    return false;
+  }
 }
 
 function isUnsafeLocalStorageRoot(value: string): boolean {
@@ -969,6 +999,74 @@ export function validateEnv(
       DEFAULT_BUNNY_EMBED_TOKEN_TTL_SECONDS,
       MIN_BUNNY_EMBED_TOKEN_TTL_SECONDS,
       MAX_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+    ),
+  );
+
+  // PUBLIC BUNNY THUMBNAIL PROXY. Off by default, so an existing deployment's
+  // public response stays byte-identical until an operator opts in.
+  validated.BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED = readBoolean(
+    config,
+    "BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED",
+    false,
+  );
+
+  const bunnyThumbnailAuthMode =
+    readOptionalTrimmedString(
+      config,
+      "BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE",
+    )?.toLowerCase() ?? BUNNY_THUMBNAIL_PROXY_AUTH_MODES.none;
+  if (
+    bunnyThumbnailAuthMode !== BUNNY_THUMBNAIL_PROXY_AUTH_MODES.none &&
+    bunnyThumbnailAuthMode !== BUNNY_THUMBNAIL_PROXY_AUTH_MODES.referer
+  ) {
+    throw new Error(
+      "BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE must be one of: none, referer",
+    );
+  }
+  validated.BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE = bunnyThumbnailAuthMode;
+
+  const bunnyThumbnailReferer = readOptionalTrimmedString(
+    config,
+    "BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER",
+  );
+  if (
+    validated.BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED === "true" &&
+    bunnyThumbnailAuthMode === BUNNY_THUMBNAIL_PROXY_AUTH_MODES.referer
+  ) {
+    // FAIL FAST rather than at the first reviewer request. A proxy configured
+    // for referer mode with no Referer to send would issue an unauthenticated
+    // request and produce a 403 that reads like a Bunny fault.
+    if (bunnyThumbnailReferer === undefined) {
+      throw new Error(
+        "BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER is required when BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE=referer",
+      );
+    }
+    if (!isValidUpstreamReferer(bunnyThumbnailReferer)) {
+      throw new Error(
+        "BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER must be an absolute https URL with no embedded credentials",
+      );
+    }
+  }
+  if (bunnyThumbnailReferer !== undefined) {
+    validated.BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER = bunnyThumbnailReferer;
+  }
+
+  validated.BUNNY_PUBLIC_THUMBNAIL_MAX_BYTES = String(
+    readBoundedInteger(
+      config,
+      "BUNNY_PUBLIC_THUMBNAIL_MAX_BYTES",
+      DEFAULT_BUNNY_THUMBNAIL_PROXY_MAX_BYTES,
+      MIN_BUNNY_THUMBNAIL_PROXY_MAX_BYTES,
+      MAX_BUNNY_THUMBNAIL_PROXY_MAX_BYTES,
+    ),
+  );
+  validated.BUNNY_PUBLIC_THUMBNAIL_TIMEOUT_MS = String(
+    readBoundedInteger(
+      config,
+      "BUNNY_PUBLIC_THUMBNAIL_TIMEOUT_MS",
+      DEFAULT_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS,
+      MIN_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS,
+      MAX_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS,
     ),
   );
 

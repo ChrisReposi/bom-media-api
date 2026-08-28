@@ -75,19 +75,101 @@ Drift/revoked resolution is an OWNER decision. Rotation (new alias for a pair)
 is intentionally **not implemented**; if ever needed it must be a separate
 step-up-authenticated OWNER endpoint that audits old and new ids.
 
-## Legacy audit and adoption (owner-driven, never automatic)
+## Legacy history is now resolved AUTOMATICALLY (changed 2026-08-28)
+
+> **The operator no longer chooses which historical link becomes canonical for
+> an ordinary duplicate pair, and `409 CANONICAL_LINK_AMBIGUOUS` is no longer
+> emitted.** The previous policy refused the moment two exact single-video links
+> existed for a pair, which made "Get link" unusable for exactly the pairs that
+> most needed it and routed the operator into a **local-only** remediation
+> script that has no production-safe equivalent.
+
+For a pair with **no** mapping, `createOrGetCanonical()` resolves it in one
+deterministic step:
+
+| Exact single-video links | Result |
+|---|---|
+| 0 | A new canonical link is created. **The only case that mints one** |
+| ≥ 1 | The **NEWEST** (`createdAt DESC`, `id DESC`) becomes the identity. Audited `CANONICAL_SHARE_LINK_AUTO_ADOPT` |
+
+> **THE WINNER'S STATUS IS NOT A SELECTION INPUT.** A `REVOKED` / `DISABLED` /
+> `EXPIRED` newest link is still the pair's identity: it is pinned and the
+> request then fails closed with that link's own code. **No older ACTIVE link is
+> promoted, and no fresh link is minted.** Doing either would silently return
+> access an owner deliberately removed — which is the entire reason the selection
+> ignores status.
+
+Three structural faults refuse the pin and write **nothing** — no mapping, no
+replacement link, and no fallback to an older candidate:
+
+| `409` code | Meaning | Operator action |
+|---|---|---|
+| `CANONICAL_HISTORICAL_ALIAS_MISSING` | the newest link has no usable alias | restore the alias on that link, then retry |
+| `CANONICAL_HISTORICAL_OPTIONS_PRESENT` | the newest link carries `expiresAt` or `maxViews` | clear the limit on that link, or resolve the pair deliberately. Do **not** work around it by revoking the link — that only changes which conflict you get |
+| `CANONICAL_HISTORICAL_INTEGRITY_CONFLICT` | the newest link already anchors a different pair | owner review. `shareLinkId` is unique, so this cannot arise by design |
+
+**Nothing about legacy rows is rewritten** — no delete, revoke, rename,
+re-alias, re-scope or re-budget. Automatic resolution only chooses which
+existing row becomes canonical.
+
+**An existing mapping is never repointed.** A newer duplicate appearing later
+does not displace it, whatever its state.
+
+## Audit — see the outcome before it happens
 
 ```bash
-yarn audit:canonical-share-links --counts-only   # summary
-yarn audit:canonical-share-links                 # masked owner worksheet
+yarn audit:canonical-share-links --counts-only   # summary + predicted outcomes
+yarn audit:canonical-share-links                 # masked per-pair worksheet
 ```
 
-The audit is read-only, masks ids/aliases, never selects tokenHash, and in
-production requires `AUDIT_CONFIRM_READ_ONLY=yes` on a read-only connection.
-See `canonical-share-link-adoption-worksheet.md` for the decision procedure.
+The audit is **dry run only — there is deliberately no `--apply`**. The request
+path adopts lazily and correctly on its own, so a bulk writer would add a second
+way to create permanent, `onDelete: Restrict` provenance rows without adding any
+capability. It is read-only, masks ids and aliases, never selects `tokenHash`,
+and in production requires `AUDIT_CONFIRM_READ_ONLY=yes` on a read-only
+connection.
 
-Adoption of one chosen legacy link (local tooling; production adoption is a
-manual operator procedure after backup):
+It reports, per pair:
+
+| `resolution` | Meaning |
+|---|---|
+| `ALREADY_CANONICAL` | pinned; never repointed |
+| `ADOPT_HISTORICAL` | the newest link is pinnable and `ACTIVE` — it will just work |
+| `ADOPT_HISTORICAL_THEN_DENY` | the newest link is pinnable but revoked/disabled/expired. It **will** be pinned and the request **will** then deny. Intended — but review it before an operator meets it live |
+| `BLOCKED_OWNER_REVIEW` | a structural fault blocks the pin; see `pinBlocker`. Nothing is written |
+| `MINT_NEW` | the pair has **no** exact history at all |
+
+plus `winner` (masked), `winnerStatus`, `pinBlocker`, `historical` count, and a
+separate list of pairs holding a duplicate created **after** their canonical
+mapping — not a correctness problem, since an existing mapping always wins, but
+each one is a second circulating URL for a video that should have one.
+
+> **The prediction is binding.** It is computed by the same
+> `selectCanonicalAutoAdoptable()` the request path uses
+> (`src/admin-websites/utils/canonical-adoption-policy.util.ts`), not by a
+> second implementation of the same intent, so the report cannot name a
+> different winner than the code picks.
+
+**No backfill run is required.** Lazy adoption on the normal create/get path is
+correct on its own; the audit exists so an operator can review the estate first.
+
+See `canonical-share-link-adoption-worksheet.md` for the remaining cases that
+still need a human.
+
+### Manual adoption — now only for the cases policy will not decide
+
+Automatic resolution covers ordinary duplicate history. `adoptExistingShareLink()`
+remains for the deliberate cases it deliberately does **not** cover: choosing a
+link the policy would reject (one already cited in DMCA records that has since
+been given an expiry, say), or pinning a specific link ahead of the newest
+eligible one. It is **local operator tooling and has never been an HTTP
+endpoint**; production adoption remains a manual operator procedure performed
+after a backup.
+
+> **It cannot repoint an existing mapping.** `shareLinkId` and
+> `(websiteId, videoId)` are both unique, so adoption fails once a pair is
+> already mapped. Moving canonical identity after the fact is not implemented in
+> either direction — see the rotation note above.
 
 ```bash
 yarn remediate:local:adopt-canonical \

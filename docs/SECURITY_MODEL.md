@@ -172,7 +172,8 @@ null`, so **unlimited links neither carry nor require a grant**.
 | `/public/watch`, `/public/watch/exchange` | Yes (a separate metadata cache exists, but it is policy-revalidated on every hit) |
 | `.../videos/:id/binary` (`DB_BLOB`) | **Yes, every request.** `getAuthorizedPublicDatabaseBinaryAsset` does not consult the cache |
 | `.../videos/:id/local-file` (`LOCAL_FILE`) | **Not always** — see §4.2 |
-| `.../videos/:id/thumbnail` (local thumbnail) | **Not always** — same code path as `local-file` |
+| `.../videos/:id/thumbnail` (`LOCAL_FILE` thumbnail) | **Not always** — same code path as `local-file` (§4.2) |
+| `.../videos/:id/thumbnail` (Bunny poster) | **Yes, every request** — uncached, plus an authoritative re-read of the `VideoAsset` row (§4.1.2) |
 | `.../videos/:id/view` | Yes, every request |
 
 > **SECURITY INVARIANT: Removing a `WebsiteVideo` assignment immediately denies
@@ -224,6 +225,7 @@ diagnose the real cause from `AccessLog` — see
 | **Provider / direct** | `UPLOAD` (Cloudinary) | Cloudinary `secure_url`, verbatim | **No** | **No** | Same |
 | **Provider / direct** | `EMBED` | `embedUrl`, verbatim | **No** | **No** | Same |
 | **Provider / signed** | `EMBED` **(Bunny-backed)** | a freshly signed `iframe.mediadelivery.net` URL | **No** | Bunny embed token | Revocation stops future watch resolution; an already-issued URL dies at its own expiry (default 5 min) |
+| **Backend-served** | `EMBED` **(Bunny-backed), poster** | `/public/watch/.../thumbnail` | **Yes**, when the proxy is enabled | Yes, when `maxViews` is set | Revoking the link stops the next poster request |
 
 `toSafePublicMediaUrl()` returns the stored URL unchanged (it only nulls out
 URLs whose path contains an `admin` segment). No token, no grant and no expiry
@@ -343,11 +345,130 @@ but not instant revocation.
 > public site allowlist and CSP `frame-src` were widened in the same change, so
 > the only Bunny URL the public site can ever render is one this backend signed.
 
+### 4.1.2 Bunny poster delivery through the backend proxy
+
+> **SECURITY INVARIANT: the reviewer's browser never fetches a Bunny pull-zone
+> URL directly while `BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED=true`.** The poster
+> is served by this API, behind the full §4 chain.
+
+The public watch response used to hand out the raw
+`https://vz-….b-cdn.net/{guid}/{file}` poster URL. Two correct decisions then
+collided in production: a public site sending `Referrer-Policy: no-referrer`
+gave the browser no `Referer`, and the pull zone's hotlink protection (Bunny's
+Allowed Referrers) answered **403**. Every reviewer poster rendered broken.
+
+```
+reviewer browser
+   │  GET /public/watch/<token>/videos/<id>/thumbnail?host=…[&grant=…]
+   ▼
+bom-media-api        full §4 authorization chain, then three provider gates
+   │  GET https://<pull-zone>/<bunnyVideoId>/<fileName>   (one request)
+   ▼                 under an EXPLICITLY CONFIGURED upstream auth mode
+Bunny pull zone
+```
+
+**Three independent gates, all of which must pass**, before one byte is fetched:
+
+1. **Authoritative Bunny identity.** `classifyBunnyVideoAsset()` — the same
+   strict predicate playback signing uses, not a weaker copy — plus the absence
+   of `metadataJson.bunnyStream.remoteMissing`. A `bunny-malformed` record fails
+   closed and never falls through to its stored URL. Read from the **current**
+   database row, not from the metadata cache, for exactly the reason
+   `loadSignableBunnyVideoIds()` exists: this process's cache cannot be
+   invalidated by reconciliation running anywhere else.
+2. **URL validation and reconstruction** — see §9.1.
+3. **Upstream response validation**: no redirect is followed, the status must be
+   `2xx`, the `Content-Type` must be an allowed raster image type, and the body
+   is capped in bytes.
+
+> **SECURITY INVARIANT: the backend's own upstream request is authorized by a
+> CONFIGURED mode, never by inference.** `BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE`
+> selects `none` (send nothing extra) or `referer` (send the configured
+> `BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER`). A proxy that merely moved the
+> browser's 403 to the API server would not be a fix. In `referer` mode the
+> value comes from validated configuration and **never** from the incoming
+> request — echoing a client-supplied `Referer` would let a caller choose what
+> the CDN sees. A `referer` mode with no usable value **fails closed** rather
+> than silently downgrading to `none`.
+
+> **CDN Token Authentication is NOT implemented**, and
+> `BUNNY_STREAM_TOKEN_SECURITY_KEY` must never be used for it. That key signs
+> Stream **embed view tokens**; a pull zone's CDN token security is a separate
+> mechanism with a separate key. Signing a CDN URL with the embed key would
+> produce signatures the CDN rejects while looking, in code, exactly like
+> working security. See
+> [features/bunny-stream.md](./features/bunny-stream.md) §4.6 and §11.
+
+**Views are never incremented** by a poster request, on GET or HEAD. `maxViews`
+is enforced through the same signed `grant` as the other media routes; the view
+itself was claimed once, atomically, during watch resolution.
+
+**Every failure is the identical generic `404 "Video not found."`** — an
+upstream 403, an upstream 404, an oversized body, a rejected content type and a
+network timeout are indistinguishable to a client. The real reason is logged
+internally, without a URL, a header value or a secret.
+
+**Reviewer privacy improves; revocation reach improves.** Bunny no longer sees
+the reviewer's IP address for the poster, and revoking the share link stops the
+next poster request. The Bunny **player** iframe is unchanged and still loads
+directly from Bunny once the reviewer starts playback, so its own exposure
+(§4.1.1) is unaffected.
+
+While the proxy is **disabled** — the default — the stored pull-zone URL is
+returned exactly as before, and that URL is in the provider/direct category of
+§4.1 with all of its limitations.
+
 ### 4.2 `LOCAL_FILE` media authorization cache
 
-`getAuthorizedPublicLocalVideo()` — the shared code path behind both the
-`local-file` and `thumbnail` routes — consults the process-local memory cache
-**before** any database query and **before** `hasValidMediaGrant()`:
+`getAuthorizedPublicLocalVideo()` — the `LOCAL_FILE` narrowing behind both the
+`local-file` route and the `LOCAL_FILE` branch of the `thumbnail` route —
+consults the process-local memory cache **before** any database query and
+**before** `hasValidMediaGrant()`:
+
+> **The Bunny thumbnail branch does NOT use this cache** (2026-08-28). It runs
+> the same shared authorization chain uncached and then re-reads the current
+> `VideoAsset` row, so the window described below does not apply to it. See
+> §4.1.2.
+
+> **CLASSIFICATION: INTENTIONAL BOUNDED EXPOSURE, re-affirmed 2026-08-28. NOT a
+> defect requiring change in this pass.**
+>
+> Stated plainly so nothing elsewhere in this document is read as claiming more
+> than the code does: **public media authorization is NOT authoritative on every
+> request.** The `LOCAL_FILE` fast path deliberately trusts a process-local cache
+> and, on a hit, issues **zero database queries** and does **not** call
+> `hasValidMediaGrant()`.
+>
+> It is classified as bounded rather than defective because every one of these
+> holds, and each is enforced by `canCachePublicWatchShareLink()` rather than by
+> convention:
+>
+> - a view-limited link (`maxViews !== null`) is **never** cached, so a cache hit
+>   can never skip a grant check that would otherwise have mattered — the links
+>   that are cached are exactly the links that neither carry nor require a grant;
+> - `DB_BLOB` is never cached, and re-runs the full chain per request;
+> - an entry can never outlive the share link's own `expiresAt`;
+> - the TTL is bounded 1–3600 s, default 300 s;
+> - same-process admin mutations *do* invalidate it (COMPAT-044 drives the real
+>   `revokeShareLink()`, `updateVideoAssignments()`, `assignSingleVideo()` and
+>   `disableVideo()` against a shared cache instance).
+>
+> What remains exposed, precisely: for an **unlimited `LOCAL_FILE`** link,
+> revocation or un-assignment performed **out of band** — direct SQL, or a
+> mutation handled by a different Node process (KI-010) — may not take effect on
+> the `local-file` and `LOCAL_FILE`-thumbnail routes for up to the TTL. It is
+> recorded as [KI-020](./KNOWN_ISSUES.md#ki-020), pinned as *current behaviour*
+> by COMPAT-040, and eliminated entirely by `MEMORY_CACHE_ENABLED=false`.
+>
+> **Why this pass did not change it.** Making it authoritative per request is a
+> deliberate performance/latency decision on a `publicMedia` route throttled at
+> 1200 req/min, not a drive-by. The generalised thumbnail route was written to
+> *preserve* the property exactly — `getPublicThumbnail()` checks the cache
+> before the provider-independent chain, and
+> `test/public-local-thumbnail.test.ts` asserts a warm request adds **zero**
+> queries — specifically so that this decision stays where it belongs, with the
+> owner of KI-020, instead of being silently reversed as a side effect of a Bunny
+> change.
 
 ```
 cache key = media:metadata:public:local-video | host | hash(token) | videoId
@@ -503,6 +624,50 @@ duration/format. It:
 - can be disabled entirely with `VIDEO_METADATA_PROBE_ENABLED=false`.
 
 Embed URLs are separately restricted to `VIDEO_EMBED_ALLOWED_HOSTS`.
+
+### 9.1 The Bunny poster proxy is not a general fetcher
+
+`src/bunny/bunny-cdn-thumbnail.util.ts` is the second outbound-URL boundary in
+this codebase, and it is deliberately much narrower than §9's probe.
+
+The value it starts from is a **database column** (`VideoAsset.thumbnailUrl`).
+"The value we wrote" and "the value in the row right now" are different claims:
+an operator, a migration, a restored backup or a direct SQL edit can put
+anything there. `fetch(row.thumbnailUrl)` with no check is the textbook SSRF
+primitive — internal hosts, cloud metadata endpoints, `file:`, redirect chains —
+reachable by anyone holding a share link.
+
+So the stored string is never the thing that gets fetched. It is parsed, every
+component is checked against the Bunny identity the caller already **proved**
+from the current row, and the upstream URL is then **rebuilt** from those proven
+components:
+
+| Check | What it stops |
+|---|---|
+| absolute and `https:` | `http:`, `file:`, `data:`, relative values |
+| no username or password | credential leakage to a third party; host confusion |
+| no explicit port | reaching an unexpected service on a passing hostname |
+| hostname **equals** `BUNNY_STREAM_PULL_ZONE_HOSTNAME` exactly | `…b-cdn.net.attacker.example`, `evil-vz-x.b-cdn.net`, any other CDN |
+| no query, no fragment | a caller-controlled parameter reaching the CDN |
+| exactly two path segments | nested paths, traversal shapes |
+| segment 1 **equals the authoritative Bunny video id** | a row pointing at a *different* video's poster on the same pull zone |
+| segment 2 passes `isSafeBunnyFileName()` | `..`, separators, schemes, whitespace |
+
+Redirects are **never followed** (`redirect: "manual"`); a `3xx` is refused
+outright, because it is the one way a URL that passed every hostname check still
+ends up fetching another origin.
+
+The response is bounded as well: a short timeout with an `AbortSignal`, a
+`Content-Type` restricted to raster image types (**`image/svg+xml` is
+excluded** — an SVG is a document that can carry script, and it would be served
+from this API's own origin), and a byte cap enforced on the transferred stream
+rather than only on `Content-Length`, so a missing or dishonest header cannot
+become an unbounded transfer. Rejected responses have their body drained rather
+than left to hold a socket.
+
+> **No per-view Bunny Management API call was added.** Public watch stays free
+> of provider latency; the file name is recovered from the stored URL under the
+> validation above.
 
 ## 10. Filesystem safety (`LOCAL_FILE`)
 

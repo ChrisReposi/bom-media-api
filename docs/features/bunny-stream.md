@@ -170,6 +170,60 @@ url   = https://iframe.mediadelivery.net/embed/{libraryId}/{videoId}
         ?token=<token>&expires=<expirationUnixSeconds>
 ```
 
+### 4.2.1 What the embed token is, and what is NOT verified about it
+
+Recorded because an incorrect inference here would be a security change made on
+no evidence.
+
+**Proven from source, in this repository:**
+
+| Fact | Where |
+|---|---|
+| The token is `SHA256_HEX(BUNNY_STREAM_TOKEN_SECURITY_KEY + videoId + expires)`, hex-encoded | `createSignedEmbedUrl()` |
+| The key is read only through `ConfigService`, is never returned, logged or placed in an exception | `BunnyStreamService` |
+| The TTL is `BUNNY_STREAM_EMBED_TOKEN_TTL_SECONDS`, default **300 s**, bounded 60–3600, out of range fails at boot | `bunny-stream.constants.ts`, `env.validation.ts` |
+| Player parameters are appended **after** the credential pair and are not part of the hash | `createSignedEmbedUrl()` |
+| The stored `embedUrl` is the **unsigned** base URL and is never returned to a public client | §1, §6 |
+| The URL is minted per request and never persisted | §5.1, §6 |
+
+**What the repository ASSUMES about the Bunny dashboard:** that the library has
+**Embed View Token Authentication enabled**. §5.1 records the symptom that led to
+that belief — the unsigned stored URL rendered a Bunny **403** in the admin
+iframe, which is why the admin preview endpoint exists at all.
+
+> **DASHBOARD VERIFICATION REQUIRED.** Nothing in this repository can confirm the
+> library's current setting, and it has **not** been verified as part of this
+> change.
+
+**An observation that must NOT be turned into a conclusion.** It has been
+reported that a request with no token, an expired token and a junk token all
+return the same iframe **HTML** with HTTP 200. That does **not** establish that
+token authentication is off:
+
+- The iframe document is the player shell. Bunny may enforce the token on the
+  **subsequent** playlist / media / license requests the player then makes, not
+  on the shell itself.
+- A 200 on the shell is consistent with both configurations, so it discriminates
+  nothing.
+
+To settle it, inspect the network trace **after** the iframe loads — the
+`.m3u8` playlist and the segment requests — for a signed and an unsigned URL,
+and read the library's Embed View Token Authentication setting in the dashboard.
+Until both are done, treat the enforcement point as unknown.
+
+**The 300-second TTL was reviewed and deliberately left unchanged.** Raising it
+would only be justified once the enforcement point above is known: if Bunny
+validates `expires` on the iframe request alone, a short TTL bounds nothing after
+the player has loaded and a longer one would weaken §6.1 for no benefit; if it is
+validated on later media requests, a short TTL is doing real work and raising it
+would directly extend post-revocation exposure. Changing it on the current
+evidence would be guessing in the less safe direction.
+
+> **Nothing in this change modified signing.** No formula, key, TTL or ordering
+> was touched. The poster proxy in §4.6 is a different mechanism against a
+> different Bunny product (the pull zone, not the Stream library) and shares no
+> key with it.
+
 ### 4.3 Status mapping
 
 Bunny status codes, verified against
@@ -327,8 +381,257 @@ Rules the implementation follows:
   status sync already makes; no extra endpoint (such as `/videos/{id}/play`) is
   consulted.
 
-Because the public watch response already returns the stored `thumbnailUrl`, the
-reviewer-facing poster works with **no public-site change at all**.
+The public watch response returns a poster URL for every Bunny video. **Which**
+URL it returns changed on 2026-08-28 — see §4.6, which supersedes the claim that
+this works with no public-site change.
+
+### 4.6 Reviewer-facing poster delivery: the backend proxy
+
+> **CORRECTION (2026-08-28).** §4.4 previously ended "Because the public watch
+> response already returns the stored `thumbnailUrl`, the reviewer-facing poster
+> works with **no public-site change at all**." That was true of the *field*, and
+> false of the *outcome*. In production every reviewer poster returned **403**.
+
+#### The production failure
+
+Two correct decisions met:
+
+- The pull zone protects its assets with **hotlink protection**: it serves a
+  request only when the `Referer` names an allowed site.
+- The reviewer-facing site sends `Referrer-Policy: no-referrer` on every
+  response — a deliberate, documented privacy property.
+
+So the browser sent no `Referer`, Bunny saw an empty referrer, and refused.
+
+> **MEASURED, not inferred**, against the live zone by `Worldfold_Studio`
+> (`verify-poster-referrer.mjs`), same URL, nothing else changed:
+>
+> | Request | Result |
+> |---|---|
+> | no `Referer` | **403** |
+> | `Referer: <the site's origin>` | **200** |
+> | **UNSIGNED** URL with a valid `Referer` | **200** |
+>
+> The third row is the load-bearing one: it rules out CDN Token Authentication
+> on that zone. A zone requiring a token could not serve an unsigned URL. Signing
+> thumbnails server-side would therefore have fixed nothing.
+>
+> These measurements were taken in the sibling repository and are recorded here
+> as evidence, not re-verified from this workspace. See §11 for what still
+> requires dashboard verification.
+
+#### The architecture
+
+```
+reviewer browser
+   │  GET /public/watch/<token>/videos/<id>/thumbnail?host=…[&grant=…]
+   ▼
+bom-media-api
+   │  full public authorization chain, then three provider gates
+   │  GET https://<pull-zone>/<bunnyVideoId>/<fileName>
+   ▼  under an EXPLICITLY CONFIGURED upstream auth mode
+Bunny pull zone
+```
+
+The reviewer's browser no longer requests a Bunny URL at all for the poster.
+That is the fix at the architecture level rather than at either endpoint:
+poster delivery stops depending on browser referrer policy, Bunny stops
+receiving the reviewer's IP address for the poster, the raw pull-zone URL stops
+being the public contract, and revoking the share link stops the next poster
+request.
+
+> **The route did not change.** It is still
+> `GET|HEAD /public/watch/:token/videos/:videoId/thumbnail?host=…[&grant=…]`,
+> which already existed for `LOCAL_FILE`. A second route would have meant a
+> second copy of the authorization chain, and two copies drift.
+> `PublicService.loadAuthorizedPublicMediaVideo()` is now the one
+> provider-independent chain; `LOCAL_FILE` and Bunny are narrowings of it, each
+> with its own provider-specific gate. `LOCAL_FILE` behaviour is byte-identical.
+
+#### The upstream authorization mode — the point of the whole thing
+
+> **A proxy that simply moves the same 403 from the browser to the API server is
+> NOT a fix.** Whatever the pull zone enforces, the backend's own request must
+> satisfy it — so the mode is configuration, never a guess.
+
+| `BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE` | Behaviour |
+|---|---|
+| `none` (default) | Send nothing extra. Correct when the zone is open, or is restricted by something the backend already satisfies (an IP allowlist, for instance) |
+| `referer` | Send `BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER` on this one request. For a zone using Bunny's **Allowed Referrers** |
+
+`referer` mode is an operational **compatibility** mechanism, and this document
+does not dress it up as more. Hotlink protection is not strong authorization: a
+`Referer` header is trivially forgeable by anything that is not a browser. What
+it does is make the backend's request indistinguishable, to the zone, from the
+browser request that worked before — which is exactly the problem being solved.
+
+The value comes from validated configuration and **never** from the incoming
+request. Echoing a client-supplied `Referer` would let a caller choose what the
+CDN sees, which is not a mechanism. A `referer` mode with no usable value
+**fails closed**: no request is made and the poster returns the generic 404,
+rather than silently downgrading to `none` and producing a 403 that reads like a
+Bunny fault. Boot fails too, so the mistake surfaces at deploy time.
+
+> **CDN Token Authentication is still NOT implemented** (§11), and
+> `BUNNY_STREAM_TOKEN_SECURITY_KEY` **must never be used for it**. That key
+> signs Stream **embed view tokens**. A pull zone's CDN token security is a
+> separate mechanism with a separate key, and reusing the embed key would
+> produce signatures the CDN rejects while looking, in code, exactly like
+> working security. Adding it later means a new mode, a new environment
+> variable, and dashboard verification that the zone actually enforces it.
+
+#### The three gates
+
+1. **Authoritative Bunny identity.** `classifyBunnyVideoAsset()` — the same
+   strict predicate playback signing uses — plus the absence of
+   `metadataJson.bunnyStream.remoteMissing`. A `bunny-malformed` record fails
+   closed and never falls through to its stored URL. Read from the **current**
+   database row rather than the metadata cache, for the same reason
+   `loadSignableBunnyVideoIds()` exists (§9.3): a process-local cache cannot be
+   invalidated by reconciliation running elsewhere.
+2. **URL validation and reconstruction.** The stored `thumbnailUrl` is parsed,
+   every component is checked against the proven identity, and the upstream URL
+   is rebuilt from it. Full table in
+   [../SECURITY_MODEL.md §9.1](../SECURITY_MODEL.md#91-the-bunny-poster-proxy-is-not-a-general-fetcher).
+3. **Upstream response validation.** No redirect is followed, the status must be
+   `2xx`, the `Content-Type` must be an allowed raster image type (**never
+   `image/svg+xml`**), and the body is capped in bytes rather than only by
+   `Content-Length`.
+
+#### What it does not do
+
+- **Views are never incremented**, on GET or HEAD. `maxViews` is enforced by the
+  existing signed `grant`.
+- **No Bunny Management API request** is added anywhere. `thumbnailFileName` is
+  not separately persisted, and recovering it with a per-view `getVideo()` would
+  trade an SSRF question for a latency and rate-limit problem. It is recovered
+  from the stored URL under validation instead.
+- **No image buffer is cached.** The response is streamed, and nothing is
+  written to `MemoryCacheService`.
+- **The Bunny player iframe is unchanged.** It still loads directly from Bunny
+  once the reviewer starts playback, so §6.1 is unaffected. Only the poster
+  moved.
+- **An operator-set poster on another host is passed through unchanged.** Sync
+  only ever fills an *empty* `thumbnailUrl` and never overwrites one, so such a
+  value was a deliberate choice and is not the proxy's business.
+
+#### GET and HEAD, exactly
+
+| Concern | Behaviour |
+|---|---|
+| Upstream verb | **Always GET**, never an upstream HEAD. Bunny CDN's HEAD behaviour is not verified from this workspace, and a HEAD some edge answers differently would make the two verbs disagree. One request shape, always |
+| Client `HEAD` | The stream is **pull-based**, so a HEAD — which destroys it without reading — transfers essentially no body, and the upstream socket is released on `close` |
+| `Content-Type` | Normalised to the **validated** media type: lower-cased, parameters stripped. Never relayed verbatim |
+| `Content-Length` | Emitted only when upstream sent one, and identical on GET and HEAD (HEAD reports what a GET would return). Absent upstream ⇒ header omitted, never guessed |
+| `Cache-Control` | `setNoStoreHeaders()` runs first: the full `no-store` family plus `X-Content-Type-Options: nosniff` and `Cross-Origin-Resource-Policy: cross-origin`. No upstream caching header is forwarded |
+| Size cap | Enforced on the **transferred bytes**, not only `Content-Length`, so an omitted or dishonest header cannot become an unbounded transfer |
+| Timeout / abort | `AbortSignal.timeout()`, bounded 1000–15000 ms |
+| Redirects | `redirect: "manual"`; any `3xx` is refused outright and its body drained |
+| Rejected responses | Body explicitly `cancel()`ed, so a refusal never leaks a socket |
+
+> **Two stream-lifecycle defects were found and fixed in final review**, both in
+> code added by this change:
+>
+> - An upstream failure arriving **before** the controller attached `pipeline()`
+>   emitted `'error'` on a `Readable` with no listener, which terminates the
+>   Node process — on an unauthenticated public route. The proxy now claims
+>   `'error'` on the upstream stream immediately; the consumer still receives it,
+>   because Node's async iterator rejects on `stream.errored` rather than on the
+>   listener list.
+> - A client `HEAD` destroys the stream without reading, so the generator never
+>   started and nothing destroyed the upstream — the connection stayed open until
+>   the CDN or the fetch timeout gave up. The socket is now released on `close`,
+>   which covers a normal end and a destroy alike.
+>
+> Both are pinned by `test/public-bunny-thumbnail.test.ts` and each was confirmed
+> to fail when its fix is removed.
+
+#### Client URL-resolution compatibility — VERIFIED, not assumed
+
+The route is returned as a **relative** `/api/v1/public/watch/.../thumbnail?host=…`
+URL. Both shipped clients strip the version prefix and re-base onto the API
+origin; neither treats it as a same-origin website path. Read from source on
+2026-08-28:
+
+| Client | Function | Transform |
+|---|---|---|
+| `Worldfold_Studio/private-watch.js` | `resolveMediaUrl()` | `raw.replace(/^\/_api(?=\/|$)/,"").replace(/^\/api\/v1(?=\/|$)/,"")` then `` `${resolveApiBase()}${path}` `` |
+| `public_website/assets/app.js` | `buildApiResourceUrl()` | `/^\/api\/v1\/public(?:\/|$)/` → `buildApiUrl(stripApiVersionPrefix(raw))` |
+
+`resolveApiBase()` / `API_CONFIG.baseUrl` are `/_api` in production (the
+documented proxy path, KI-001) and `http://localhost:3000/api/v1` on a local
+Worldfold host. Executed against the real transform:
+
+```
+/api/v1/public/watch/TOK/videos/VID/thumbnail?host=example.com&grant=g
+  → production : /_api/public/watch/TOK/videos/VID/thumbnail?host=example.com&grant=g
+  → local dev  : http://localhost:3000/api/v1/public/watch/TOK/videos/VID/thumbnail?host=example.com&grant=g
+```
+
+The **query string survives** in both, which matters: `host` is required by the
+route and `grant` carries the `maxViews` authorization.
+
+Which field each client reads:
+
+| Client | Thumbnail fields, in order | Playback fields |
+|---|---|---|
+| Worldfold | `publicThumbnailUrl`, `thumbnailUrl` (`LEGACY_THUMBNAIL_FIELDS`) | `publicPlaybackUrl`, `binaryPlaybackUrl`, `playbackUrl` |
+| `public_website` | `localThumbnailUrl`, `publicLocalThumbnailUrl`, `thumbnailProxyUrl`, `publicThumbnailUrl`, … `thumbnailUrl` | `publicPlaybackUrl`, … |
+
+Populating **both** `thumbnailUrl` and `publicThumbnailUrl` is therefore what
+makes an already-deployed bundle of either client pick the protected URL up with
+no change of its own.
+
+> **Two client-side filters the emitted URL must satisfy, and does.** Worldfold's
+> `apiOwnedThumbnail()` DROPS an absolute off-origin URL — so the value must stay
+> relative, which is why the backend does not emit an absolute one. And
+> `public_website`'s `isForbiddenMediaUrl()` rejects any path containing an
+> `admin` segment; this route contains none.
+>
+> **No client change is required, and none was made.** The backend half of this
+> contract is pinned by `test/public-bunny-thumbnail.test.ts` → "emits a relative
+> /api/v1/public URL both shipped clients re-base"; the client halves live in
+> repositories this one must not edit.
+
+#### Verifying the upstream leg before enabling it
+
+Unit tests mock `globalThis.fetch`, deliberately, so **no CI test ever reaches
+Bunny**. That leaves one question they cannot answer: does the pull zone serve a
+poster to THIS server, with THIS deployment's configuration? A proxy that merely
+moves the browser's 403 onto the API host is not a fix, so prove it first:
+
+```bash
+yarn diagnose:bunny-thumbnail --config-only
+```
+
+```bash
+yarn diagnose:bunny-thumbnail --bunny-video-id <guid> --file-name <thumbnail_xxxx.jpg>
+```
+
+Read-only: one outbound GET, to a URL built by the **same validator** the
+production path uses. No database, no share link, no credential minted, nothing
+written. It never reads — let alone prints — `BUNNY_STREAM_API_KEY` or
+`BUNNY_STREAM_TOKEN_SECURITY_KEY`, and it prints only the *origin* of the
+configured Referer. It reports the status, `Content-Type` and `Content-Length`,
+and a PASS/FAIL verdict; a 401/403 tells the operator to switch to `referer`
+mode rather than to enable the proxy and hope.
+
+The video id and file name come from an admin video detail page:
+`providerAssetId`, and the last path segment of `thumbnailUrl`.
+
+#### Configuration and rollout
+
+| Variable | Default | Notes |
+|---|---|---|
+| `BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED` | `false` | Master switch. While false the public response is byte-identical to before this feature existed |
+| `BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE` | `none` | `none` or `referer`. Any other value fails at boot |
+| `BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER` | unset | **Required** when the proxy is enabled in `referer` mode. Absolute `https` URL, no embedded credentials. Not a secret |
+| `BUNNY_PUBLIC_THUMBNAIL_MAX_BYTES` | `5242880` | Bounded 65536 – 20971520; out of range fails at boot |
+| `BUNNY_PUBLIC_THUMBNAIL_TIMEOUT_MS` | `5000` | Bounded 1000 – 15000; out of range fails at boot |
+
+Enabling it is a deliberate two-part decision — turn the proxy on **and** pick
+the mode that matches the zone. Turning it on with the wrong mode produces the
+generic 404 rather than a broken image, and the reason is in the API log.
 
 ## 5. Endpoints
 
@@ -979,7 +1282,14 @@ Not implemented, and not partially implemented:
 - Bunny **webhooks**. Status is polled, not pushed. Bunny publishes no
   video-deleted event either (§9.4), so deletion reconciliation is pull-based by
   necessity, not by preference.
-- **CDN token authentication** on the pull zone.
+- **CDN token authentication** on the pull zone. Still not implemented, and
+  deliberately so: the measured evidence in §4.6 shows the zone in question does
+  not enforce it (an unsigned URL with a valid `Referer` returns 200), and no
+  CDN token security key is part of this deployment's environment contract.
+  `BUNNY_STREAM_TOKEN_SECURITY_KEY` is **not** that key and must never be reused
+  as one. Enabling token authentication later requires a Bunny dashboard change,
+  a new environment variable, a new `BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE`
+  value, and verification that the zone actually enforces it.
 - MediaCage **DRM**.
 - A custom **HLS player**. Playback is the Bunny iframe.
 - **Automatic migration** of existing videos to Bunny.

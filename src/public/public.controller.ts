@@ -260,17 +260,17 @@ export class PublicController {
   @Get("watch/:token/videos/:videoId/thumbnail")
   @ThrottleProfile(THROTTLE_PROFILES.publicMedia)
   @ApiOperation({
-    summary: "Stream token-protected public LOCAL_FILE thumbnail.",
+    summary: "Stream the token-protected public thumbnail for a video.",
     description:
-      "Validates the public share token, host/domain, share-link status, video membership, READY status, and local thumbnail asset before streaming.",
+      "Validates the public share token, host/domain, share-link status, video membership, ACTIVE assignment and READY status before streaming. Serves a LOCAL_FILE thumbnail from local storage, and a Bunny Stream poster by proxying the library pull zone under a configured upstream authorization mode. Never increments views. Every failure is the same generic 404.",
   })
   @ApiOkResponse({
-    description: "Local thumbnail image response.",
+    description: "Thumbnail image response.",
   })
   @ApiBadRequestResponse({
-    description: "Invalid or unauthorized public local thumbnail request.",
+    description: "Invalid or unauthorized public thumbnail request.",
   })
-  async streamPublicLocalThumbnail(
+  async streamPublicThumbnail(
     @Param("token") token: string,
     @Param("videoId") videoId: string,
     @Query("host") host: string,
@@ -280,7 +280,7 @@ export class PublicController {
   ): Promise<void> {
     setNoStoreHeaders(response);
 
-    const result = await this.publicService.getPublicLocalThumbnail({
+    const result = await this.publicService.getPublicThumbnail({
       host,
       token,
       videoId,
@@ -289,7 +289,12 @@ export class PublicController {
 
     response.status(HttpStatus.OK);
     response.setHeader("Content-Type", result.mimeType);
-    response.setHeader("Content-Length", String(result.contentLength));
+    // A proxied poster may arrive with no upstream `Content-Length`. Omitting
+    // the header is correct there; emitting a guess would be a lie the client
+    // acts on. A local asset always has one, so its response is unchanged.
+    if (result.contentLength !== null) {
+      response.setHeader("Content-Length", String(result.contentLength));
+    }
     await pipeStreamToResponse(
       result.stream,
       response,

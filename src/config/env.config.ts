@@ -1,10 +1,17 @@
 import { registerAs } from "@nestjs/config";
 import {
+  BUNNY_THUMBNAIL_PROXY_AUTH_MODES,
   DEFAULT_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+  DEFAULT_BUNNY_THUMBNAIL_PROXY_MAX_BYTES,
+  DEFAULT_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS,
   DEFAULT_BUNNY_TUS_TTL_SECONDS,
   MAX_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+  MAX_BUNNY_THUMBNAIL_PROXY_MAX_BYTES,
+  MAX_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS,
   MAX_BUNNY_TUS_TTL_SECONDS,
   MIN_BUNNY_EMBED_TOKEN_TTL_SECONDS,
+  MIN_BUNNY_THUMBNAIL_PROXY_MAX_BYTES,
+  MIN_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS,
   MIN_BUNNY_TUS_TTL_SECONDS,
 } from "../bunny/bunny-stream.constants";
 import {
@@ -98,6 +105,20 @@ export interface ApiEnvironmentConfig {
     pullZoneHostname: string | null;
     tusTtlSeconds: number;
     embedTokenTtlSeconds: number;
+    /**
+     * Reviewer-facing poster delivery through this API rather than straight
+     * from the pull zone. Off by default; see
+     * `src/bunny/bunny-thumbnail-proxy.service.ts` for why it exists and what
+     * `upstreamAuthMode` selects. All non-secret: the mode is a policy name and
+     * the referer is a public site URL.
+     */
+    publicThumbnailProxy: {
+      enabled: boolean;
+      upstreamAuthMode: string;
+      upstreamReferer: string | null;
+      maxBytes: number;
+      timeoutMs: number;
+    };
   };
   release: {
     version: string | null;
@@ -418,6 +439,31 @@ export const apiConfig = registerAs("api", (): ApiEnvironmentConfig => {
         MIN_BUNNY_EMBED_TOKEN_TTL_SECONDS,
         MAX_BUNNY_EMBED_TOKEN_TTL_SECONDS,
       ),
+      publicThumbnailProxy: {
+        enabled: parseBoolean(
+          process.env.BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED,
+          false,
+        ),
+        upstreamAuthMode:
+          readOptionalTrimmedEnv(
+            process.env.BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE,
+          )?.toLowerCase() ?? BUNNY_THUMBNAIL_PROXY_AUTH_MODES.none,
+        upstreamReferer: readOptionalTrimmedEnv(
+          process.env.BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER,
+        ),
+        maxBytes: parseBoundedInteger(
+          process.env.BUNNY_PUBLIC_THUMBNAIL_MAX_BYTES,
+          DEFAULT_BUNNY_THUMBNAIL_PROXY_MAX_BYTES,
+          MIN_BUNNY_THUMBNAIL_PROXY_MAX_BYTES,
+          MAX_BUNNY_THUMBNAIL_PROXY_MAX_BYTES,
+        ),
+        timeoutMs: parseBoundedInteger(
+          process.env.BUNNY_PUBLIC_THUMBNAIL_TIMEOUT_MS,
+          DEFAULT_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS,
+          MIN_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS,
+          MAX_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS,
+        ),
+      },
     },
     release: {
       version: readOptionalTrimmedEnv(process.env.APP_RELEASE_VERSION),

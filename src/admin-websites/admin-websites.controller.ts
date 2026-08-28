@@ -533,7 +533,7 @@ export class AdminWebsitesController {
   @ApiOperation({
     summary: "Create share link",
     description:
-      "Multi-video: creates a new bundle link and returns rawToken and publicUrl once. tokenHash is never returned. EXACTLY ONE video: idempotently resolves the canonical link for that website+video pair — the same id, alias and publicUrl every time, `outcome: REUSED` when nothing was written, and no rawToken. A canonical request must not carry label, expiresAt or maxViews.",
+      "Multi-video: creates a new bundle link and returns rawToken and publicUrl once. tokenHash is never returned. EXACTLY ONE video: idempotently resolves the canonical link for that website+video pair — the same id, alias and publicUrl every time, `outcome: REUSED` when nothing was written, and no rawToken. An existing canonical mapping always wins; otherwise the newest ELIGIBLE historical single-video link is adopted, and a fresh canonical link is minted only when none is eligible. Legacy links are never deleted, revoked or rewritten. A canonical request must not carry label, expiresAt or maxViews.",
   })
   @ApiCreatedResponse({ type: CreateShareLinkResponse })
   @ApiBadRequestResponse({
@@ -542,7 +542,7 @@ export class AdminWebsitesController {
   })
   @ApiConflictResponse({
     description:
-      "Single-video only, and never accompanied by a replacement link. CANONICAL_LINK_REVOKED, CANONICAL_LINK_INACTIVE, CANONICAL_DOMAIN_UNAVAILABLE, CANONICAL_EVIDENCE_DRIFT, CANONICAL_EVIDENCE_INCOMPLETE and CANONICAL_VIDEO_NOT_SHAREABLE mean the pair's canonical link exists but is not currently usable. CANONICAL_LINK_AMBIGUOUS (with candidateCount) means several historical links already contain exactly this video on this website and no mapping records which is official — an owner must adopt one; nothing was written.",
+      "Single-video only, and never accompanied by a replacement link. CANONICAL_LINK_REVOKED, CANONICAL_LINK_INACTIVE, CANONICAL_DOMAIN_UNAVAILABLE, CANONICAL_EVIDENCE_DRIFT, CANONICAL_EVIDENCE_INCOMPLETE and CANONICAL_VIDEO_NOT_SHAREABLE mean the pair's canonical link exists but is not currently usable. CANONICAL_LINK_ALIAS_MISSING, CANONICAL_LINK_INTEGRITY_CONFLICT and CANONICAL_LINK_OPTIONS_PRESENT mean the ALREADY-PINNED link cannot honour the canonical contract at all — no alias, a foreign website or membership, or a legacy expiry/view limit — and each carries a `fault` label naming which. The mapping is left exactly as it is in every case; owner remediation of the anchored link is required. CANONICAL_LINK_AMBIGUOUS is NO LONGER EMITTED: pre-canonical duplicate history is resolved deterministically by adopting the newest ELIGIBLE exact single-video link, or by minting a fresh canonical link when none is eligible.",
   })
   @ApiUnauthorizedResponse()
   @ApiNotFoundResponse()
@@ -586,7 +586,7 @@ export class AdminWebsitesController {
   @ApiBadRequestResponse()
   @ApiConflictResponse({
     description:
-      "Stable codes: CANONICAL_LINK_REVOKED, CANONICAL_LINK_INACTIVE, CANONICAL_DOMAIN_UNAVAILABLE, CANONICAL_EVIDENCE_DRIFT, CANONICAL_EVIDENCE_INCOMPLETE, CANONICAL_VIDEO_NOT_SHAREABLE.",
+      "Stable codes: CANONICAL_LINK_REVOKED, CANONICAL_LINK_INACTIVE, CANONICAL_DOMAIN_UNAVAILABLE, CANONICAL_EVIDENCE_DRIFT, CANONICAL_EVIDENCE_INCOMPLETE, CANONICAL_VIDEO_NOT_SHAREABLE, CANONICAL_LINK_ALIAS_MISSING, CANONICAL_LINK_INTEGRITY_CONFLICT, CANONICAL_LINK_OPTIONS_PRESENT. The last three describe an already-pinned link that cannot honour the canonical contract and carry a `fault` label; the mapping is never repointed, deleted or replaced.",
   })
   @ApiUnauthorizedResponse()
   @ApiNotFoundResponse()

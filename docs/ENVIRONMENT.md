@@ -231,10 +231,37 @@ added. See [features/bunny-stream.md](./features/bunny-stream.md).
 > `BUNNY_STREAM_SIGNING_KEY` was a never-read placeholder. It is superseded by
 > `BUNNY_STREAM_TOKEN_SECURITY_KEY` and has been removed from the templates.
 
+### 14.1 Public Bunny thumbnail proxy (added 2026-08-28)
+
+Reviewer-facing Bunny posters are served **through this API** rather than fetched
+from the pull zone by the reviewer's browser. Off by default; while disabled the
+public response is byte-identical to before the feature existed.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED` | `false` | Master switch |
+| `BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE` | `none` | `none` or `referer`. **Any other value fails at boot.** An empty value means "use the default" |
+| `BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER` | unset | **Required when the proxy is enabled AND the mode is `referer`.** Absolute `https` URL with no embedded credentials, matching an entry in the pull zone's Allowed Referrers list. **Not a secret** — it is a public site URL |
+| `BUNNY_PUBLIC_THUMBNAIL_MAX_BYTES` | `5242880` | Bounded 65536–20971520. Out of range **fails at boot** rather than clamping. Enforced on transferred bytes, not only `Content-Length` |
+| `BUNNY_PUBLIC_THUMBNAIL_TIMEOUT_MS` | `5000` | Bounded 1000–15000. Same fail-fast behaviour. Deliberately far shorter than `BUNNY_STREAM_REQUEST_TIMEOUT_MS` (15 s), which governs operator-triggered management calls rather than an unauthenticated public route |
+
+> **`BUNNY_STREAM_TOKEN_SECURITY_KEY` IS NOT A CDN CREDENTIAL.** It signs Stream
+> **embed view tokens**. A pull zone's CDN Token Authentication is a separate
+> mechanism with a separate key, and that mechanism is **not implemented** here.
+> Never configure the proxy to derive anything from the embed key: the CDN would
+> reject the resulting signatures while the code looked like working security.
+
+> **The mode is a deployment decision, not a default that happens to work.**
+> `none` sends nothing extra; `referer` sends the configured value. Enabling the
+> proxy in `referer` mode with no usable Referer fails at boot, and at runtime it
+> fails closed rather than downgrading to `none`. Full rationale and the measured
+> evidence behind the choice: [features/bunny-stream.md §4.6](./features/bunny-stream.md#46-reviewer-facing-poster-delivery-the-backend-proxy).
+
 Only the non-secret values reach `ApiEnvironmentConfig.bunnyStream`
-(`enabled`, `libraryId`, `tusTtlSeconds`, `embedTokenTtlSeconds`). The two
-secrets are read exclusively by `BunnyStreamService` through `ConfigService` and
-never appear in a response, an exception message or a log line.
+(`enabled`, `libraryId`, `pullZoneHostname`, `tusTtlSeconds`,
+`embedTokenTtlSeconds`, and the `publicThumbnailProxy` block). The two secrets
+are read exclusively by `BunnyStreamService` through `ConfigService` and never
+appear in a response, an exception message or a log line.
 
 ## 15. Declared but not read by any code
 

@@ -360,27 +360,100 @@ of attempts inside a `Serializable` transaction.
 > and writes nothing. Minting a fresh credential in any of those cases would
 > restore access an owner had deliberately removed.
 
-> **A pair that already has a link but no mapping ADOPTS it.** Almost every
-> production pair is in this state, because the canonical endpoint had no
-> client. The resolver looks for share links on this website whose membership is
-> **exactly** the requested video — a bundle `[A, B]` never qualifies for A —
-> and then:
+> **A pair that already has history but no mapping RESOLVES IT AUTOMATICALLY.**
+> Almost every production pair is in this state, because the canonical endpoint
+> had no client. The resolver looks for share links on this website whose
+> membership is **exactly** the requested video — a bundle `[A, B]` never
+> qualifies for A — and then applies one rule:
 >
 > | Exact single-video links found | Result |
 > |---|---|
-> | 0 | A new canonical link is created. The only case that mints one |
-> | 1 | It is adopted unchanged: same `id`, same `alias`, same `publicUrl`, same views and budget. `outcome: "REUSED"` |
-> | 2 or more | `409 CANONICAL_LINK_AMBIGUOUS`, with `candidateCount`. **Nothing is written** |
+> | 0 | A new canonical link is created. **The only case that mints one** |
+> | ≥ 1 | The **NEWEST** one (`createdAt DESC`, `id DESC`) becomes the pair's identity |
+
+> **IDENTITY IS NOT USABILITY, and the winner's status is NOT a selection
+> input.** A `REVOKED`, `DISABLED` or `EXPIRED` newest link is still the pair's
+> correct permanent identity. It is pinned, and the request then fails with that
+> link's own `409` from the list in §2.11a. No replacement is minted and no
+> older link is promoted.
 >
-> Adoption pins *identity*, not usability: a revoked or expired historical link
-> is still adopted and the request then fails with that link's own code, so the
-> pair keeps one permanent answer and no replacement appears.
+> This is the load-bearing security property of the whole feature. Filtering to
+> "usable" candidates first reads as the safer choice and is the opposite:
 >
-> The ambiguous case is **never** resolved by picking the newest, the oldest or
-> the only `ACTIVE` one — nothing in the data says which already-circulated URL
-> a reviewer holds. An owner resolves it with
-> `yarn audit:canonical-share-links` then `yarn remediate:local:adopt-canonical`,
-> after which every request returns the adopted link.
+> - Pair has L1 (Jan, `ACTIVE`) and L2 (Apr) which an owner REVOKED after a leak.
+>   Filtering would pick L1 and return a **working** URL — routing around the
+>   revoke.
+> - Pair has only L2, revoked. Filtering would find nothing usable and **mint a
+>   brand-new working link** for a video whose only share link the owner
+>   deliberately took away.
+>
+> Both are refused. `currentViews` is never consulted, and neither `updatedAt`
+> nor `lastViewedAt` participates — all three move for reasons unrelated to which
+> URL a reviewer holds.
+
+> **Three structural faults refuse the pin outright, writing NOTHING** — no
+> mapping, no replacement link, and emphatically no fallback to an older
+> candidate:
+>
+> | `409` code | When | Remediation |
+> |---|---|---|
+> | `CANONICAL_HISTORICAL_ALIAS_MISSING` | the newest link has no usable `alias` | restore the alias on that link, then retry |
+> | `CANONICAL_HISTORICAL_OPTIONS_PRESENT` | the newest link carries `expiresAt` or `maxViews` | clear the limit, or resolve the pair deliberately |
+> | `CANONICAL_HISTORICAL_INTEGRITY_CONFLICT` | the newest link already anchors a **different** pair | owner review; `shareLinkId` is unique, so this state cannot arise by design |
+>
+> The response carries `blocker` and `historicalCandidateCount` alongside the
+> `code`. Both are counts/enums, never a credential.
+>
+> `expiresAt` / `maxViews` refuse rather than adopt because the canonical
+> contract cannot *represent* them.
+>
+> **Neither control can be bypassed by pinning.** Public resolution enforces both
+> independently and never consults the canonical mapping —
+> `PublicService.getDeniedReason()`, the atomic `incrementShareLinkView()` guard,
+> and `getDeniedReasonForMediaPlayback()` on the media routes. What breaks is the
+> canonical contract itself: `assertReusable()` reads neither column, so the
+> **admin** side would keep reporting a "permanent" canonical URL while reviewers
+> were denied, and once the link lapses the pair's one identity is dead with no
+> replacement possible. Minting or falling back WOULD bypass the control
+> outright. Refusing does neither.
+>
+> `alias` refuses rather than pins because pinning is the one genuinely
+> **unremediable** outcome: the alias IS the canonical URL's credential, so the
+> mapping would commit and response construction would then throw forever, with
+> no HTTP path to undo it (`onDelete: Restrict` on all four relations, and
+> nothing un-adopts a mapping).
+
+> **Legacy rows are never rewritten.** Automatic resolution chooses which
+> existing row becomes canonical; it never deletes, revokes, renames, re-scopes,
+> re-aliases or re-budgets any of them. They may already be cited in DMCA
+> evidence or bookmarked by a reviewer.
+>
+> `yarn audit:canonical-share-links` reports, per pair and in advance, which
+> outcome will occur — including `ADOPT_HISTORICAL_THEN_DENY`, so a pin-then-deny
+> is never a surprise — computed by the same policy function the request path
+> uses.
+
+> **`409 CANONICAL_LINK_AMBIGUOUS` IS NO LONGER EMITTED (changed 2026-08-28).**
+> It previously fired whenever two or more exact single-video links existed. There
+> is exactly one newest link, so no irreducible ambiguity remains. The constant is
+> retained in `CANONICAL_ERROR_CODES` and in the Admin's message map so an older
+> client is unaffected, but no code path produces it.
+
+> **An existing mapping is ALWAYS authoritative, and is never repointed.** Once
+> `CanonicalVideoShareLink(websiteId, videoId)` exists, history is not
+> re-scanned. A newer duplicate created afterwards never displaces it, because
+> canonical identity is what DMCA submissions and reviewer bookmarks were built
+> on. Changing it is an explicit, OWNER-driven remediation, never a side effect
+> of pressing "Get link".
+
+> **Every precondition is re-read inside the `Serializable` transaction**
+> (changed 2026-08-28): website status, video eligibility, the active domain and
+> the evidence snapshot. They were previously loaded before the transaction
+> opened, which left a window in which a concurrent website disable, video
+> unassignment or domain change committed between the read and the canonical
+> write. Because the mapping is permanent and all four of its relations are
+> `onDelete: Restrict`, a record committed against stale preconditions is not a
+> transient error — it is a row an operator then has to unpick by hand.
 
 > **CONTRACT INVARIANT: `rawToken` is write-once.** Any client that discards it
 > has permanently lost the raw token; only the alias remains usable. The admin
@@ -719,7 +792,8 @@ Breaking any of these breaks every deployed customer website.
      "binaryAsset"   : { "mimeType", "sizeBytes" } | null,
      "localFileAsset": { "mimeType", "sizeBytes" } | null,
      "embedUrl", "embedProvider", "embedAllow",
-     "thumbnailUrl", "publicThumbnailUrl",
+     "thumbnailUrl", "publicThumbnailUrl",   // both carry the backend-protected
+                                             // route for a proxied Bunny poster
      "durationSeconds", "viewCount" /* string */, "publishedAt"
   } ] }
 
@@ -767,6 +841,7 @@ configured from a failed watch.
 | `UPLOAD` | `playbackUrl` (Cloudinary `secure_url`) | Cloudinary | **No** |
 | `EMBED` | `embedUrl` (+ `embedProvider`, `embedAllow`) | the embed provider | **No** |
 | `EMBED` **(Bunny-backed)** | `embedUrl` - a **freshly signed, short-lived** `iframe.mediadelivery.net` URL | Bunny CDN | **No**, but the URL expires |
+| `EMBED` **(Bunny-backed), poster** | `thumbnailUrl` **and** `publicThumbnailUrl` - this API's `/public/watch/.../thumbnail` route, when the proxy is enabled | this API | **Yes** |
 
 For the backend-mediated rows, the URL carries the share token and host, and —
 when the share link has a `maxViews` limit — a signed `grant`. Clients must pass
@@ -778,9 +853,35 @@ For the non-mediated rows, the field contains the stored external URL verbatim
 segment). No token, host binding, grant or expiry is added, and no backend
 request occurs during playback.
 
-> **No public response field was added for Bunny.** The signed URL is returned
-> in the existing `embedUrl` field, so an older deployed public bundle plays a
-> Bunny video without modification - provided its embed host allowlist and CSP
+> **The reviewer-facing Bunny POSTER is now backend-mediated (2026-08-28).**
+> `thumbnailUrl` and `publicThumbnailUrl` both carry this API's
+> `/public/watch/:token/videos/:videoId/thumbnail` route for a Bunny-backed
+> video, instead of the raw `https://vz-….b-cdn.net/…` pull-zone URL.
+>
+> **Why.** A public site sending `Referrer-Policy: no-referrer` gives the
+> browser no `Referer`, so a pull zone using Bunny's hotlink protection answered
+> **403** and every poster rendered broken. Serving the image from this API
+> removes the dependency on browser referrer policy entirely, keeps the
+> reviewer's IP away from Bunny, and puts the poster behind the same share
+> authorization as the video.
+>
+> **No field was added, and no client change is required.** Worldfold's
+> `private-share-contract.js` reads `publicThumbnailUrl` first and falls back to
+> `thumbnailUrl`; older public bundles read only `thumbnailUrl`. Both now carry
+> the same protected URL, and it is **relative**, which is the form both clients
+> already re-base against the API origin.
+>
+> **Off by default.** While `BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED` is false the
+> response is byte-identical to before. See
+> [features/bunny-stream.md §4.6](./features/bunny-stream.md#46-reviewer-facing-poster-delivery-the-backend-proxy)
+> for the upstream authorization modes and the rollout steps.
+>
+> An operator-set poster on some **other** host — sync only ever fills an empty
+> `thumbnailUrl` and never overwrites one — is still passed through unchanged.
+
+> **No public response field was added for Bunny PLAYBACK.** The signed URL is
+> returned in the existing `embedUrl` field, so an older deployed public bundle
+> plays a Bunny video without modification - provided its embed host allowlist and CSP
 > `frame-src` include `iframe.mediadelivery.net`. The URL is minted fresh on
 > every watch resolution, including cache hits, so reloading a valid share page
 > after the token expired yields a new URL.
@@ -856,12 +957,38 @@ Delivery differs by source:
 
 `HEAD` returns the headers without transferring a body.
 
-The thumbnail route serves `LOCAL_FILE` thumbnails only, returns the whole
-object, and does not honour Range.
+The thumbnail route returns the whole object and does not honour Range. It
+serves **two** kinds of poster, decided from the video's own `sourceType`:
 
-> Authorization for `local-file` and `thumbnail` may be served from a
-> process-local cache rather than re-queried per request. See
+| Source | Served from | Headers |
+|---|---|---|
+| `LOCAL_FILE` | the local thumbnail asset, streamed from `LOCAL_FILE_STORAGE_ROOT` | `Content-Type`, `Content-Length` |
+| Bunny-backed `EMBED` | the library pull zone, proxied by this API | `Content-Type`; `Content-Length` **only when the CDN sent one** |
+
+> **Bunny support was added on 2026-08-28 and the URL did not change.** A second
+> route would have meant a second copy of the authorization chain, and two
+> copies drift. `LOCAL_FILE` behaviour is byte-identical to before.
+
+> **`Content-Length` may be absent on a proxied poster.** An upstream CDN is not
+> obliged to send one, and emitting a guess would be a lie the client acts on.
+> A `LOCAL_FILE` thumbnail always carries it, so no existing client is affected.
+
+> **The Bunny branch requires `BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED=true`.**
+> While it is off — the default — a Bunny poster request returns the same
+> generic `404` as any other unservable video, and the watch response keeps
+> returning the stored pull-zone URL exactly as it did before. See
+> [features/bunny-stream.md §4.6](./features/bunny-stream.md#46-reviewer-facing-poster-delivery-the-backend-proxy).
+
+> **Views are never incremented by a thumbnail request**, on either branch and
+> on GET or HEAD. `maxViews` is still enforced through the signed `grant`, with
+> the same semantics as the other media routes.
+
+> Authorization for `local-file` and the `LOCAL_FILE` thumbnail branch may be
+> served from a process-local cache rather than re-queried per request. See
 > [SECURITY_MODEL.md §4.2](./SECURITY_MODEL.md#42-local_file-media-authorization-cache).
+> The **Bunny** branch deliberately does not use that cache: it re-reads the
+> current `VideoAsset` row before every proxied fetch, for the same reason the
+> playback signing gate does.
 
 ### 3.3 `POST /public/watch/:token/videos/:videoId/view`
 

@@ -125,8 +125,18 @@ class RouteProbePublicService {
     };
   }
 
-  async getPublicLocalThumbnail(params: Record<string, unknown>) {
-    this.record("getPublicLocalThumbnail", params);
+  /**
+   * The controller entry point for the thumbnail route.
+   *
+   * Renamed from `getPublicLocalThumbnail` when the route was generalised to
+   * serve Bunny posters as well as LOCAL_FILE thumbnails. The WIRE contract
+   * COMPAT-050 pins — same path, same verb, 200, an image content type — is
+   * unchanged; only the collaborator method the controller dispatches to moved.
+   * `PublicService.getPublicLocalThumbnail()` still exists and still serves the
+   * LOCAL_FILE branch.
+   */
+  async getPublicThumbnail(params: Record<string, unknown>) {
+    this.record("getPublicThumbnail", params);
     const { Readable } = await import("node:stream");
 
     return {
@@ -263,7 +273,7 @@ describe("COMPAT-050 controller route-decorator compatibility", () => {
     for (const [segment, method, contentType] of [
       ["binary", "getPublicDatabaseVideoBinary", "video/mp4"],
       ["local-file", "getPublicLocalVideoFile", "video/mp4"],
-      ["thumbnail", "getPublicLocalThumbnail", "image/jpeg"],
+      ["thumbnail", "getPublicThumbnail", "image/jpeg"],
     ] as const) {
       const url = new URL(
         `${baseUrl}/public/watch/${TOKEN}/videos/${VIDEO_ID}/${segment}`,

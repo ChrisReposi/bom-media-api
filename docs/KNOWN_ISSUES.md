@@ -34,6 +34,9 @@ real friction) · `LOW` (hygiene, correctness of documentation, cleanup).
 | [KI-019](#ki-019) | Concurrent refresh is conservatively treated as replay | LOW | Design/risk note | Yes |
 | [KI-020](#ki-020) | Unlimited LOCAL_FILE media authorization is cached | MED | Backend | Yes |
 | [KI-021](#ki-021) | Historical share links stranded DISABLED by the old one-way video disable | MEDIUM | Data | Yes — remedy exists, purge residual RESOLVED |
+| [KI-022](#ki-022) | Canonical adoption could commit an unremediable alias-less mapping | MEDIUM | Backend | **RESOLVED 2026-08-28** — data residue may remain |
+| [KI-023](#ki-023) | Public Bunny posters returned 403 behind a no-referrer site | HIGH | Backend ↔ public site | **RESOLVED 2026-08-28**, opt-in |
+| [KI-024](#ki-024) | Bunny Embed View Token enforcement point is unverified | LOW | Provider config | Yes — verification task |
 
 ---
 
@@ -522,6 +525,111 @@ real friction) · `LOW` (hygiene, correctness of documentation, cleanup).
   operator override.
 - **Safe to defer?** Yes. Nothing degrades further; the residue is static and the
   remedy is idempotent and re-runnable.
+
+---
+
+### KI-022
+
+**Canonical adoption could commit an unremediable alias-less mapping**
+
+- Status: **RESOLVED 2026-08-28** (code) · Severity: MEDIUM · Component: backend
+- **SCOPE CORRECTION.** An earlier draft of this entry claimed that adopting a
+  `REVOKED` / `DISABLED` / `EXPIRED` historical link was itself a defect
+  ("poisoned mapping"). **That was wrong**, and the fix it motivated was a
+  security regression that has been reverted. Pinning a revoked link is the
+  *intended* separation of identity from usability: the pair gets one permanent
+  answer and the request fails closed. Filtering such a link out instead lets a
+  deliberate revoke be routed around — by promoting an older `ACTIVE` link, or by
+  minting a fresh one. See [features/share-links.md §2.1.1](./features/share-links.md).
+- **The real defect, which remains fixed.** `findExactSingleVideoCandidates()`
+  selected only `id, alias` and the mapping was committed **before** anything
+  checked the alias. For an `alias`-`null` winner the mapping committed, then
+  `buildCanonicalReviewUrl()` threw a `400` **while building the response** — on
+  that request and on every later one. With `onDelete: Restrict` on all four
+  relations and no HTTP path that un-adopts a mapping, the pair was left with no
+  resolvable canonical URL and no way to obtain one. That is the one genuinely
+  **unremediable** outcome, and it is distinct from a link that merely denies.
+- **Also fixed alongside it.** A winner carrying `expiresAt` / `maxViews` would
+  have been pinned into a contract that cannot honour either (`assertReusable()`
+  reads neither), and a winner already anchoring a **different** pair was
+  silently skipped so an older link was blessed in its place. Both now refuse
+  explicitly with their own stable codes.
+- **Fix.** `assessHistoricalWinnerPinnability()` runs **inside** the transaction
+  and **before** any write; a blocked winner throws, the transaction rolls back,
+  and nothing is written — no mapping, no replacement link, and no fallback.
+  Status is deliberately **not** one of its inputs.
+- **Data residue — CHECK BEFORE ASSUMING NONE.** Any mapping already committed
+  against an alias-less link is still in the database and still unresolvable.
+  `yarn audit:canonical-share-links` reports such a pair as `ALREADY_CANONICAL`;
+  correlate it with a `400` an operator still sees on "Get link". Repointing an
+  existing mapping is deliberately not automated — it changes provenance — so it
+  remains a manual owner decision.
+- **Public resolution is unaffected either way — verified.** A canonical
+  mapping confers no bypass: `src/public/public.service.ts` never reads
+  `CanonicalVideoShareLink` at all, and enforces the link's own policy in
+  `getDeniedReason()` (`EXPIRED_LINK`, `VIEW_LIMIT_REACHED`), in the atomic
+  `incrementShareLinkView()` guard, and in `getDeniedReasonForMediaPlayback()`
+  on the media routes. So even a mapping pinned to an expiring or view-limited
+  link cannot serve a reviewer past its limit; the damage is confined to the
+  admin side reporting a "permanent" URL that will stop working.
+- **Safe to defer?** The code fix is shipped. The residue check is an operator
+  task before declaring the incident closed — run
+  `yarn audit:canonical-share-links --counts-only` and read the
+  "Existing canonical mappings, by finding" block.
+
+### KI-023
+
+**Public Bunny posters returned 403 behind a `no-referrer` public site**
+
+- Status: **RESOLVED 2026-08-28** (opt-in) · Severity: HIGH · Component:
+  backend ↔ public site
+- **Evidence.** `public.service.ts` `toPublicVideoResponses()` returned
+  `toSafePublicMediaUrl(video.thumbnailUrl)` for a Bunny `EMBED` video — the raw
+  stored `https://vz-….b-cdn.net/{guid}/{file}` URL — which the reviewer's
+  browser then fetched directly. The reviewer-facing site sends
+  `Referrer-Policy: no-referrer`, and the pull zone enforces Bunny's Allowed
+  Referrers. Measured against the live zone by `Worldfold_Studio`
+  (`verify-poster-referrer.mjs`): no `Referer` → **403**; a valid `Referer` →
+  **200**; an **unsigned** URL with a valid `Referer` → **200**, which rules out
+  CDN Token Authentication on that zone.
+- **Impact.** Every reviewer poster for a Bunny-backed video rendered broken.
+  Separately, each poster request disclosed the reviewer's IP address to Bunny,
+  and the raw CDN URL was the public contract and outside share-link revocation.
+- **Fix.** The existing `/public/watch/:token/videos/:videoId/thumbnail` route
+  now serves Bunny posters as well as `LOCAL_FILE` thumbnails, behind the full
+  public authorization chain, with the backend performing one validated upstream
+  request under an explicitly configured mode. See
+  [features/bunny-stream.md §4.6](./features/bunny-stream.md#46-reviewer-facing-poster-delivery-the-backend-proxy).
+- **Not automatic.** `BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED` defaults to `false`,
+  and the upstream mode must match the pull zone's actual configuration. Until an
+  operator sets both, the production symptom persists — deliberately, so no
+  deployment's public response changes without a decision.
+- **Safe to defer?** The enabling step is per deployment and should be done with
+  the rollout checklist.
+
+### KI-024
+
+**Bunny Embed View Token enforcement point is unverified**
+
+- Status: CURRENT · Severity: LOW · Type: **verification task**, not a defect
+- **Evidence.** `createSignedEmbedUrl()` signs
+  `SHA256(BUNNY_STREAM_TOKEN_SECURITY_KEY + videoId + expires)` with a 300 s
+  default TTL, and `docs/features/bunny-stream.md` §5.1 records that the
+  **unsigned** stored URL produced a Bunny 403 in the admin iframe — which is why
+  the admin preview endpoint exists. Nothing in this repository can read the
+  library's current Embed View Token Authentication setting.
+- **The observation that must not become a conclusion.** No token, an expired
+  token and a junk token reportedly all return the same iframe **HTML** with
+  HTTP 200. That is consistent with token authentication being either on or off,
+  because Bunny may enforce on the subsequent playlist / media requests rather
+  than on the player shell. It discriminates nothing.
+- **Direction.** Inspect the network trace **after** the iframe loads (`.m3u8`
+  and segment requests) for a signed and an unsigned URL, and read the dashboard
+  setting. **No signing code was changed on the strength of the HTML status
+  code**, and the 300 s TTL was deliberately left alone — see
+  [features/bunny-stream.md §4.2.1](./features/bunny-stream.md#421-what-the-embed-token-is-and-what-is-not-verified-about-it).
+- **Safe to defer?** Yes. Nothing depends on the answer today; it becomes
+  blocking only if someone proposes raising the TTL.
 
 ---
 

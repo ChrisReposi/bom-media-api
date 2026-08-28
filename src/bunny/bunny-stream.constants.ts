@@ -77,3 +77,61 @@ export const MAX_BUNNY_EMBED_TOKEN_TTL_SECONDS = 60 * 60;
  * whenever a custom thumbnail is uploaded.
  */
 export const DEFAULT_BUNNY_THUMBNAIL_TIME_MS = 1000;
+
+/* ------------------------------------------------------------------ *
+ * PUBLIC THUMBNAIL PROXY
+ *
+ * Reviewer-facing Bunny posters are served THROUGH this API rather than
+ * fetched from the pull zone by the reviewer's browser. See
+ * `bunny-thumbnail-proxy.service.ts` for why, and `docs/features/bunny-stream.md`
+ * §4.5 for the operational contract.
+ * ------------------------------------------------------------------ */
+
+/**
+ * How the BACKEND authorizes its own request to the Bunny pull zone.
+ *
+ * These are two entirely different mechanisms from Stream EMBED view tokens,
+ * which `BUNNY_STREAM_TOKEN_SECURITY_KEY` signs. A pull zone and a Stream
+ * library are separate products with separate security settings, and a key from
+ * one does not authorize the other.
+ *
+ * - `none`    — send nothing extra. Correct when the pull zone is open, or is
+ *               restricted by something the backend already satisfies.
+ * - `referer` — send a configured `Referer` that the zone's Allowed Referrers
+ *               list accepts. This is Bunny's hotlink protection: a
+ *               compatibility mechanism, NOT strong authorization, and it is
+ *               documented as such.
+ *
+ * CDN Token Authentication is deliberately absent: it requires a CDN token
+ * security key that is not part of this deployment's environment contract.
+ */
+export const BUNNY_THUMBNAIL_PROXY_AUTH_MODES = {
+  none: "none",
+  referer: "referer",
+} as const;
+
+export type BunnyThumbnailProxyAuthMode =
+  (typeof BUNNY_THUMBNAIL_PROXY_AUTH_MODES)[keyof typeof BUNNY_THUMBNAIL_PROXY_AUTH_MODES];
+
+/**
+ * Largest poster the proxy will relay, in bytes.
+ *
+ * 5 MB is far above any frame Bunny extracts from a video and far below
+ * anything that would matter for memory or bandwidth on a public route. The cap
+ * is enforced on the transferred bytes, not only on `Content-Length`.
+ */
+export const DEFAULT_BUNNY_THUMBNAIL_PROXY_MAX_BYTES = 5 * 1024 * 1024;
+export const MIN_BUNNY_THUMBNAIL_PROXY_MAX_BYTES = 64 * 1024;
+export const MAX_BUNNY_THUMBNAIL_PROXY_MAX_BYTES = 20 * 1024 * 1024;
+
+/**
+ * Upstream request timeout, in milliseconds.
+ *
+ * Much shorter than `BUNNY_STREAM_REQUEST_TIMEOUT_MS` (15 s), and deliberately
+ * so: that governs operator-triggered management calls, while this sits on an
+ * unauthenticated public route where a slow CDN must never be able to pin API
+ * request handlers.
+ */
+export const DEFAULT_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS = 5_000;
+export const MIN_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS = 1_000;
+export const MAX_BUNNY_THUMBNAIL_PROXY_TIMEOUT_MS = 15_000;

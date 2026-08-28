@@ -196,6 +196,17 @@ appears anywhere in the suite.**
 | COMPAT-050 | **Controller route-decorator compatibility.** Legacy `GET /public/watch`, `POST /public/watch/exchange`, the view route and all three media routes resolve on the right methods with HEAD working, and five near-miss paths still 404. Scope: the controller is registered *directly* under a prefix the test sets, so this proves the decorators — **not** that the controller is reachable in the real app | routing | `…-routes` | COVERED (scope stated) |
 | COMPAT-051 | **Production wiring.** `AppModule` imports `PublicModule`; `PublicModule` registers `PublicController`; the real config factory still yields the `api/v1` prefix COMPAT-050 mounts under. These read the same module metadata `NestFactory.create(AppModule)` reads at boot | routing | `…-routes` | COVERED (see §8 for what is still not booted) |
 
+> **Note on the thumbnail row of COMPAT-050 (2026-08-28).** The collaborator
+> method the controller dispatches to was renamed
+> `getPublicLocalThumbnail` → `getPublicThumbnail` when the route was
+> generalised to serve Bunny posters as well as `LOCAL_FILE` thumbnails, and the
+> stub in `…-routes` was updated to match. The **wire** contract this id pins —
+> same path, same verb, `200`, an image content type — is unchanged, and
+> `PublicService.getPublicLocalThumbnail()` still exists and still serves the
+> `LOCAL_FILE` branch. Renaming an internal collaborator breaks no share link;
+> §9's rule that constructor arity is not a compatibility contract applies for
+> the same reason.
+
 ## 7. COMPAT-043 — structural invariant, not a runtime gate
 
 **Classification: STRUCTURAL / DOCUMENTED INVARIANT. NOT a runtime

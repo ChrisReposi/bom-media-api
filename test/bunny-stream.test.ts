@@ -1123,9 +1123,24 @@ describe("Bunny Stream environment validation", () => {
         "embedTokenTtlSeconds",
         "enabled",
         "libraryId",
+        // The public thumbnail proxy block: a feature flag, a policy NAME, a
+        // public site URL and two numeric bounds. Nothing derived from a key.
+        "publicThumbnailProxy",
         "pullZoneHostname",
         "tusTtlSeconds",
       ]);
+      assert.deepEqual(Object.keys(bunnyStream.publicThumbnailProxy).sort(), [
+        "enabled",
+        "maxBytes",
+        "timeoutMs",
+        "upstreamAuthMode",
+        "upstreamReferer",
+      ]);
+      // Off by default, so an existing deployment is untouched until an
+      // operator opts in.
+      assert.equal(bunnyStream.publicThumbnailProxy.enabled, false);
+      assert.equal(bunnyStream.publicThumbnailProxy.upstreamAuthMode, "none");
+      assert.equal(bunnyStream.publicThumbnailProxy.upstreamReferer, null);
       assert.equal(bunnyStream.enabled, true);
       assert.equal(bunnyStream.libraryId, LIBRARY_ID);
       // The hostname is NOT a secret - it is the public CDN host that appears
@@ -1153,6 +1168,201 @@ describe("Bunny Stream environment validation", () => {
     });
   });
 
+  /**
+   * PUBLIC THUMBNAIL PROXY CONFIGURATION.
+   *
+   * The upstream authorization mode is what decides whether the proxy actually
+   * fixes the reviewer-facing 403 or merely moves it from the browser to the
+   * API server, so it is configuration rather than inference — and it is
+   * validated at BOOT so a mistake fails the deploy instead of every poster.
+   */
+  it("defaults the public thumbnail proxy to OFF with no upstream auth", () => {
+    withCleanEnv(() => {
+      const validated = validateEnv({ ...BASE_ENV });
+
+      assert.equal(validated.BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED, "false");
+      assert.equal(
+        validated.BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE,
+        "none",
+      );
+      // An existing production deployment that has never heard of this feature
+      // still boots, and its public response is unchanged.
+      assert.equal(
+        validated.BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER,
+        undefined,
+      );
+    });
+  });
+
+  it("rejects an unknown upstream auth mode instead of falling back", () => {
+    withCleanEnv(() => {
+      for (const mode of ["token", "cdn-token", "hotlink", "REFERRER"]) {
+        assert.throws(
+          () =>
+            validateEnv({
+              ...BASE_ENV,
+              BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE: mode,
+            }),
+          /BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE must be one of/,
+          `mode ${JSON.stringify(mode)} must be rejected`,
+        );
+      }
+    });
+  });
+
+  it("treats an empty auth mode as unset, not as an error", () => {
+    withCleanEnv(() => {
+      // `.env` templates ship the key with an empty value, so an empty string
+      // must mean "use the default" rather than fail the deploy — the same
+      // rule every other optional string in this file follows.
+      const validated = validateEnv({
+        ...BASE_ENV,
+        BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE: "",
+      });
+      assert.equal(
+        validated.BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE,
+        "none",
+      );
+    });
+  });
+
+  it("requires a Referer when the proxy runs in referer mode", () => {
+    withCleanEnv(() => {
+      assert.throws(
+        () =>
+          validateEnv({
+            ...BASE_ENV,
+            BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED: "true",
+            BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE: "referer",
+          }),
+        /BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER is required/,
+      );
+    });
+  });
+
+  it("rejects a Referer that is not an absolute credential-free https URL", () => {
+    withCleanEnv(() => {
+      for (const referer of [
+        "http://example.com/",
+        "//example.com/",
+        "example.com",
+        "https://user:pass@example.com/",
+        "not a url",
+      ]) {
+        assert.throws(
+          () =>
+            validateEnv({
+              ...BASE_ENV,
+              BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED: "true",
+              BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE: "referer",
+              BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER: referer,
+            }),
+          /BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER must be an absolute https URL/,
+          `${referer} must be rejected`,
+        );
+      }
+    });
+  });
+
+  it("accepts a well-formed referer-mode configuration", () => {
+    withCleanEnv(() => {
+      const validated = validateEnv({
+        ...BASE_ENV,
+        BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED: "true",
+        BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE: "referer",
+        BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER: "https://example.com/",
+      });
+
+      assert.equal(validated.BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED, "true");
+      assert.equal(
+        validated.BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE,
+        "referer",
+      );
+      assert.equal(
+        validated.BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER,
+        "https://example.com/",
+      );
+    });
+  });
+
+  it("does not require a Referer while the proxy is off", () => {
+    withCleanEnv(() => {
+      // Mode alone is inert. Only enabling the proxy makes the mode binding,
+      // so a half-configured deployment is not blocked from booting.
+      const validated = validateEnv({
+        ...BASE_ENV,
+        BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE: "referer",
+      });
+
+      assert.equal(validated.BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED, "false");
+    });
+  });
+
+  it("defaults the proxy size and timeout, and fails fast when out of range", () => {
+    withCleanEnv(() => {
+      const defaults = validateEnv({ ...BASE_ENV });
+      assert.equal(
+        Number(defaults.BUNNY_PUBLIC_THUMBNAIL_MAX_BYTES),
+        5 * 1024 * 1024,
+      );
+      assert.equal(Number(defaults.BUNNY_PUBLIC_THUMBNAIL_TIMEOUT_MS), 5000);
+
+      // FAILS FAST rather than silently clamping, exactly like the Bunny TTLs.
+      // A deployment that asked for a 40 MB poster cap, or a 60-second wait on
+      // an unauthenticated public route, has made a mistake that must surface
+      // at boot rather than as surprising runtime behaviour.
+      for (const [key, value] of [
+        ["BUNNY_PUBLIC_THUMBNAIL_MAX_BYTES", "1"],
+        ["BUNNY_PUBLIC_THUMBNAIL_MAX_BYTES", "41943040"],
+        ["BUNNY_PUBLIC_THUMBNAIL_TIMEOUT_MS", "1"],
+        ["BUNNY_PUBLIC_THUMBNAIL_TIMEOUT_MS", "60000"],
+      ] as const) {
+        assert.throws(
+          () => validateEnv({ ...BASE_ENV, [key]: value }),
+          new RegExp(`${key} must be between`),
+          `${key}=${value} must be rejected`,
+        );
+      }
+
+      const inRange = validateEnv({
+        ...BASE_ENV,
+        BUNNY_PUBLIC_THUMBNAIL_MAX_BYTES: "262144",
+        BUNNY_PUBLIC_THUMBNAIL_TIMEOUT_MS: "2500",
+      });
+      assert.equal(Number(inRange.BUNNY_PUBLIC_THUMBNAIL_MAX_BYTES), 262144);
+      assert.equal(Number(inRange.BUNNY_PUBLIC_THUMBNAIL_TIMEOUT_MS), 2500);
+    });
+  });
+
+  it("never reuses the embed token security key as a CDN credential", () => {
+    withCleanEnv(() => {
+      const validated = validateEnv({
+        ...BASE_ENV,
+        BUNNY_STREAM_ENABLED: "true",
+        BUNNY_STREAM_LIBRARY_ID: LIBRARY_ID,
+        BUNNY_STREAM_API_KEY: API_KEY,
+        BUNNY_STREAM_TOKEN_SECURITY_KEY: TOKEN_SECURITY_KEY,
+        BUNNY_STREAM_PULL_ZONE_HOSTNAME: PULL_ZONE_HOSTNAME,
+        BUNNY_PUBLIC_THUMBNAIL_PROXY_ENABLED: "true",
+        BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_AUTH_MODE: "referer",
+        BUNNY_PUBLIC_THUMBNAIL_UPSTREAM_REFERER: "https://example.com/",
+      });
+
+      // Stream EMBED view tokens and CDN pull-zone security are separate
+      // systems with separate keys. Signing a CDN URL with the embed key would
+      // produce a signature the CDN rejects while looking, in code, exactly
+      // like working security.
+      for (const value of Object.values(validated)) {
+        if (typeof value === "string" && value !== TOKEN_SECURITY_KEY) {
+          assert.equal(
+            value.includes(TOKEN_SECURITY_KEY),
+            false,
+            "no proxy value may be derived from the embed token security key",
+          );
+        }
+      }
+    });
+  });
   it("fails fast on an out-of-range TTL rather than silently clamping", () => {
     // Matches how every other bounded value in this file behaves: a malformed
     // deployment value is reported at boot, not quietly rewritten.

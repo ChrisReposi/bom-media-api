@@ -21,6 +21,20 @@ environment-controlled connection settings, plus targeted diagnostics.
   `DB_IDLE_TIMEOUT_SECONDS`.
 - `DB_MARIADB_USE_TEXT_PROTOCOL` switches the adapter to the text protocol as an
   operator-controllable mitigation, defaulting to `false`.
+- **Every pooled connection runs `SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci`
+  via the driver's `initSql`** (added 2026-09-01). The charset and collation are
+  derived from the schema contract in `prisma/migrations/`, never from a host
+  default. Without it the driver sets the session collation only through the
+  handshake collation byte, which leaves `character_set_client`'s default
+  collation and `collation_connection` free to disagree. On Hostinger's
+  `11.8.8-MariaDB-log` a binary-protocol bound parameter then arrives as
+  `utf8mb4_general_ci` while SQL-text literals stay `utf8mb4_unicode_ci`;
+  `CONCAT('%', ?, '%')` aggregates them to `utf8mb4_bin` with DERIVATION_NONE,
+  which outranks the column's IMPLICIT and makes MariaDB raise 1267 on every
+  admin `contains`/`startsWith` query. Neither the driver's `collation` option
+  nor `SET collation_connection` alone fixes it - only the combined `SET NAMES
+  ... COLLATE ...`. See
+  `docs/incidents/2026-07-20-production-admin-video-list-500.md` section 18.
 - A read-only collation probe runs after `listen()` **only** when
   `DIAG_MARIADB_COLLATION_PROBE` equals the exact literal
   `I_UNDERSTAND_THIS_ONLY_READS_SESSION_METADATA`.

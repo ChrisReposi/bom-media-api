@@ -42,6 +42,16 @@ Logs go to stdout and are whatever the host does with them.
   share-link creation stages), so one line ties request → route → failing stage.
 - `database` comes from `toSafeDatabaseErrorContext()` and never contains raw
   messages, SQL, query arguments or secrets.
+- For MariaDB **1267** ("Illegal mix of collations") that context additionally
+  carries `databaseCategory: "COLLATION_CONFLICT"` and a bounded
+  `collationConflict: { leftCollation, leftCoercibility, rightCollation,
+  rightCoercibility, operation }`, parsed by
+  `parse-mariadb-collation-conflict.util.ts`. Five short allowlisted tokens -
+  never SQL, query arguments, values or connection identity. This is the field
+  that identifies which two collations actually conflicted; before 2026-09-01 it
+  was parsed only by the opt-in boot probe and discarded on the request path,
+  which is why `docs/incidents/2026-07-20-production-admin-video-list-500.md`
+  ran for six weeks with the pair unverified.
 - Clients always get the generic 500 body; nothing from these fields is returned.
 
 Non-5xx `HttpException`s are returned as-is and are not error-logged.

@@ -1,4 +1,8 @@
 import { Prisma } from "../../generated/prisma/client";
+import {
+  parseMariaDbCollationConflict,
+  type MariaDbCollationConflict,
+} from "./parse-mariadb-collation-conflict.util";
 
 /**
  * Allowlisted, secret-free context extracted from a database/Prisma error for
@@ -20,6 +24,13 @@ export type SafeDatabaseErrorContext = {
   sqlState?: string;
   cause?: SafeDriverAdapterCause;
   databaseCategory?: string;
+  /**
+   * Bounded MariaDB 1267 detail (the two collation/coercibility pairs and the
+   * operation token). Present only for illegal-collation-mix failures. The
+   * parser reads the raw driver message in memory and returns short
+   * allowlisted tokens only - never SQL, query arguments or values.
+   */
+  collationConflict?: MariaDbCollationConflict;
 };
 
 export type SafeDriverAdapterCause = {
@@ -71,6 +82,7 @@ const CATEGORY_BY_MYSQL_CODE: Record<string, string> = {
   "1203": "CONNECTION_LIMIT",
   "1205": "OPERATION_TIMEOUT",
   "1213": "TRANSACTION_CONFLICT",
+  "1267": "COLLATION_CONFLICT",
 };
 
 const MAX_DRIVER_KIND_LENGTH = 64;
@@ -216,10 +228,12 @@ export function toSafeDatabaseErrorContext(
     const cause = extractSafeDriverCause(
       (error as Error & { cause: unknown }).cause,
     );
+    const collationConflict = parseMariaDbCollationConflict(error);
     return {
       errorName: "DriverAdapterError",
       cause,
       databaseCategory: categoryForDriverCause(cause),
+      ...(collationConflict ? { collationConflict } : {}),
     };
   }
 
@@ -248,7 +262,22 @@ export function toSafeDatabaseErrorContext(
         : {}),
       ...(CATEGORY_BY_PRISMA_CODE[error.code]
         ? { databaseCategory: CATEGORY_BY_PRISMA_CODE[error.code] }
-        : {}),
+        : driver.driverCode && CATEGORY_BY_MYSQL_CODE[driver.driverCode]
+          ? { databaseCategory: CATEGORY_BY_MYSQL_CODE[driver.driverCode] }
+          : {}),
+      ...(() => {
+        // The 1267 detail lives under `meta.driverAdapterError.cause` for this
+        // Prisma shape, which the parser's own graph walk (error -> cause ->
+        // driverAdapterError) does not reach from the root. Hand it that node
+        // directly as a fallback.
+        const collationConflict =
+          parseMariaDbCollationConflict(error) ??
+          parseMariaDbCollationConflict(
+            (error.meta as { driverAdapterError?: unknown } | undefined)
+              ?.driverAdapterError,
+          );
+        return collationConflict ? { collationConflict } : {};
+      })(),
     };
   }
 

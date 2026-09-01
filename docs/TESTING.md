@@ -102,6 +102,7 @@ These require a **test** database and are never part of `yarn test` or CI:
 | Canonical FK restrict proof | `yarn test:integration:canonical-fk` |
 | DB-blob evidence proof | `yarn test:integration:canonical-db-evidence` |
 | MariaDB video query protocol proof | `yarn test:integration:mariadb-video-queries` |
+| MariaDB admin-search collation proof | `yarn test:integration:mariadb-collation-search` |
 
 They run under `APP_ENV=test` with `DOTENV_CONFIG_PATH=.env.test`, and are
 guarded by `scripts/safety/assert-destructive-test-database.ts`, which refuses to
@@ -118,6 +119,21 @@ yarn docker:mariadb-test:up
 yarn docker:mariadb-test:down
 ```
 
+The collation proof needs its own container, because
+`docker-compose.mariadb-test.yml` pins
+`--collation-server=utf8mb4_unicode_ci` - which makes the server default match
+the schema contract and hides every host-dependent collation behaviour. The
+second compose file deliberately does **not** pin it, so a stock managed host is
+reproducible. Keep both.
+
+```bash
+yarn docker:mariadb-collation-test:up
+```
+
+```bash
+yarn docker:mariadb-collation-test:down
+```
+
 ## 6. Audit, smoke and diagnostic scripts
 
 Read-only or local-only; useful when investigating rather than testing.
@@ -128,6 +144,7 @@ Read-only or local-only; useful when investigating rather than testing.
 | Admin account audit | `yarn audit:admin-accounts` |
 | Canonical share-link audit (local) | `yarn audit:canonical-share-links` |
 | Admin video query isolation | `yarn diagnose:admin-video-queries` |
+| Admin-search column collation audit (read-only, production-safe) | `yarn diagnose:admin-search-collation` |
 | Share-link assignment smoke (local) | `yarn smoke:local:share-link-assignment` |
 | Admin account smoke (local) | `yarn smoke:local:admin-accounts` |
 | Expired admin session cleanup | `yarn cleanup:admin-sessions` |

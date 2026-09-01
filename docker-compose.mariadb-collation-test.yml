@@ -1,0 +1,33 @@
+# Stock-collation MariaDB for the admin-search collation regression proof.
+#
+# Deliberately does NOT pass --collation-server. docker-compose.mariadb-test.yml
+# pins `--collation-server=utf8mb4_unicode_ci`, which makes the server default
+# match the schema's declared column collation and therefore hides every
+# host-dependent collation behaviour. Managed hosts do not do that: stock
+# MariaDB 11.8 defaults to utf8mb4_uca1400_ai_ci while the migrations declare
+# utf8mb4_unicode_ci. Keep both harnesses.
+services:
+  mariadb-collation-test:
+    image: mariadb:11.8.8
+    container_name: bom_media_api_mariadb_collation_test
+    restart: "no"
+    command:
+      - --max-allowed-packet=256M
+    environment:
+      MARIADB_ROOT_PASSWORD: bom_media_root_collation_test
+      MARIADB_DATABASE: video_share_cms_collation_test
+      MARIADB_USER: bom_media_collation
+      MARIADB_PASSWORD: bom_media_collation
+      TZ: UTC
+    ports:
+      - "3312:3306"
+    volumes:
+      - bom_media_api_mariadb_collation_test_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  bom_media_api_mariadb_collation_test_data:

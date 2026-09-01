@@ -315,3 +315,242 @@ FROM _prisma_migrations ORDER BY started_at;
 If a migration row is present but its column/table is missing physically →
 `SCHEMA_DRIFT = PROVEN`; prepare a reviewed additive repair after backup. Do
 not ALTER/`db push`/reset directly.
+
+---
+
+## 17. 2026-09-01 — mechanism identified, connection/protocol hypotheses eliminated
+
+Status of this section: **failure class REPRODUCED and mutation-proven. The
+specific production instance is NOT yet identified, because production has been
+discarding the one field that identifies it.**
+
+### 17.1 What was reproduced
+
+`col LIKE CONCAT('%', ?, '%')` — the exact SQL Prisma 7 emits for `contains`,
+re-confirmed by capturing the generated statements — raises MariaDB **1267 /
+HY000** when **the bound term's character repertoire cannot be converted into
+the searched COLUMN's character set**. Reproduced end to end through Prisma 7 +
+`@prisma/adapter-mariadb` 7.8.0 + `mariadb` 3.4.5, with the safe error context
+reporting exactly the production shape:
+
+```
+Illegal mix of collations (utf8mb3_general_ci,IMPLICIT)
+                      and (utf8mb4_unicode_ci,COERCIBLE) for operation 'like'
+```
+
+Note the derivations: the column is **IMPLICIT**, the CONCAT expression is
+**COERCIBLE**. MySQL/MariaDB normally coerce the COERCIBLE side to the column's
+collation; that coercion is what fails when the value cannot be represented in
+the column's charset.
+
+### 17.2 What was ELIMINATED, experimentally
+
+Each of these was previously listed as POSSIBLE. All are now RULED_OUT, by
+executable matrices rather than reasoning:
+
+| Hypothesis | How it was eliminated |
+| --- | --- |
+| Connection/session collation mismatch causes 1267 | 294-case matrix over {`utf8mb4_unicode_ci`, `utf8mb4_general_ci`, `utf8mb4_uca1400_ai_ci`} connections × 7 column collations × 7 term shapes × both protocols. **Zero** failures attributable to the connection collation |
+| Some other `character_set_connection` triggers it | Swept **all 40 server character sets** as `character_set_connection` against a `utf8mb4_unicode_ci` column with an ASCII term: **0** failures (the only errors were Node-side "Encoding not recognized" for `dec8`/`swe7`/`ujis` etc., which never reach the server) |
+| `character_set_client = binary`, `SET NAMES binary`, client≠connection charset | All tested explicitly. No 1267 |
+| Binary (prepared) protocol is at fault | `useTextProtocol` **false and true fail identically** on the reproducing case, and both succeed on every non-reproducing case. The protocol is irrelevant to this error class |
+| MariaDB version behaviour | Same matrices on **10.6.28, 10.11.19, 11.8.8** and **MySQL 8.0.46**. Identical outcomes |
+| Migration-induced schema drift on a fresh database | `prisma migrate deploy` of all 19 migrations onto a **stock** MariaDB 11.8.8 (server default `utf8mb4_uca1400_ai_ci`) converges **all 22 tables and all 123 searchable string columns** to `utf8mb4` / `utf8mb4_unicode_ci`. Fresh databases are correct |
+
+**Consequence for `DB_MARIADB_USE_TEXT_PROTOCOL`: it is neither the cause nor a
+mitigation for this error class.** Classify it `MITIGATION_ONLY` for other
+purposes and leave it at `false`. Flipping it would not have fixed this.
+
+### 17.3 The one case that cannot be reproduced, and why it matters
+
+**An ASCII search term such as `Surprised` never produces 1267** — not on any
+column charset, connection collation, protocol or server version tested. ASCII
+converts into every charset MariaDB supports.
+
+So a production 1267 on `search=Surprised` requires at least one of:
+
+1. the bound term was not pure ASCII (the console is Vietnamese, and
+   `mimeType startsWith "video/"` in `getPlayableVideoWhereInput()` puts a LIKE
+   into assignment-options **with no user search at all**); or
+2. a searched column in the production database is not `utf8mb4`.
+
+Both point at the same root class and the same corrective action. Neither can be
+confirmed from here — which is the actual blocker, and it is a code defect:
+
+### 17.4 The observability defect that kept this open
+
+`parseMariaDbCollationConflict()` has existed since `d7cb5e1` and correctly
+extracts the two collation/coercibility pairs and the operation token. It was
+wired **only** into the opt-in post-`listen()` probe — **never into the request
+error path**. `toSafeDatabaseErrorContext()`, which `GlobalExceptionFilter`
+actually calls, did not use it, and `1267` had no entry in
+`CATEGORY_BY_MYSQL_CODE`.
+
+Every production 500 therefore logged `errorName`, `originalCode`, `code` and
+`sqlState` — and threw away the message naming the two collations. That is why
+this incident has read "exact collation/coercibility pair NOT_VERIFIED" since
+2026-07-20.
+
+**Fixed.** The parser is now called from `toSafeDatabaseErrorContext()` on both
+the top-level `DriverAdapterError` shape and the
+`meta.driverAdapterError.cause` shape, and `1267` maps to the
+`COLLATION_CONFLICT` category. Output stays bounded and allowlisted: five short
+tokens, no SQL, no query arguments, no values, no connection identity.
+
+Mutation-proven: removing the wiring makes 3 unit tests and both
+`COLLATION-04` integration checks fail with `category=DRIVER_ADAPTER`,
+`pair=undefined` — **byte-identical to what production reports today**, which is
+independent evidence that production is running the unfixed path.
+
+### 17.5 Why the previous local harness could never see any of this
+
+`docker-compose.mariadb-test.yml` pins `--collation-server=utf8mb4_unicode_ci`,
+making the server default match the schema contract and hiding every
+host-dependent collation behaviour. `docker-compose.mariadb-collation-test.yml`
+was added alongside it (port 3312, **no** pinned collation) so the stock-host
+condition is reproducible. Both harnesses are kept.
+
+### 17.6 Operator next step — read-only, safe on production
+
+```bash
+yarn diagnose:admin-search-collation
+```
+
+`SELECT`-only against `information_schema` and session variables. Reads no row
+data, writes nothing, prints no credential, host, user or `DATABASE_URL`. It
+reports the charset/collation of every column reachable from an Admin search
+input and names any that drifted from the contract. Exit `0` = clean, `1` =
+drift found, `2` = audit failed.
+
+Run it, then either:
+
+- **drift reported** → the named columns are the cause. Prepare a narrowly
+  scoped forward migration converting exactly those columns to
+  `utf8mb4 / utf8mb4_unicode_ci`. Do not write that migration before this output
+  exists, and do not `CONVERT TO CHARACTER SET` whole tables blind.
+- **no drift reported** → deploy the observability fix and capture one real
+  failure. The log line will now carry `databaseCategory: "COLLATION_CONFLICT"`
+  and `collationConflict: { leftCollation, leftCoercibility, rightCollation,
+  rightCoercibility, operation }`, request-correlated by `x-request-id`.
+
+### 17.7 What was deliberately NOT changed
+
+- **No connection `charset`/`collation` was pinned in the adapter.** It would
+  not fix the reproduced class (proven in 17.2) and shipping it would be a
+  speculative change to the shared database layer.
+- **No migration was written.** There is no evidence yet of which production
+  columns, if any, drifted.
+- **No search behaviour was altered.** Normalization, NFC, trim, whitespace
+  collapse, min/max length, literal `%`/`_`/`\` escaping, title+slug OR,
+  `filterKey`, status, provider, sorting, pagination and cache keys are all
+  unchanged and are pinned by the new proof.
+- **`DB_MARIADB_USE_TEXT_PROTOCOL` was left at `false`.**
+
+---
+
+## 18. 2026-09-01 — RESOLVED. Root cause proven on production and fixed
+
+Status: **ROOT CAUSE PROVEN — FIX DEPLOYED — PRODUCTION VERIFIED.**
+
+### 18.1 Corrections to section 17
+
+Section 17 was written without production access and contains three conclusions
+that direct measurement has now falsified. They are corrected here rather than
+edited away, because the reasoning that produced them is instructive.
+
+| §17 claim | Corrected finding |
+| --- | --- |
+| "`DB_MARIADB_USE_TEXT_PROTOCOL` is neither cause nor mitigation" | **Wrong for this failure mode.** On production the binary protocol fails and the text protocol succeeds. §17 tested a *different* 1267 mode (charset-repertoire), where the protocol genuinely is irrelevant. Two distinct mechanisms produce the same error code |
+| "Connection/session collation mismatch is RULED_OUT" | **Wrong.** The real cause *is* a collation disagreement — but between the **SQL-text literal** and the **bound parameter**, not between the connection and the column |
+| "The parser exists but is wired only into the boot probe" | Described the local repo. The deployed build did contain the parser; it was `toSafeDatabaseErrorContext()` that never called it |
+
+An unrelated but material trap: `/health` reported
+`commit 0cc41e2, builtAt 2026-07-20`, which is **stale `APP_RELEASE_*` env**, not
+the running build. The deployed source is `1475610` (`last-source/.git`).
+Release identity from operator-set env must be corroborated against the build.
+
+### 18.2 Root cause
+
+`Hostinger MariaDB 11.8.8-log` assigns a **binary-protocol bound parameter** the
+legacy default collation `utf8mb4_general_ci`, instead of the session's
+`collation_connection`. SQL-text literals keep `collation_connection`
+(`utf8mb4_unicode_ci`, from the driver's handshake collation byte 224).
+
+Prisma compiles `contains` to `col LIKE CONCAT('%', ?, '%')`. Aggregating a
+`utf8mb4_unicode_ci` literal with a `utf8mb4_general_ci` parameter — same
+charset, different collation, equal derivation — yields **`utf8mb4_bin` with
+DERIVATION_NONE (1)**. NONE outranks the column's IMPLICIT (2), so the operand
+cannot be coerced and the server raises 1267.
+
+Measured on production versus a local MariaDB 11.8.8:
+
+| operand, binary protocol | local `11.8.8-ubu2404` | production `11.8.8-MariaDB-log` |
+| --- | --- | --- |
+| literal `'%'` | `utf8mb4_unicode_ci` (6) | `utf8mb4_unicode_ci` (6) |
+| **bound parameter `?`** | `utf8mb4_unicode_ci` (6) | **`utf8mb4_general_ci` (6)** |
+| `CONCAT('%', ?, '%')` | `utf8mb4_unicode_ci` (6) | **`utf8mb4_bin` (1 = NONE)** |
+
+The failure is **value-independent**: ASCII, Vietnamese and `video/` all fail
+identically, because the conflict is resolved at CONCAT aggregation before any
+value is compared. This is why `search=Surprised` failed even though §17 proved
+ASCII cannot trigger the charset-repertoire mode.
+
+### 18.3 What was ruled out, with production evidence
+
+- **Schema drift — RULED OUT.** All 11 searched columns, all 123 text columns,
+  all 22 tables and the database default are `utf8mb4 / utf8mb4_unicode_ci`.
+  Migrations 19/19 finished, 0 rolled back. **No migration was created.**
+- **Adapter `collation` option — INEFFECTIVE.** `UTF8MB4_UNICODE_CI`,
+  `UTF8MB4_GENERAL_CI` and `UTF8MB4_BIN` all leave `collation_connection`
+  unchanged and all still fail. The driver applies it as a handshake byte, not a
+  statement.
+- **`SET collation_connection = ...` alone — INEFFECTIVE.** Only the combined
+  `SET NAMES <charset> COLLATE <collation>` rebinds both sides.
+- **Driver/adapter/Prisma versions — IDENTICAL** to local (`mariadb` 3.4.5,
+  adapter/client/prisma 7.8.0). Not a version defect.
+- **Recent work — NOT THE CAUSE.** The search predicate, `schema.prisma` and
+  `prisma/migrations/` are unchanged since the July release. No search logic was
+  deleted.
+
+### 18.4 Fix
+
+`src/database/prisma.service.ts` — one option on the pooled connection:
+
+```ts
+initSql: `SET NAMES ${SCHEMA_CHARSET} COLLATE ${SCHEMA_COLLATION}`
+```
+
+derived from the schema contract in `prisma/migrations/`, never from a host
+default. It keeps the binary/prepared protocol, so prepared-statement injection
+guarantees, BigInt/date/BLOB handling, transactions and pooling are untouched.
+
+`DB_MARIADB_USE_TEXT_PROTOCOL` remains `false`. The text protocol also resolves
+the error and was verified data-safe (BigInt preserved, dates as `Date`,
+injection probe returned 0 rather than the full table), but it changes how
+statements reach the server and was therefore rejected in favour of correcting
+the session state.
+
+### 18.5 Observability fix
+
+`toSafeDatabaseErrorContext()` now calls the existing bounded parser and maps
+`1267 → COLLATION_CONFLICT`, so a future occurrence names both operands,
+request-correlated by `x-request-id`, with no SQL, values or secrets.
+
+### 18.6 Production verification
+
+Through the **deployed** `PrismaService`, `useTextProtocol=false`: video search
+(ASCII, Vietnamese, literal `%`, literal `_`), status+search, no-search,
+`mimeType startsWith` on both asset tables, websites, domains, domain groups and
+admin accounts — **all OK**. Runtime log after restart: 114 entries, **0 × 1267,
+0 error-level entries**, `stderr.log` 0 bytes.
+
+### 18.7 Why no local harness could reproduce it
+
+The behaviour is a property of the **server build**, not of configuration.
+`docker-compose.mariadb-test.yml` and `docker-compose.mariadb-collation-test.yml`
+were both confirmed to match production on `collation_server` and
+`character_set_collations` and still assign parameters the session collation
+correctly. No local MariaDB available here reproduces it. The invariant is
+therefore encoded as COLLATION-05/06/07 in the proof: session, parameter and
+`CONCAT` collation must all equal the schema contract and must never aggregate
+to a NONE derivation.

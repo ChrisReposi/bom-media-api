@@ -180,6 +180,110 @@ describe("safe database error context", () => {
     });
   });
 
+  // SEARCH-17: production 1267 observability. The bounded collation pair is the
+  // one piece of evidence that identifies which column/connection collations
+  // actually conflict; before this it was parsed only by the opt-in boot probe
+  // and discarded on the request path.
+  it("surfaces MariaDB 1267 as COLLATION_CONFLICT with the bounded collation pair", () => {
+    const error = Object.assign(new Error("wrapper"), {
+      name: "DriverAdapterError",
+      cause: {
+        kind: "mysql",
+        originalCode: "1267",
+        code: 1267,
+        state: "HY000",
+        originalMessage:
+          "Illegal mix of collations (utf8mb3_general_ci,IMPLICIT) and (utf8mb4_unicode_ci,COERCIBLE) for operation 'like'",
+        sql: SECRETS[3],
+        parameters: ["private value"],
+        host: "private-host",
+        user: "private-user",
+        password: SECRETS[1],
+      },
+    });
+
+    const context = toSafeDatabaseErrorContext(error);
+    assert.equal(context.errorName, "DriverAdapterError");
+    assert.equal(context.databaseCategory, "COLLATION_CONFLICT");
+    assert.deepEqual(context.collationConflict, {
+      leftCollation: "utf8mb3_general_ci",
+      leftCoercibility: "IMPLICIT",
+      rightCollation: "utf8mb4_unicode_ci",
+      rightCoercibility: "COERCIBLE",
+      operation: "like",
+    });
+    assert.equal(context.cause?.sqlState, "HY000");
+    assertNoSecrets(context);
+    const serialized = JSON.stringify(context);
+    for (const forbidden of [
+      "private-host",
+      "private-user",
+      "private value",
+      '"parameters"',
+      '"sql"',
+    ]) {
+      assert.ok(!serialized.includes(forbidden), `leaked: ${forbidden}`);
+    }
+  });
+
+  it("surfaces 1267 through the Prisma meta.driverAdapterError shape", () => {
+    const error = new Prisma.PrismaClientKnownRequestError("query failed", {
+      code: "P2010",
+      clientVersion: "7.8.0",
+      meta: {
+        modelName: "VideoAsset",
+        driverAdapterError: {
+          cause: {
+            kind: "mysql",
+            originalCode: "1267",
+            code: 1267,
+            state: "HY000",
+            originalMessage:
+              "Illegal mix of collations (latin1_swedish_ci,IMPLICIT) and (utf8mb4_unicode_ci,COERCIBLE) for operation 'like'",
+          },
+        },
+      },
+    });
+
+    const context = toSafeDatabaseErrorContext(error);
+    assert.equal(context.databaseCategory, "COLLATION_CONFLICT");
+    assert.equal(context.collationConflict?.leftCollation, "latin1_swedish_ci");
+    assert.equal(context.collationConflict?.operation, "like");
+    assertNoSecrets(context);
+  });
+
+  it("omits collationConflict for non-1267 drivers and unparseable 1267 messages", () => {
+    const otherCode = Object.assign(new Error("wrapper"), {
+      name: "DriverAdapterError",
+      cause: {
+        kind: "mysql",
+        originalCode: "1146",
+        code: 1146,
+        state: "42S02",
+        originalMessage:
+          "Illegal mix of collations (a_ci,IMPLICIT) and (b_ci,COERCIBLE) for operation 'like'",
+      },
+    });
+    const otherContext = toSafeDatabaseErrorContext(otherCode);
+    assert.equal(otherContext.databaseCategory, "MISSING_TABLE");
+    assert.equal(otherContext.collationConflict, undefined);
+
+    const unparseable = Object.assign(new Error("wrapper"), {
+      name: "DriverAdapterError",
+      cause: {
+        kind: "mysql",
+        originalCode: "1267",
+        code: 1267,
+        state: "HY000",
+        originalMessage: `Illegal mix of collations ${SECRETS[3]}`,
+      },
+    });
+    const unparseableContext = toSafeDatabaseErrorContext(unparseable);
+    assert.equal(unparseableContext.databaseCategory, "COLLATION_CONFLICT");
+    assert.equal(unparseableContext.collationConflict, undefined);
+    assertNoSecrets(unparseableContext);
+  });
+
   it("isPrismaError distinguishes Prisma errors from generic errors", () => {
     assert.equal(
       isPrismaError(

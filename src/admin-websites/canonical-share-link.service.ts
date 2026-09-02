@@ -27,6 +27,7 @@ import type { CreateShareLinkResponse } from "./types/admin-share-link-response.
 import type { CanonicalShareLinkResponse } from "./types/canonical-share-link-response.type";
 import {
   isShareLinkTokenOrAliasCollision,
+  isShareLinkTransportAliasCollision,
   isUniqueViolationOn,
 } from "./utils/share-link-errors.util";
 import {
@@ -36,10 +37,13 @@ import {
   type CanonicalPinBlocker,
 } from "./utils/canonical-adoption-policy.util";
 import {
+  buildCanonicalCompatibilityUrl,
   buildCanonicalPublicShareUrl,
   buildCanonicalReviewUrl,
   generateShareAlias,
   generateShareToken,
+  generateTransportAlias,
+  isWellFormedTransportAlias,
 } from "./utils/share-url.util";
 
 const CANONICAL_CREATE_MAX_ATTEMPTS = 5;
@@ -124,6 +128,11 @@ export const CANONICAL_AUDIT_ACTIONS = {
   create: "CANONICAL_SHARE_LINK_CREATE",
   autoAdopt: "CANONICAL_SHARE_LINK_AUTO_ADOPT",
   operatorAdopt: "CANONICAL_SHARE_LINK_ADOPT",
+  /**
+   * An existing canonical link received its email-safe transport alias after
+   * the fact. A credential-bearing write, so it is audited — with ids only.
+   */
+  transportAliasBackfill: "SHARE_LINK_TRANSPORT_ALIAS_BACKFILL",
 } as const;
 
 /**
@@ -271,6 +280,7 @@ export class CanonicalShareLinkService {
           : "Existing canonical share link reused.",
       shareLink: canonical.shareLink,
       publicUrl: canonical.reviewUrl,
+      compatibilityUrl: canonical.compatibilityUrl,
       outcome: canonical.outcome,
       isCanonical: true,
     };
@@ -353,11 +363,7 @@ export class CanonicalShareLinkService {
 
     const existing = await this.loadCanonical(websiteId, videoId);
     if (existing !== null) {
-      await this.assertReusable(existing, websiteId, videoId);
-      return this.toResponse(existing, {
-        outcome: "REUSED",
-        evidenceDrift: false,
-      });
+      return this.reuseCanonical(existing, websiteId, videoId, adminId);
     }
 
     const tokenPepper = this.configService
@@ -377,16 +383,15 @@ export class CanonicalShareLinkService {
         // instead of burning another Serializable transaction.
         const raced = await this.loadCanonical(websiteId, videoId);
         if (raced !== null) {
-          await this.assertReusable(raced, websiteId, videoId);
-          return this.toResponse(raced, {
-            outcome: "REUSED",
-            evidenceDrift: false,
-          });
+          return this.reuseCanonical(raced, websiteId, videoId, adminId);
         }
       }
 
       const transientToken = generateShareToken();
       const alias = generateShareAlias();
+      // The EMAIL-SAFE transport alias, minted in the same attempt so a
+      // collision on any unique column regenerates every credential.
+      const transportAlias = generateTransportAlias();
       const tokenHash = hashShareToken({
         token: transientToken,
         pepper: tokenPepper,
@@ -511,6 +516,7 @@ export class CanonicalShareLinkService {
                       websiteId,
                       tokenHash,
                       alias,
+                      transportAlias,
                       label: null,
                       expiresAt: null,
                       maxViews: null,
@@ -611,11 +617,7 @@ export class CanonicalShareLinkService {
           // runs here is the ordinary usability verdict, and its refusal is the
           // product behaviour: a pair whose link was revoked stays revoked, and
           // no replacement credential is ever minted for it.
-          await this.assertReusable(canonical, websiteId, videoId);
-          return this.toResponse(canonical, {
-            outcome: "REUSED",
-            evidenceDrift: false,
-          });
+          return this.reuseCanonical(canonical, websiteId, videoId, adminId);
         }
 
         return this.toResponse(canonical, {
@@ -626,11 +628,7 @@ export class CanonicalShareLinkService {
         if (this.isCanonicalPairConflict(error)) {
           const winner = await this.loadCanonical(websiteId, videoId);
           if (winner !== null) {
-            await this.assertReusable(winner, websiteId, videoId);
-            return this.toResponse(winner, {
-              outcome: "REUSED",
-              evidenceDrift: false,
-            });
+            return this.reuseCanonical(winner, websiteId, videoId, adminId);
           }
           continue;
         }
@@ -936,6 +934,169 @@ export class CanonicalShareLinkService {
       blocker,
       historicalCandidateCount,
     });
+  }
+
+  /**
+   * Every REUSED answer goes through here: the usability verdict first, then
+   * — only for a link that verdict admitted — the one-time transport-alias
+   * backfill, then the response.
+   *
+   * ORDER IS THE SAFETY PROPERTY. `assertReusable()` refuses a revoked,
+   * disabled, expired, limited, domain-drifted or evidence-drifted link, and
+   * it runs BEFORE any write. So "no auto-mint on invalid or revoked
+   * historical state" is not a separate rule to remember; it is the ordering.
+   */
+  private async reuseCanonical(
+    canonical: CanonicalWithRelations,
+    websiteId: string,
+    videoId: string,
+    adminId: string,
+  ): Promise<CanonicalShareLinkResponse> {
+    await this.assertReusable(canonical, websiteId, videoId);
+    const current = await this.ensureTransportAlias(
+      canonical,
+      websiteId,
+      videoId,
+      adminId,
+    );
+
+    return this.toResponse(current, {
+      outcome: "REUSED",
+      evidenceDrift: false,
+    });
+  }
+
+  /**
+   * Gives an existing canonical link its EMAIL-SAFE transport alias, once.
+   *
+   * Mappings committed before the column existed have none, and a canonical
+   * link is re-issued by pressing "Get link" — so the first time such a link
+   * is handed back WHILE USABLE, it is backfilled here. The write is a
+   * conditional `updateMany` on `{ id, transportAlias: null, status: ACTIVE }`:
+   * idempotent (a second call matches nothing), race-safe (two operators
+   * pressing at once produce one alias; the loser reloads the winner's), and
+   * guarded by status at write time as well as by `assertReusable()` before
+   * it, so a revoke that lands between the two changes nothing.
+   *
+   * NEVER rotates an existing value, never touches `alias`, `tokenHash`,
+   * membership, budget or expiry. A unique-violation on the new column is
+   * regenerated with fresh CSPRNG material; anything else is re-thrown.
+   */
+  private async ensureTransportAlias(
+    canonical: CanonicalWithRelations,
+    websiteId: string,
+    videoId: string,
+    adminId: string,
+  ): Promise<CanonicalWithRelations> {
+    if (
+      canonical.shareLink.transportAlias !== null &&
+      canonical.shareLink.transportAlias !== undefined
+    ) {
+      return canonical;
+    }
+
+    let claimed = false;
+
+    for (
+      let attempt = 1;
+      attempt <= CANONICAL_CREATE_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
+      try {
+        // THE GENERATED VALUE NEVER LEAVES THIS EXPRESSION. It is built inline
+        // into the write and is deliberately not held in a variable this
+        // method could return, so a response can only ever carry a value that
+        // is actually persisted — see the re-read below.
+        const result = await this.prisma.shareLink.updateMany({
+          where: {
+            id: canonical.shareLink.id,
+            transportAlias: null,
+            status: ShareLinkStatus.ACTIVE,
+          },
+          data: { transportAlias: generateTransportAlias() },
+        });
+        claimed = result.count === 1;
+        break;
+      } catch (error) {
+        if (!isShareLinkTransportAliasCollision(error)) {
+          throw error;
+        }
+        if (attempt < CANONICAL_CREATE_MAX_ATTEMPTS) {
+          continue;
+        }
+        // BOUNDED, AND NOT FATAL. At 128 bits this is unreachable in
+        // practice; if it ever happens, the canonical URL is the payload the
+        // operator asked for and an enhancement field must not fail the whole
+        // request. The re-read below then reports the truth: no transport
+        // alias is persisted, so `compatibilityUrl` is null.
+        this.logger.warn(
+          { shareLinkId: canonical.shareLink.id },
+          "Transport alias backfill exhausted its retries on unique collisions.",
+        );
+      }
+    }
+
+    // AUDITED BY THE WRITER ONLY. `count === 1` means this request performed
+    // the write, so exactly one backfill row exists however many requests
+    // raced. A loser writes nothing and audits nothing.
+    if (claimed) {
+      await this.writeTransportAliasBackfillAudit(
+        adminId,
+        canonical.shareLink.id,
+        websiteId,
+        videoId,
+      );
+    }
+
+    // AUTHORITATIVE RE-READ, ON EVERY PATH — winner, loser and exhausted
+    // alike. `count === 0` means someone else claimed it (or the row stopped
+    // being ACTIVE), and the only correct answer to "what is this pair's
+    // transport alias?" is the one the database now holds. Building the
+    // response from the locally generated value instead would hand a loser a
+    // string that was never persisted and that no reviewer could redeem.
+    const reloaded = await this.loadCanonical(websiteId, videoId);
+    if (reloaded === null) {
+      throw new NotFoundException({
+        message: "No canonical share link exists for this website and video.",
+        code: CANONICAL_ERROR_CODES.notFound,
+      });
+    }
+
+    return reloaded;
+  }
+
+  /**
+   * Best effort, like `AdminWebsitesService.writeAudit()`: a failed audit row
+   * must not withhold a URL the reviewer is entitled to. SAFE METADATA ONLY —
+   * ids, never the alias, the transport alias, a token or a hash.
+   */
+  private async writeTransportAliasBackfillAudit(
+    adminId: string,
+    shareLinkId: string,
+    websiteId: string,
+    videoId: string,
+  ): Promise<void> {
+    try {
+      await this.prisma.adminAuditLog.create({
+        data: {
+          adminId,
+          action: CANONICAL_AUDIT_ACTIONS.transportAliasBackfill,
+          module: "admin-websites",
+          entityType: "ShareLink",
+          entityId: shareLinkId,
+          status: AuditStatus.SUCCESS,
+          metadataJson: { websiteId, videoId, shareLinkId },
+        },
+      });
+    } catch (error) {
+      this.logger.warn(
+        {
+          shareLinkId,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        },
+        "Transport alias backfill audit write failed.",
+      );
+    }
   }
 
   private async loadCanonical(
@@ -1343,6 +1504,71 @@ export class CanonicalShareLinkService {
     );
   }
 
+  /**
+   * MAY THIS PAIR BE HANDED AN EMAIL-SAFE URL?
+   *
+   * The complete eligibility predicate for `compatibilityUrl`, in one place.
+   * Every clause is a separate reason to withhold, and all must hold:
+   *
+   *   1. the reviewer frontend at the SNAPSHOT host can redeem `?r=`
+   *      (`PUBLIC_COMPATIBILITY_URL_HOSTS`; every frontend redeems `#k=`,
+   *      only some redeem the query form);
+   *   2. a well-formed transport alias is actually PERSISTED on the row —
+   *      never a value this process generated but did not store;
+   *   3. the link is ACTIVE;
+   *   4. it carries NO `expiresAt` and NO `maxViews`. This is the scope
+   *      restriction that keeps the feature safe: the compatibility exchange
+   *      consumes one view exactly as the V2 exchange does, so a
+   *      JavaScript-executing mail security scanner could spend a BUDGETED
+   *      link before the reviewer opened it. A canonical link is unbudgeted
+   *      by construction, so the same scanner spends nothing that matters;
+   *   5. its membership is EXACTLY the one video this mapping names — a
+   *      multi-video link is a bundle whatever a mapping says about it, and
+   *      a bundle is out of scope for this release;
+   *   6. it belongs to the website this mapping names.
+   *
+   * Clauses 3-6 duplicate checks `assertReusable()` also makes, and that
+   * duplication is deliberate: `assertReusable()` decides whether a URL may
+   * be RETURNED AT ALL on the write path, while this decides whether the
+   * NEW field may be emitted on any path. `getCanonical()` runs the second
+   * without the first.
+   */
+  private isCompatibilityUrlEligible(
+    canonical: CanonicalWithRelations,
+  ): boolean {
+    const link = canonical.shareLink;
+
+    if (
+      !this.adminWebsitesService.supportsCompatibilityUrl(
+        canonical.canonicalHostSnapshot,
+      )
+    ) {
+      return false;
+    }
+
+    if (!isWellFormedTransportAlias(link.transportAlias)) {
+      return false;
+    }
+
+    if (link.status !== ShareLinkStatus.ACTIVE) {
+      return false;
+    }
+
+    if (link.expiresAt !== null || link.maxViews !== null) {
+      return false;
+    }
+
+    if (link.websiteId !== canonical.websiteId) {
+      return false;
+    }
+
+    const memberVideoIds = link.shareLinkVideos.map((row) => row.videoId);
+
+    return (
+      memberVideoIds.length === 1 && memberVideoIds[0] === canonical.videoId
+    );
+  }
+
   private toResponse(
     canonical: CanonicalWithRelations,
     options: {
@@ -1360,6 +1586,20 @@ export class CanonicalShareLinkService {
       alias: canonical.shareLink.alias ?? "",
       protocol: canonical.canonicalProtocol,
     });
+    // THE ONE EMISSION SITE, AND THE ONE ELIGIBILITY PREDICATE.
+    //
+    // `isCompatibilityUrlEligible()` is evaluated HERE rather than trusted
+    // from a caller, because `getCanonical()` — the read endpoint — reaches
+    // this method WITHOUT `assertReusable()`, so a guard that lived in the
+    // caller would simply not run on that path. Answering the question at the
+    // point of emission makes it hold for every caller, present and future.
+    const compatibilityUrl = this.isCompatibilityUrlEligible(canonical)
+      ? buildCanonicalCompatibilityUrl({
+          host: canonical.canonicalHostSnapshot,
+          transportAlias: canonical.shareLink.transportAlias as string,
+          protocol: canonical.canonicalProtocol,
+        })
+      : null;
 
     return {
       message:
@@ -1375,9 +1615,11 @@ export class CanonicalShareLinkService {
       shareLink: this.adminWebsitesService.toShareLinkResponse(
         canonical.shareLink,
         reviewUrl,
+        compatibilityUrl,
       ),
       publicUrl,
       reviewUrl,
+      compatibilityUrl,
       alias: canonical.shareLink.alias ?? "",
       evidenceSnapshot:
         (canonical.evidenceSnapshotJson as CanonicalEvidenceSnapshot | null) ??

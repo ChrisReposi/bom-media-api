@@ -77,9 +77,13 @@ function bunnyCandidate(overrides: CandidateOverrides = {}) {
 function createHarness(options: {
   preflightVideos: unknown[];
   transactionVideos?: unknown[];
+  /** Value of PUBLIC_COMPATIBILITY_URL_HOSTS for this harness. */
+  compatibilityHosts?: string;
 }) {
   let transactionCalls = 0;
   let shareLinkCreateCalls = 0;
+  /** Every `data` payload the bundle path handed to shareLink.create. */
+  const createdShareLinkData: Record<string, unknown>[] = [];
   let shareLinkVideoCreateCalls = 0;
   let videoQueryCalls = 0;
   const createdAt = new Date("2026-07-16T00:00:00.000Z");
@@ -117,8 +121,9 @@ function createHarness(options: {
           },
         },
         shareLink: {
-          create: async () => {
+          create: async (args: { data: Record<string, unknown> }) => {
             shareLinkCreateCalls += 1;
+            createdShareLinkData.push(args.data);
             return { id: "share-1" };
           },
           findUniqueOrThrow: async () => ({
@@ -153,8 +158,16 @@ function createHarness(options: {
     },
   };
   const config = {
-    get: (key: string) =>
-      key === "SHARE_TOKEN_PEPPER" ? "test-share-pepper" : undefined,
+    get: (key: string) => {
+      if (key === "SHARE_TOKEN_PEPPER") return "test-share-pepper";
+      /* The reviewer-frontend capability allowlist. Undefined by default, so
+         every existing assertion in this suite runs against the fail-closed
+         state the feature ships in. */
+      if (key === "PUBLIC_COMPATIBILITY_URL_HOSTS") {
+        return options.compatibilityHosts;
+      }
+      return undefined;
+    },
   };
   const service = new AdminWebsitesService(
     prisma as never,
@@ -164,6 +177,7 @@ function createHarness(options: {
 
   return {
     service,
+    createdShareLinkData,
     counts: () => ({
       transactionCalls,
       shareLinkCreateCalls,
@@ -547,5 +561,138 @@ describe("share links accept Bunny-backed videos", () => {
 
     assert.equal(typeof result.rawToken, "string");
     assert.equal(harness.counts().shareLinkVideoCreateCalls, 3);
+  });
+});
+
+/**
+ * A BUNDLE NEVER RECEIVES AN EMAIL-SAFE URL, AND NEVER MINTS THE CREDENTIAL.
+ *
+ * The email-safe form is CANONICAL SINGLE-VIDEO ONLY in this release. The
+ * compatibility exchange consumes one `currentViews` exactly as the V2
+ * exchange does, and a bundle link may carry `maxViews` — so a
+ * JavaScript-executing mail security scanner could spend a limited bundle's
+ * budget before the reviewer ever opened it. A canonical link cannot be
+ * budgeted or expired by construction, so the same scanner spends nothing
+ * that matters.
+ *
+ * These run against the REAL `AdminWebsitesService`, and they assert the
+ * stronger property: not merely that the URL is withheld, but that no
+ * alternate bearer credential is written to the row at all.
+ */
+describe("share-link bundle is excluded from the email-safe URL", () => {
+  const bundleVideos = () => [candidate(), candidate({ id: "video-2" })];
+
+  it("emits nothing and mints no transport alias for an UNLIMITED bundle", async () => {
+    const harness = createHarness({ preflightVideos: bundleVideos() });
+
+    const result = await harness.service.createShareLink(
+      "website-1",
+      { videoIds: ["video-1", "video-2"] },
+      "admin-1",
+    );
+
+    assert.equal(result.compatibilityUrl, null);
+    assert.equal(result.shareLink.compatibilityUrl, null);
+    // NOTHING was written to the row: no unused credential at rest.
+    assert.equal(harness.createdShareLinkData.length, 1);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(
+        harness.createdShareLinkData[0] ?? {},
+        "transportAlias",
+      ),
+      false,
+    );
+    // The fragment URL is untouched and is still the operator's link.
+    // (Asserted by SHAPE: this harness's `findUniqueOrThrow` stub returns a
+    // fixed alias, while the URL carries the freshly generated one.)
+    assert.match(
+      result.publicUrl ?? "",
+      /^https:\/\/public\.example\/watch#k=[A-Za-z0-9_-]{16}$/,
+    );
+  });
+
+  it("emits nothing for a VIEW-LIMITED bundle — the case the restriction exists for", async () => {
+    const harness = createHarness({ preflightVideos: bundleVideos() });
+
+    const result = await harness.service.createShareLink(
+      "website-1",
+      { videoIds: ["video-1", "video-2"], maxViews: 3 },
+      "admin-1",
+    );
+
+    assert.equal(result.compatibilityUrl, null);
+    assert.equal(result.shareLink.compatibilityUrl, null);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(
+        harness.createdShareLinkData[0] ?? {},
+        "transportAlias",
+      ),
+      false,
+    );
+    // The budget really was requested, so this is the limited case.
+    assert.equal(harness.createdShareLinkData[0]?.maxViews, 3);
+  });
+
+  it("emits nothing for an EXPIRING bundle", async () => {
+    const harness = createHarness({ preflightVideos: bundleVideos() });
+
+    const result = await harness.service.createShareLink(
+      "website-1",
+      {
+        videoIds: ["video-1", "video-2"],
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      },
+      "admin-1",
+    );
+
+    assert.equal(result.compatibilityUrl, null);
+    assert.notEqual(harness.createdShareLinkData[0]?.expiresAt, null);
+  });
+
+  it("emits nothing EVEN WHEN this host is declared compatible", async () => {
+    // The host allowlist is a FRONTEND-capability gate, not a licence. Scope
+    // is decided separately and independently: declaring the host must not
+    // widen the email-safe URL to bundles.
+    const harness = createHarness({
+      preflightVideos: bundleVideos(),
+      compatibilityHosts: "public.example",
+    });
+
+    const result = await harness.service.createShareLink(
+      "website-1",
+      { videoIds: ["video-1", "video-2"], maxViews: 3 },
+      "admin-1",
+    );
+
+    assert.equal(result.compatibilityUrl, null);
+    assert.equal(result.shareLink.compatibilityUrl, null);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(
+        harness.createdShareLinkData[0] ?? {},
+        "transportAlias",
+      ),
+      false,
+    );
+  });
+
+  it("leaves the historical bundle contract completely unchanged", async () => {
+    const harness = createHarness({ preflightVideos: bundleVideos() });
+
+    const result = await harness.service.createShareLink(
+      "website-1",
+      { videoIds: ["video-1", "video-2"] },
+      "admin-1",
+    );
+
+    // Everything a pre-2026-09-02 client depended on is still here.
+    assert.equal(typeof result.rawToken, "string");
+    assert.ok((result.rawToken ?? "").length > 0);
+    assert.equal(result.outcome, "CREATED");
+    assert.equal(result.isCanonical, false);
+    assert.match(
+      result.publicUrl ?? "",
+      /^https:\/\/public\.example\/watch#k=/,
+    );
+    assert.equal(result.shareLink.videos[0]?.videoId, "video-1");
   });
 });

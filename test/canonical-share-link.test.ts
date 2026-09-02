@@ -189,6 +189,27 @@ class FakePrisma {
       const link = this.shareLinks.get(args.where.id);
       return link ? this.withVideos(link) : null;
     },
+    /** The transport-alias backfill: one ACTIVE row by id, only while unset. */
+    updateMany: async (args: {
+      where: { id: string; transportAlias?: null; status?: string };
+      data: { transportAlias?: string };
+    }): Promise<{ count: number }> => {
+      const link = this.shareLinks.get(args.where.id) as
+        | (FakeShareLink & { transportAlias?: string | null })
+        | undefined;
+      if (
+        !link ||
+        ("transportAlias" in args.where &&
+          (link.transportAlias ?? null) !== null) ||
+        (args.where.status !== undefined && link.status !== args.where.status)
+      ) {
+        return { count: 0 };
+      }
+      if (args.data.transportAlias !== undefined) {
+        link.transportAlias = args.data.transportAlias;
+      }
+      return { count: 1 };
+    },
     /**
      * Models ONLY the predicates the production query actually sends, each
      * applied only when present. Dropping one from the service therefore
@@ -433,6 +454,12 @@ function createService(options?: { eligibilityError?: Error }) {
       }
     },
     getConfiguredPublicSiteProtocol: () => undefined,
+    /* The reviewer-frontend capability gate. These fixtures use
+       public.example as the canonical host and declare it supported, so the
+       compatibility URL is exercised rather than gated out of every
+       assertion in this suite. */
+    supportsCompatibilityUrl: (domain: string | null) =>
+      domain === "public.example",
     toShareLinkResponse: (
       link: FakeShareLink & { shareLinkVideos: { videoId: string }[] },
       publicUrl: string | null,

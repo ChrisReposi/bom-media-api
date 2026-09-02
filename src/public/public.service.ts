@@ -20,6 +20,10 @@ import {
   hashCacheKeyPart,
 } from "../cache/memory-cache-key.util";
 import { MemoryCacheService } from "../cache/memory-cache.service";
+import {
+  isCompatibilityCapableHost,
+  isWellFormedTransportAlias,
+} from "../admin-websites/utils/share-url.util";
 import { PrismaService } from "../database/prisma.service";
 import { Prisma } from "../generated/prisma/client";
 import {
@@ -43,6 +47,7 @@ import { VideoViewGrowthService } from "../videos/video-view-growth.service";
 import { PublicMediaGrantService } from "./public-media-grant.service";
 import {
   hashIpAddress,
+  sanitizeAccessLogReferer,
   truncateAccessLogValue,
   truncateDomain,
   truncateReasonCode,
@@ -84,6 +89,12 @@ type PublicWatchRequestMeta = {
 type ResolvePublicWatchParams = {
   host: string;
   token?: string;
+  requestMeta?: PublicWatchRequestMeta | undefined;
+};
+
+type ResolvePublicWatchCompatibleParams = {
+  host: string;
+  alias: string;
   requestMeta?: PublicWatchRequestMeta | undefined;
 };
 
@@ -235,6 +246,136 @@ export class PublicService {
     }
 
     return this.resolvePublicWatchUncached(params);
+  }
+
+  /**
+   * THE EMAIL-SAFE COMPATIBILITY EXCHANGE.
+   *
+   * `alias` here is the TRANSPORT alias from `/watch?r=<transportAlias>` — a
+   * separate 128-bit identifier, and an ALTERNATE BEARER CREDENTIAL for the
+   * same ShareLink. It is never the `#k` credential, and it is never harmless:
+   * whoever holds one gets in here. This method does exactly one new thing:
+   * it maps that identifier to a ShareLink row and
+   * hands the row's OWN `alias` to `resolvePublicWatch()`. Everything that
+   * decides whether the reviewer gets in then runs unmodified — host → ACTIVE
+   * domain → ACTIVE website → ShareLink WITHIN that website → status, expiry,
+   * `maxViews` → membership ∩ ACTIVE assignment → READY/playable → the atomic
+   * view claim → access log → the same media URLs and grants.
+   *
+   * WHAT THAT BUYS, AND WHAT IT DELIBERATELY DOES NOT.
+   *
+   * - One authority. There is no second resolver to drift from the first,
+   *   and no rule the `#k` path enforces that this path can skip: the website
+   *   scope in particular is re-imposed by the resolver's own
+   *   `findFirst({ alias, websiteId })`, so a transport alias for website A
+   *   presented on website B's host is refused there, not here.
+   * - Parity, not privilege. A successful call consumes one view exactly as
+   *   the `#k` exchange does. A denied call consumes nothing.
+   * - No fallback. The value handed to the resolver is a share alias (7 or 16
+   *   characters); a raw token is `s_` + 43, so the resolver's token-hash
+   *   branch can never match some other row.
+   * - Disjoint credentials. The transport alias is refused by the V2 resolver
+   *   (it matches no `alias` and hashes to no `tokenHash`), and a `#k`
+   *   credential is refused here by shape before any read.
+   *
+   * The media URLs in the response carry the ShareLink's alias, as they do for
+   * the `#k` exchange, so every downstream route is untouched — and the
+   * transport alias itself reaches no part of the response.
+   */
+  async resolvePublicWatchCompatible(
+    params: ResolvePublicWatchCompatibleParams,
+  ): Promise<PublicWatchResponse> {
+    const normalizedHost = normalizePublicHost(params.host);
+
+    if (normalizedHost === null) {
+      await this.writeAccessLog({
+        reasonCode: "MISSING_HOST",
+        status: AccessLogStatus.DENIED,
+        requestMeta: params.requestMeta,
+      });
+
+      return this.invalidResponse("MISSING_HOST");
+    }
+
+    // CAPABILITY BEFORE CREDENTIAL. `PUBLIC_COMPATIBILITY_URL_HOSTS` gates
+    // REDEMPTION here as well as emission in the Admin, through the one
+    // shared predicate — neither side re-implements the host rule.
+    //
+    // THIS IS WHAT MAKES THE ALLOWLIST A KILL SWITCH. Gating emission alone
+    // would mean clearing the variable stops new URLs being minted while
+    // every URL already sitting in a reviewer's inbox keeps working, because
+    // a transport alias is a BEARER CREDENTIAL and nothing about it expires.
+    // An operator clearing the variable during an incident will believe they
+    // have closed the alternate surface; with emission-only gating they would
+    // be wrong, and would find out only by reading this method. Now the
+    // belief is correct: clear the variable, restart, and every `?r=` link
+    // for that host stops resolving at once — while every `#k` link keeps
+    // working, which is the point of having a separate lever.
+    //
+    // It runs BEFORE the shape check and therefore before any credential is
+    // examined or read: a host that may not redeem never has its presented
+    // secret looked at, let alone queried. The denial is the same generic
+    // `INVALID_LINK` every other refusal on this path returns.
+    //
+    // This is NOT a substitute for revocation. It suspends a whole host's
+    // alternate surface; it does not invalidate an individual credential.
+    // Restore the host and every previously-issued alias redeems again.
+    // Revoking the ShareLink is still the only way to kill one for good.
+    if (
+      !isCompatibilityCapableHost(
+        normalizedHost,
+        this.configService.get<string>("PUBLIC_COMPATIBILITY_URL_HOSTS"),
+      )
+    ) {
+      await this.writeAccessLog({
+        domain: normalizedHost,
+        reasonCode: "INVALID_LINK",
+        status: AccessLogStatus.DENIED,
+        requestMeta: params.requestMeta,
+      });
+
+      return this.invalidResponse("INVALID_LINK");
+    }
+
+    // SHAPE BEFORE STORAGE. Exactly the minted form — no trim, no decode — so
+    // garbage costs no query and a `#k` credential can never be looked up
+    // as a transport alias.
+    if (!isWellFormedTransportAlias(params.alias)) {
+      await this.writeAccessLog({
+        domain: normalizedHost,
+        reasonCode: "INVALID_LINK",
+        status: AccessLogStatus.DENIED,
+        requestMeta: params.requestMeta,
+      });
+
+      return this.invalidResponse("INVALID_LINK");
+    }
+
+    const row = await this.prisma.shareLink.findUnique({
+      where: { transportAlias: params.alias },
+      select: { alias: true },
+    });
+    const shareAlias = row?.alias?.trim();
+
+    // Unknown transport alias, or a row that cannot be re-entered into the V2
+    // resolver by its own alias: the same generic denial, and nothing else
+    // is tried. Never the token hash, never another row.
+    if (!shareAlias) {
+      await this.writeAccessLog({
+        domain: normalizedHost,
+        reasonCode: "INVALID_LINK",
+        status: AccessLogStatus.DENIED,
+        requestMeta: params.requestMeta,
+      });
+
+      return this.invalidResponse("INVALID_LINK");
+    }
+
+    return this.resolvePublicWatch({
+      host: params.host,
+      token: shareAlias,
+      requestMeta: params.requestMeta,
+    });
   }
 
   private async resolvePublicWatchUncached(
@@ -2212,12 +2353,13 @@ export class PublicService {
                 ),
               }
             : {}),
-          ...(truncateAccessLogValue(params.requestMeta?.referer, 2048)
+          // QUERY AND FRAGMENT STRIPPED. A referer can carry a share
+          // credential — `/watch?r=<transportAlias>` and the V1
+          // `/?token=<rawToken>` both do — and this row outlives the link.
+          // See `sanitizeAccessLogReferer()`.
+          ...(sanitizeAccessLogReferer(params.requestMeta?.referer)
             ? {
-                referer: truncateAccessLogValue(
-                  params.requestMeta?.referer,
-                  2048,
-                ),
+                referer: sanitizeAccessLogReferer(params.requestMeta?.referer),
               }
             : {}),
         },

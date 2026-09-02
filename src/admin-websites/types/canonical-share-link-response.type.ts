@@ -35,6 +35,14 @@ export class CanonicalShareLinkResponse {
   })
   reviewUrl!: string;
 
+  @ApiPropertyOptional({
+    nullable: true,
+    example: "https://plushcomedystudios.com/watch?r=cOmPaTtRaNsPoRt_0123ab",
+    description:
+      "The email-safe reviewer URL for the same canonical link, built from the same snapshotted host. Null until the link has been issued while usable at least once since the transport alias was introduced.",
+  })
+  compatibilityUrl!: string | null;
+
   @ApiProperty({ example: "G3tqak0" })
   alias!: string;
 

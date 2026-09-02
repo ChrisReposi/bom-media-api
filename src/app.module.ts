@@ -62,6 +62,20 @@ export function serializeRequestForLogs(
             "res.headers.set-cookie",
             "req.query.token",
             "req.query.grant",
+            // BEARER CREDENTIALS IN A REQUEST BODY. The public watch
+            // exchanges take a credential in the BODY, not the query:
+            // `{host, token}` for the `#k` form and `{host, alias}` for the
+            // email-safe form, whose `alias` is the transport alias — an
+            // ALTERNATE bearer credential for the same ShareLink.
+            //
+            // `serializeRequestForLogs` already emits only `id`, `method` and
+            // a route TEMPLATE, so no body or query reaches a log line today.
+            // These paths are the second layer: if a body serializer is ever
+            // added, the credentials are already named as things to censor
+            // rather than being discovered later in a log file.
+            "req.body.token",
+            "req.body.alias",
+            "req.query.r",
           ],
           censor: "[Redacted]",
         },

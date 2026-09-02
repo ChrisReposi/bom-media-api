@@ -44,8 +44,8 @@ SPA). Public websites are display-only and hold no admin capability.
 | `src/cache/`          | Process-local in-memory cache                                                                          |
 | `src/config/`         | Env loading, `registerAs("api")` config, strict env validation                                         |
 | `src/common/`         | Global exception filter, request-security utils, MariaDB diagnostics                                   |
-| `prisma/`             | `schema.prisma`, 19 migrations, seed                                                                   |
-| `test/`               | 28 `node:test` suites (no DB required)                                                                 |
+| `prisma/`             | `schema.prisma`, 20 migrations, seed                                                                   |
+| `test/`               | `node:test` suites (no DB required)                                                                    |
 | `scripts/`            | Audits, diagnostics, remediation, smoke, DB-backed integration proofs                                  |
 | `docs/`               | Authoritative documentation (see below)                                                                |
 
@@ -100,6 +100,15 @@ yarn install --frozen-lockfile
   revokes the whole session (`ADMIN_REFRESH_REPLAY`).
 - Share tokens and refresh tokens exist in the database only as peppered
   SHA-256 hashes. The raw share token is returned exactly once, at creation.
+- `ShareLink.transportAlias` (2026-09-02) is the email-safe `?r=` carrier and
+  an **ALTERNATE BEARER CREDENTIAL**: a separate 128-bit identifier resolved
+  only by `POST /public/watch/exchange-compatible`, into the row's own `alias`
+  and then the unmodified public chain. Holding one reaches that ShareLink, so
+  redact it exactly as you redact `alias` — never log it, never put it in
+  `AccessLog`, never echo it in an error. It creates no second authorization
+  model (no permissions, budget or status of its own) and it is a credential
+  nowhere else: every other route refuses it. Minted only for canonical
+  single-video links.
 - Public watch requires: `ACTIVE` domain → `ACTIVE` website → `ACTIVE` share
   link (not expired, under `maxViews`) → `ShareLinkVideo` membership → `ACTIVE`
   `WebsiteVideo` assignment → `VideoStatus.READY` → playable asset.

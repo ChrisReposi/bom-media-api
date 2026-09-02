@@ -316,9 +316,50 @@ src>`.
   "rawToken": "s_…",     // MULTI-VIDEO ONLY. Returned EXACTLY ONCE, never
                          // retrievable again. ABSENT on the canonical path
   "publicUrl": "https://<domain>/watch#k=<alias>",
+  "compatibilityUrl": "https://<domain>/watch?r=<transportAlias>" | null,  // added 2026-09-02
   "outcome": "CREATED" | "REUSED",   // added 2026-08-25
   "isCanonical": false }             // added 2026-08-25
 ```
+
+> **`compatibilityUrl` (added 2026-09-02) is the EMAIL-SAFE form of the same
+> link.** It carries `ShareLink.transportAlias` — a separate 22-character,
+> 128-bit identifier — in the query string, so it survives mail clients and
+> link rewriters that strip URL fragments. `shareLink.compatibilityUrl` carries
+> the same value (null on list and revoke responses, as `publicUrl` is).
+>
+> **`transportAlias` IS AN ALTERNATE BEARER CREDENTIAL.** Possession of one is
+> enough to reach that ShareLink through the compatibility exchange, so treat
+> the field exactly as you treat the alias inside `publicUrl`: display it, let
+> the operator copy it, and never write it to a log, an analytics event or a
+> persisted record. It creates no second authorization model — every decision
+> is still the existing resolver's, and it has no permissions, expiry or view
+> budget of its own — but "no second model" is not "not a secret". Full
+> compromise semantics:
+> [SECURITY_MODEL.md §2.0](./SECURITY_MODEL.md#20-the-two-share-link-bearer-credentials).
+>
+> **It is `null` unless the link is an eligible CANONICAL SINGLE-VIDEO link on
+> a capable host.** Three independent reasons produce `null`, and a client
+> renders all three identically by omitting the row:
+>
+> | Case | `compatibilityUrl` |
+> |---|---|
+> | Bundle / multi-video link, any `maxViews`, any host | **always `null`** |
+> | Canonical single-video link, host not in `PUBLIC_COMPATIBILITY_URL_HOSTS` | `null` |
+> | Canonical single-video link minted before the column existed, not yet re-issued | `null` until its next reuse while usable |
+>
+> Bundles are excluded because the compatibility exchange consumes a view with
+> full parity, so a JavaScript-executing mail security scanner could spend a
+> budgeted link before the reviewer opened it; a canonical link is unbudgeted by
+> contract. The host gate exists because this backend serves several reviewer
+> frontends and only some ship the compatibility bootstrap. See
+> [features/share-links.md §3.1.2](./features/share-links.md#312-it-is-emitted-only-for-canonical-single-video-links)
+> and [§3.1.1](./features/share-links.md#311-it-is-emitted-only-where-a-reviewer-frontend-can-redeem-it).
+>
+> A client MUST treat the field as optional and MUST NOT construct one itself.
+> It is resolved by `POST /public/watch/exchange-compatible` (§3.1.3) under
+> exactly the checks and view budget of `publicUrl`, and it is **less private**
+> than `publicUrl` — see
+> [features/share-links.md §3.1](./features/share-links.md#31-the-email-safe-compatibility-url).
 
 Preconditions enforced server-side: the website is `ACTIVE`, it has at least one
 `ACTIVE` assigned domain, and every selected video is eligible (assigned to the
@@ -892,6 +933,54 @@ request occurs during playback.
 > that a browser already received keeps working for as long as the provider
 > serves it. Do not describe revocation as universal. See
 > [SECURITY_MODEL.md §4.1](./SECURITY_MODEL.md#41-backend-served-media-versus-providerdirect-media).
+
+### 3.1.3 `POST /public/watch/exchange-compatible` — the email-safe reviewer exchange (added 2026-09-02)
+
+```jsonc
+// POST body
+{ "host": "arcwildstudios.com", "alias": "<22-character transport alias from ?r=>" }
+
+// 200 — success and denial: EXACTLY the §3.1 bodies. No new field, no new
+// reason code, no new status.
+```
+
+The public site redeems `https://<domain>/watch?r=<transportAlias>` here. The
+body carries the **transport alias** — an alternate bearer credential for the
+ShareLink, never the `#k` credential — and the backend does exactly one new
+thing with it: `resolvePublicWatchCompatible()` maps it to a ShareLink row and
+hands that row's own `alias` to the unmodified `resolvePublicWatch()`. So host
+binding, website scope, status, expiry,
+`maxViews`, membership, assignment, READY/playable, the atomic view claim, the
+access log, caching, Bunny signing and media-URL/grant minting are the §3.1
+ones, byte for byte.
+
+> **CONTRACT INVARIANT: same payload, same consumption.** A successful call
+> claims one `currentViews` exactly as `watch/exchange` does; a denial claims
+> nothing; the two URL forms share one budget. That parity is the reason
+> `compatibilityUrl` is emitted only for canonical single-video links, which
+> carry no view budget for a mail scanner to spend. The media URLs in the response
+> carry the ShareLink's **own alias** in their path, as the `#k` exchange's
+> do, so every media route is unchanged and the transport alias reaches no
+> part of the response.
+
+> **CONTRACT INVARIANT: the two credential kinds are disjoint.** A transport
+> alias is refused by `watch/exchange`, the legacy `GET`, and every media route
+> (it matches no `alias` and hashes to no `tokenHash`). A share alias or raw
+> token is refused here by shape — exactly 22 base64url characters, no trim, no
+> decode — before any database read. Every refusal is the generic §3.1 denial.
+
+> **POST only.** There is no `GET` form: a mail scanner or a link preview that
+> fetches the reviewer URL receives the static page shell and reaches no
+> exchange. Only a JavaScript-executing client redeems the alias.
+
+> **CONTRACT INVARIANT: the host must be compatibility-capable.** This endpoint
+> refuses a `host` that is not in `PUBLIC_COMPATIBILITY_URL_HOSTS`, before it
+> reads the presented alias, with the same generic §3.1 denial. The check uses
+> the one predicate the Admin emission path uses, so a host can never be able
+> to redeem a URL the Admin would not emit, or the reverse. Removing a host
+> from that list is therefore an **emergency kill switch** for every `?r=` link
+> on it, effective on restart; `#k` links are unaffected. It suspends rather
+> than revokes — restoring the host restores every alias.
 
 ### 3.1.2 The Bunny reviewer URL opens on the poster
 

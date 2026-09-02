@@ -149,7 +149,17 @@ Process-local, lost on restart, **not shared** between Node processes.
 | `ACCESS_LOG_IP_PEPPER` | — | **Required. Secret.** |
 | `PUBLIC_SITE_PROTOCOL` | `https` | Protocol used when building share URLs |
 | `PUBLIC_SHARE_LOCAL_PROTOCOL` | `http` | Used for localhost-style domains |
+| `PUBLIC_COMPATIBILITY_URL_HOSTS` | empty | **Reviewer-frontend capability, and the email-safe kill switch.** Comma-separated hostnames whose deployed reviewer client can redeem the email-safe URL `/watch?r=<transportAlias>`. Gates **both** emission (the Admin is handed a URL) and **redemption** (`POST /public/watch/exchange-compatible` accepts one), through one shared predicate. Empty means no website receives one **and none can redeem one** — the correct fail-closed default, because every reviewer frontend redeems `#k=` and only some redeem `?r=`. Matching is EXACT after normalization: no substring, no suffix, no implicit `www`. A malformed entry **fails at boot**. Not a secret |
 | `ALLOW_LOCALHOST_DOMAIN_CLAIM` | env-dependent | Permits claiming localhost domains |
+
+> **Clearing this variable and restarting is the emergency kill switch for the
+> alternate bearer surface.** Every `/watch?r=` link for a removed host stops
+> resolving immediately, while every `#k` link on that host keeps working. It
+> **suspends**, it does not **revoke**: restore the host and every previously
+> issued transport alias redeems again. Revoking the individual `ShareLink` is
+> still the only way to destroy one credential permanently, and that kills the
+> `#k` credential too. See
+> [SECURITY_MODEL.md §2.0](./SECURITY_MODEL.md#20-the-two-share-link-bearer-credentials).
 
 ## 10. Public display-view growth
 

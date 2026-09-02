@@ -456,6 +456,25 @@ model ShareLink {
   websiteId    String
   tokenHash    String          @unique @db.VarChar(128)
   alias        String?         @unique @db.VarChar(16)
+  // Email-safe TRANSPORT alias: an ALTERNATE BEARER CREDENTIAL for this row.
+  // A separate 128-bit identifier that the fragment-independent reviewer URL
+  // (`/watch?r=<transportAlias>`) carries in the query string, resolved by
+  // `PublicService.resolvePublicWatchCompatible()` into THIS row's own `alias`
+  // and then through the unmodified V2 resolver.
+  //
+  // TREAT IT AS A SECRET, exactly like `alias`. Holding one is enough to reach
+  // this ShareLink's videos through the compatibility exchange. What it does
+  // NOT do is create a second authorization model: it carries no permissions,
+  // budget, expiry or status of its own, every decision is still the existing
+  // resolver's, and it lives and dies with the ShareLink. "No second model" is
+  // not "not a credential".
+  //
+  // Stored in clear for the same reason `alias` is: a canonical link is
+  // re-issued on every request and the URL must be re-displayable.
+  // Minted ONLY for canonical single-video links — the only shape the
+  // email-safe URL is emitted for — so the credential exists nowhere it is not
+  // needed. NULL on every bundle and on every row predating 2026-09-02.
+  transportAlias String?       @unique @db.VarChar(32)
   label        String?         @db.VarChar(255)
   expiresAt    DateTime?
   maxViews     Int?

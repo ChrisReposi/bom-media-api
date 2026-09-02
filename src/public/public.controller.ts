@@ -29,6 +29,7 @@ import {
   THROTTLE_PROFILES,
   ThrottleProfile,
 } from "../security/throttle-profile.decorator";
+import { PublicWatchCompatibleExchangeDto } from "./dto/public-watch-compatible-exchange.dto";
 import { PublicWatchExchangeDto } from "./dto/public-watch-exchange.dto";
 import { PublicWatchQueryDto } from "./dto/public-watch-query.dto";
 import { RecordPublicVideoViewDto } from "./dto/record-public-video-view.dto";
@@ -103,6 +104,58 @@ export class PublicController {
     return this.publicService.resolvePublicWatch({
       host: body.host,
       token: body.token,
+      requestMeta: {
+        ip: this.extractClientIp(request),
+        referer: readRequestHeader(request, "referer"),
+        userAgent: readRequestHeader(request, "user-agent"),
+      },
+    });
+  }
+
+  /**
+   * THE EMAIL-SAFE REVIEWER EXCHANGE.
+   *
+   * The fragment form `/watch#k=<credential>` is never transmitted and is
+   * therefore stripped by some mail clients. The query form
+   * `/watch?r=<transportAlias>` survives them, and the site redeems it here.
+   *
+   * The body carries a TRANSPORT ALIAS — a separate 128-bit identifier, and an
+   * ALTERNATE BEARER CREDENTIAL for the same ShareLink — never the `#k`
+   * credential. Both are secrets and both are redacted.
+   * `PublicService.resolvePublicWatchCompatible()` swaps it
+   * for the ShareLink's own alias and runs the UNMODIFIED V2 resolver, so the
+   * response, the authorization chain, the view consumption and the media
+   * URLs are exactly those of `POST watch/exchange` for the same link.
+   *
+   * POST only, and the alias travels in the BODY: no route parameter, no
+   * query string, so nothing about it can reach the request log
+   * (`safeRequestRoute()` logs the route template alone).
+   */
+  @Post("watch/exchange-compatible")
+  @HttpCode(HttpStatus.OK)
+  @ThrottleProfile(THROTTLE_PROFILES.publicWatch)
+  @ApiOperation({
+    summary: "Exchange an email-safe transport alias for public watch videos.",
+    description:
+      "Fragment-independent counterpart of POST watch/exchange for the `/watch?r=<transportAlias>` reviewer URL. Resolves the transport alias to its ShareLink and applies exactly the same authorization, view-consumption and response semantics as watch/exchange. Does not require admin authentication.",
+  })
+  @ApiOkResponse({
+    type: PublicWatchResponse,
+    description: "Public watch result.",
+  })
+  @ApiBadRequestResponse({
+    description: "Invalid request body.",
+  })
+  exchangePublicWatchCompatible(
+    @Body() body: PublicWatchCompatibleExchangeDto,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ): Promise<PublicWatchResponse> {
+    setNoStoreHeaders(response);
+
+    return this.publicService.resolvePublicWatchCompatible({
+      host: body.host,
+      alias: body.alias,
       requestMeta: {
         ip: this.extractClientIp(request),
         referer: readRequestHeader(request, "referer"),

@@ -15,6 +15,7 @@ one website's videos, on that website's domains only.
 |---|---|
 | `tokenHash` | `sha256(SHARE_TOKEN_PEPPER + rawToken)`; unique. The raw token is never stored |
 | `alias` | `base64url`, unique, stored in clear; the customer-facing credential. **16 chars / 96 bits for links created since 2026-08-25; 7 chars / 40 bits before that.** Existing short aliases are never rotated — see §2.3 |
+| `transportAlias` | `base64url`, unique, nullable, stored in clear; **22 chars / 128 bits**, since 2026-09-02. The identifier behind the EMAIL-SAFE reviewer URL (§3.1), and an **ALTERNATE BEARER CREDENTIAL** for this row — holding one reaches this link's videos through `POST /public/watch/exchange-compatible`, which resolves it into this row's own `alias`. It is a credential on no other route, and it carries no permissions, budget or status of its own. **Minted only for canonical single-video links** (§2.2.1); null on every bundle, and on every canonical row that predates it until the link is next issued while usable |
 | `label` | Operator note |
 | `expiresAt` | Optional absolute expiry |
 | `maxViews` / `currentViews` | Optional view budget and its counter |
@@ -183,6 +184,31 @@ audit SHARE_LINK_CREATE, invalidate public caches
 > `publicUrl` is **computed on read, never persisted.** No table stores a share
 > URL string, so changing its shape converts no data and mutates no row.
 
+### 2.2.1 The transport alias is minted for CANONICAL links only
+
+> **A TRANSPORT ALIAS IS AN ALTERNATE BEARER CREDENTIAL, so it is minted only
+> where it is actually used.** The email-safe URL is emitted for canonical
+> single-video links and nothing else (§3.1.2), so a bundle receiving one would
+> be an unused credential sitting at rest for the life of the row. The bundle
+> transaction above writes no `transportAlias`, and there is no bundle-shaped
+> compatibility-URL builder in the codebase to call.
+
+The canonical mint generates `transportAlias = randomBytes(16).base64url` in
+the same attempt as `alias` and the token, so a unique-violation on any of the
+three regenerates all three. `compatibilityUrl` is built from the same snapshot
+host and protocol as `reviewUrl`.
+
+A canonical mapping committed before the column existed has none. It is
+**backfilled exactly once, lazily**, by `CanonicalShareLinkService.ensureTransportAlias()`
+on the REUSED path — after `assertReusable()` has passed, so a revoked,
+disabled, expired, limited, domain-drifted or evidence-drifted link never
+receives one. The write is a conditional
+`updateMany({ id, transportAlias: null, status: ACTIVE })`: idempotent, race-safe
+(one writer wins, every other racer reloads its value), guarded by status at
+write time as well as before it, and audited as `SHARE_LINK_TRANSPORT_ALIAS_BACKFILL`
+with ids only. Nothing else about the row is touched. Bundles created before
+2026-09-02 are never re-issued by any client and are not backfilled.
+
 ### 2.3 The alias is a bearer credential
 
 `resolvePublicWatch()` accepts the alias in place of a raw share token, so on
@@ -217,6 +243,177 @@ Pinned by `test/share-url-util.test.ts`.
 |---|---|
 | `https://<domain>/watch#k=<alias>` | `buildPublicShareUrl()` (bundles) and `buildCanonicalReviewUrl()` (single-video canonical links); both are what Admin copies |
 | `https://<domain>/watch#k=<alias>&v=<videoId>` | Admin, when a single video is selected |
+| `https://<domain>/watch?r=<transportAlias>` | `buildCanonicalCompatibilityUrl()` — the only builder, and canonical-only by construction. The EMAIL-SAFE form, returned as `compatibilityUrl` beside `publicUrl`. See §3.1 |
+
+### 3.1 The email-safe compatibility URL
+
+A URI fragment is never transmitted, which is what makes the `#k` form private
+and what makes it fragile: some mail clients and link-rewriting proxies strip
+fragments, and a reviewer following such a link reaches an empty page. The
+compatibility form puts a carrier in the QUERY STRING instead, where transport
+preserves it — and pays for that with privacy, because the static host, every
+proxy in front of it and every access log on the way see the query once.
+
+So the carrier is a **different** credential, not a harmless one.
+`transportAlias` is a separate 22-character, 128-bit identifier, and it is an
+**ALTERNATE BEARER CREDENTIAL**: whoever holds one reaches the same ShareLink.
+`POST /public/watch/exchange-compatible`
+([API_CONTRACTS.md §3.1.3](../API_CONTRACTS.md#313-post-publicwatchexchange-compatible--the-email-safe-reviewer-exchange-added-2026-09-02))
+maps it to its ShareLink and hands that row's own `alias` to the unmodified
+`resolvePublicWatch()`: one authority, one budget, one payload.
+
+What the separation buys is narrower than "it is not a secret", and is worth
+stating exactly:
+
+- Compromise of a transport alias grants access to that ShareLink's videos,
+  under that link's own checks, until the link is revoked or otherwise becomes
+  invalid. It is a secret and is redacted everywhere `alias` is.
+- Compromise of a transport alias does **not** reveal the `#k` alias. A leaked
+  static-host access log yields the email-safe credential and nothing else, and
+  revoking the ShareLink kills both at once.
+- The two kinds are disjoint by shape in both directions, so neither is
+  accepted on the other's route.
+- It creates no SECOND authorization model. There is one resolver, one budget
+  and one set of checks; the transport alias has no permissions, expiry, view
+  budget or status of its own.
+
+| | `#k=<alias>` (fragment) | `?r=<transportAlias>` (query) |
+|---|---|---|
+| Sent to the static host, proxies, CDN logs | never | on the first document request |
+| Survives fragment-stripping mail clients | no | yes |
+| What it is | the canonical bearer credential | an alternate, email-safe bearer credential for the same ShareLink |
+| Must be redacted from logs | yes | yes — identically |
+| Emitted for | every ShareLink | canonical single-video links on a capable host only |
+| Checks, budget, payload | the V2 chain | the same V2 chain, entered by the row's own alias |
+| Consumes a view on exchange | yes | yes — parity, one shared budget |
+
+> **Do not describe the compatibility URL as having the fragment URL's privacy
+> properties.** It does not. It exists because a link that never opens protects
+> nobody; the Admin shows it as the *email* link next to the *secure* link and
+> says why.
+
+#### 3.1.1 It is emitted only where a reviewer frontend can redeem it
+
+> **THIS BACKEND SERVES SEVERAL REVIEWER FRONTENDS AND THEY ARE NOT
+> INTERCHANGEABLE.** Every one of them redeems `#k=`. Only a frontend that has
+> shipped the compatibility bootstrap redeems `?r=`. Measured 2026-09-02:
+
+| Frontend | Redeems `#k=` | Redeems `?r=` | What `/watch?r=…` does today |
+|---|---|---|---|
+| `CPR_arcwildstudios` (`src/js/watch.js`) | yes | **yes** | parses, scrubs, exchanges |
+| `public_website` (`assets/app.js`) | yes | **no** | `getUrlSearchToken()` reads only `token`/`t`, so no credential is found; the route falls through to the reviewer room's "link is incomplete" state |
+| `Worldfold_Studio` (`private-watch-access.js`) | yes | **no** | the entry grammar matches `#k=` and `#/s/` only; the location is **inert** |
+
+Emitting a compatibility URL for the second or third would hand a reviewer a
+link that loads a real page and then does nothing — a silent broken link, which
+is a worse failure than the fragment-stripping this feature exists to fix. So
+emission is gated on `PUBLIC_COMPATIBILITY_URL_HOSTS`, an explicit list of
+hosts whose deployed reviewer bundle can redeem the query form.
+
+- **One predicate, one place.** `AdminWebsitesService.supportsCompatibilityUrl()`
+  is the only implementation; `CanonicalShareLinkService` delegates to it
+  exactly as it already delegates the protocol, so no second copy can drift and
+  no service guesses at a hostname. The value tested is the SAME host the URL
+  would be built from — the canonical snapshot host.
+- **It fails closed.** Unset means no website anywhere gets a compatibility
+  URL. A malformed entry fails at boot rather than being silently dropped.
+- **A host, not a database column**, because the capability belongs to the
+  deployed frontend bundle rather than to the `Website` row: the fact being
+  declared is "the bundle serving this hostname understands `?r=`". It also
+  means enabling a customer is a one-line deploy change with no migration and
+  nothing to backfill. The shape matches `VIDEO_EMBED_ALLOWED_HOSTS`.
+- **It gates REDEMPTION as well as emission.**
+  `PublicService.resolvePublicWatchCompatible()` calls the same
+  `isCompatibilityCapableHost()` predicate before it examines the presented
+  credential, so a transport alias offered on an undeclared host is refused
+  with the generic `INVALID_LINK` and is never read from the database. This is
+  what makes the variable a kill switch rather than a labelling preference: a
+  transport alias is a bearer credential that nothing expires, so gating
+  emission alone would leave every already-delivered URL working after an
+  operator cleared the list. It **suspends** rather than revokes — restore the
+  host and every alias redeems again.
+- **`#k=` is untouched and stays universal.** The gate withholds only the new
+  field and refuses only the new endpoint. Clearing the allowlist entirely
+  leaves every `#k` link on every host working exactly as before.
+- **A canonical link is minted or backfilled one regardless of the gate**, so
+  declaring a host later needs no data work. It is never emitted for an
+  undeclared host, so it is unguessable there; and redeeming one grants nothing
+  the `#k` alias does not, because it resolves to the same row through the same
+  checks. A bundle gets none at all (§2.2.1) — an alternate bearer credential
+  that is never emitted is credential surface area for nothing.
+- **`compatibilityUrl` is therefore `null` in three distinct cases** — the pair
+  is not an eligible canonical single-video link, the host is not declared, or
+  no transport alias is persisted yet — and the Admin renders all three
+  identically by omitting the row.
+
+#### 3.1.2 It is emitted only for CANONICAL SINGLE-VIDEO links
+
+> **THE COMPATIBILITY EXCHANGE CONSUMES A VIEW, SO A MAIL SCANNER CAN SPEND
+> ONE.** Parity with the `#k` exchange is the design (§3.1), and parity cuts
+> both ways: a successful exchange claims one `currentViews`. A plain `GET` of
+> the reviewer URL consumes nothing — a scanner that only fetches receives the
+> static shell — but a JavaScript-executing mail security scanner runs the
+> bootstrap, reaches the exchange, and spends a view. On a **budgeted** link
+> that is a real loss: a `maxViews: 1` bundle can be exhausted before the
+> reviewer ever opens it.
+>
+> The first production version therefore restricts the email-safe URL to
+> **canonical single-video links**, which by their own contract carry no
+> `expiresAt` and no `maxViews` (§2.1). A scanner spends one increment of an
+> unbounded counter, which changes nothing any reviewer can observe.
+
+The complete eligibility predicate lives in one place —
+`CanonicalShareLinkService.isCompatibilityUrlEligible()`, evaluated at the
+single emission site rather than trusted from a caller, because the canonical
+**read** endpoint reaches that site without `assertReusable()`. Every clause
+must hold:
+
+| # | Clause | Withheld when |
+|---|---|---|
+| 1 | the snapshot host is in `PUBLIC_COMPATIBILITY_URL_HOSTS` | the reviewer frontend there cannot redeem `?r=` (§3.1.1) |
+| 2 | a well-formed `transportAlias` is PERSISTED on the row | never a value this process generated but did not store |
+| 3 | `status === ACTIVE` | revoked, disabled or marked expired |
+| 4 | `expiresAt === null` **and** `maxViews === null` | any budget or expiry at all |
+| 5 | membership is exactly the one video this mapping names | the anchored link has grown a second member |
+| 6 | `websiteId` matches the mapping's | a cross-website integrity fault |
+
+Clauses 3–6 duplicate checks `assertReusable()` also makes, deliberately:
+`assertReusable()` decides whether a URL may be returned at all on the write
+path, while this decides whether the NEW field may be emitted on any path.
+
+**Bundles are excluded structurally, not by a runtime flag.** There is no
+bundle-shaped compatibility-URL builder in the codebase, the bundle create
+transaction writes no `transportAlias`, and the bundle response hard-codes
+`compatibilityUrl: null`. So the outcome for a bundle does not depend on a
+condition anyone can get wrong later — including a `maxViews: null` bundle,
+which is still excluded because "unbudgeted today" is not a property a bundle
+carries by contract.
+
+| Link | Capable host | `compatibilityUrl` | `publicUrl` (`#k`) |
+|---|---|---|---|
+| Canonical single-video | yes | **emitted** | unchanged |
+| Canonical single-video | no | `null` | unchanged |
+| Bundle, any `maxViews` | yes | `null` | unchanged |
+| Bundle, unlimited | yes | `null` | unchanged |
+| Historical bundle | either | `null` | unchanged |
+
+Broadening this to bundles is a **later, separate decision**. It would need a
+non-consuming probe, or a budget the exchange does not spend — not a change to
+this predicate.
+
+The public site (`CPR_arcwildstudios`, `src/js/watch.js`) scrubs the carrier
+from the visible URL with `history.replaceState(null, "", "/watch")` before it
+makes any request, holds the alias in one module-scoped variable, redeems it on
+the compatibility exchange, and refuses a location that carries **both** a
+`#k` fragment and a `?r=` query rather than picking one. A plain `GET` of the
+URL — a mail scanner, a link preview — receives the static shell and consumes
+nothing; only a JavaScript-executing client exchanges, and that consumes one
+view exactly as a JavaScript-executing client opening a `#k` link does.
+
+Pinned by `test/public-watch-compatibility-exchange.test.ts` (backend) and the
+`COMPAT-*` scenarios in `CPR_arcwildstudios/tools/watch-test.mjs` and
+`tools/watch-browser-test.mjs` (client). Design and trade-off record:
+`docs/superpowers/specs/2026-09-02-email-safe-reviewer-url-design.md`.
 
 **V1 — permanent legacy contract. Still accepted, never re-issued:**
 

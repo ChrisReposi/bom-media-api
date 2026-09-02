@@ -52,14 +52,28 @@ export function isUniqueViolationOn(error: unknown, needle: string): boolean {
 }
 
 /**
- * True when a Prisma unique violation hit the ShareLink alias or tokenHash
- * columns — the only collisions that should trigger a regenerate-and-retry.
- * Pure so both the generic and the canonical share-link services can share
- * the policy without coupling to each other's internals.
+ * True when a Prisma unique violation hit the ShareLink alias, transportAlias
+ * or tokenHash columns — the only collisions that should trigger a
+ * regenerate-and-retry. Pure so both the generic and the canonical share-link
+ * services can share the policy without coupling to each other's internals.
+ *
+ * `transportAlias` is covered by the `alias` needle (`ShareLink_transportAlias_key`
+ * contains it), and named explicitly below so the coverage is a decision
+ * rather than a coincidence of naming.
  */
 export function isShareLinkTokenOrAliasCollision(error: unknown): boolean {
   return (
     isUniqueViolationOn(error, "alias") ||
-    isUniqueViolationOn(error, "tokenHash")
+    isUniqueViolationOn(error, "tokenHash") ||
+    isShareLinkTransportAliasCollision(error)
   );
+}
+
+/**
+ * True when a unique violation hit the email-safe transport alias alone. The
+ * lazy backfill onto an existing canonical link regenerates on exactly this
+ * and re-throws anything else.
+ */
+export function isShareLinkTransportAliasCollision(error: unknown): boolean {
+  return isUniqueViolationOn(error, "transportAlias");
 }

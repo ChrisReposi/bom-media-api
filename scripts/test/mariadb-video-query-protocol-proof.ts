@@ -7,6 +7,7 @@
 import "reflect-metadata";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
+import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createServer } from "node:net";
 import { hash } from "bcryptjs";
@@ -416,12 +417,24 @@ async function main(): Promise<void> {
       FROM _prisma_migrations
       WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
     `;
-    assert.equal(Number(appliedMigrations[0]?.count ?? 0n), 19);
+    // Compared against the migrations this checkout ships, never a literal:
+    // a stale constant would fail this proof every time one is added.
+    const migrationsOnDisk = readdirSync(
+      join(__dirname, "../../prisma/migrations"),
+      { withFileTypes: true },
+    ).filter((entry) => entry.isDirectory()).length;
+    assert.ok(migrationsOnDisk > 0, "no migrations found on disk");
+    const appliedCount = Number(appliedMigrations[0]?.count ?? 0n);
+    assert.equal(
+      appliedCount,
+      migrationsOnDisk,
+      `applied ${appliedCount} migrations, checkout ships ${migrationsOnDisk}`,
+    );
     writeSafe({
       database: target.database,
       hostClassification: "local",
       server: "MariaDB 11.8.8",
-      migrations: 19,
+      migrations: migrationsOnDisk,
     });
 
     fixturesCreated = true;

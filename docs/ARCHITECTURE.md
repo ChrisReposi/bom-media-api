@@ -185,6 +185,9 @@ Traced from `src/public/public.service.ts` and `src/public/public.controller.ts`
    scrubs it from the visible URL, keeps it in sessionStorage.
 3. POST /api/v1/public/watch/exchange { host, token }
         (legacy fallback: GET /api/v1/public/watch?host=&token=)
+        (email-safe form: POST /api/v1/public/watch/exchange-compatible
+         { host, alias } — the query carrier of /watch?r=<transportAlias>,
+         mapped to its ShareLink's own alias and then steps 4-7 unchanged)
 4. Backend resolvePublicWatch:
      normalize host (lowercase, strip protocol/port rules, max 253 chars)
         null                             → DENIED  MISSING_HOST

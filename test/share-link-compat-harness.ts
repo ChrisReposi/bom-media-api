@@ -129,9 +129,29 @@ export const ROTATED_TOKEN_PEPPER =
 export const LEGACY_ALIAS = "Ab3dEf7";
 export const SECOND_ALIAS = "Zy9wQr2";
 
+/**
+ * Shaped like `generateTransportAlias()` output: 22 base64url characters.
+ * The email-safe reviewer URL carries this in its QUERY STRING
+ * (`/watch?r=<transportAlias>`); it is a separate identifier from `alias`
+ * and is resolved only by `resolvePublicWatchCompatible()`.
+ */
+export const LEGACY_TRANSPORT_ALIAS = "cOmPaTtRaNsPoRt_0123ab";
+export const SECOND_TRANSPORT_ALIAS = "sEcOnDtRaNsPoRt_4567cd";
+/** Well-formed, but no ShareLink carries it. */
+export const UNKNOWN_TRANSPORT_ALIAS = "uNkNoWnTrAnSpOrT_89efg";
+
 export const LEGACY_HOST = "customer.example.com";
 export const SECOND_LEGACY_HOST = "www.customer.example.com";
 export const FOREIGN_HOST = "other-tenant.example.com";
+
+/**
+ * A host that is a perfectly good `WebsiteDomain` but is NOT compatibility
+ * capable — the reviewer bundle deployed there cannot redeem `?r=`.
+ *
+ * Everything else about it is legitimate, so a denial on this host isolates
+ * the capability gate from every other reason a request can fail.
+ */
+export const UNSUPPORTED_COMPAT_HOST = "legacy-frontend.example.com";
 export const UNKNOWN_HOST = "not-a-customer.example.com";
 
 export const WEBSITE_ID = "website-compat-a";
@@ -227,6 +247,8 @@ export type CompatShareLink = {
   websiteId: string;
   tokenHash: string;
   alias: string | null;
+  /** Null for every historical row: the column postdates them. */
+  transportAlias: string | null;
   label: string | null;
   status: ShareLinkStatus;
   expiresAt: Date | null;
@@ -944,11 +966,36 @@ export class CompatPrismaService {
       };
     },
 
-    findUnique: async (args: { where: { id: string } }) => {
+    /**
+     * Two lookup forms, each applied only when the service asks for it: by
+     * `id` (the view-consumption re-read) and by `transportAlias` (the
+     * email-safe compatibility exchange). A `select` projects the row exactly
+     * as Prisma would, so a service that asks for `{ alias: true }` sees only
+     * the alias - and a test that reads anything else off the result is
+     * asserting something production never receives.
+     */
+    findUnique: async (args: {
+      where: { id?: string; transportAlias?: string };
+      select?: Record<string, boolean>;
+    }) => {
       this.counters.shareLinkFindUnique += 1;
-      const record = this.shareLinks.find((link) => link.id === args.where.id);
+      const record = this.shareLinks.find((link) => {
+        if (args.where.id !== undefined) {
+          return link.id === args.where.id;
+        }
+        if (args.where.transportAlias !== undefined) {
+          return (
+            link.transportAlias !== null &&
+            link.transportAlias === args.where.transportAlias
+          );
+        }
 
-      return record === undefined ? null : { ...record };
+        return false;
+      });
+
+      return record === undefined
+        ? null
+        : applySelect({ ...record }, args.select);
     },
 
     /**
@@ -1170,7 +1217,15 @@ export class CompatPrismaService {
  * ------------------------------------------------------------------ */
 
 export class CompatConfigService {
-  constructor(private readonly pepper: string = LEGACY_TOKEN_PEPPER) {}
+  constructor(
+    private readonly pepper: string = LEGACY_TOKEN_PEPPER,
+    /**
+     * Per-test environment overrides. The capability kill-switch tests clear
+     * `PUBLIC_COMPATIBILITY_URL_HOSTS` through this rather than by mutating a
+     * shared object, so one test can never leak configuration into another.
+     */
+    private readonly overrides: Record<string, string> = {},
+  ) {}
 
   get<T = string>(key: string): T | undefined {
     const values: Record<string, string> = {
@@ -1180,6 +1235,10 @@ export class CompatConfigService {
       PUBLIC_MEDIA_GRANT_SECRET:
         "compat-suite-public-media-grant-secret-at-least-32-bytes",
       PUBLIC_MEDIA_GRANT_TTL_SECONDS: "21600",
+      // Both tenant hosts are compatibility-capable. UNSUPPORTED_COMPAT_HOST
+      // is deliberately absent, so a test can single out the capability gate.
+      PUBLIC_COMPATIBILITY_URL_HOSTS: `${LEGACY_HOST},${SECOND_LEGACY_HOST},${FOREIGN_HOST}`,
+      ...this.overrides,
     };
 
     return values[key] as T | undefined;
@@ -1279,6 +1338,7 @@ export type CompatShareLinkSpec = {
   id?: string;
   websiteId?: string;
   alias?: string | null;
+  transportAlias?: string | null;
   tokenHash?: string;
   status?: ShareLinkStatus;
   expiresAt?: Date | null;
@@ -1306,6 +1366,9 @@ function buildShareLink(
     websiteId: spec.websiteId ?? WEBSITE_ID,
     tokenHash: spec.tokenHash ?? LEGACY_EXPECTED_TOKEN_HASH,
     alias: spec.alias === undefined ? LEGACY_ALIAS : spec.alias,
+    // Absent unless a scenario grants one: legacy rows never carry it.
+    transportAlias:
+      spec.transportAlias === undefined ? null : spec.transportAlias,
     label: null,
     status: spec.status ?? ShareLinkStatus.ACTIVE,
     expiresAt: spec.expiresAt ?? null,
@@ -1359,6 +1422,16 @@ export function defaultDomains(): CompatDomain[] {
       status: DomainStatus.ACTIVE,
       websiteId: FOREIGN_WEBSITE_ID,
     },
+    {
+      // ACTIVE, correct website, everything in order — the ONLY thing wrong
+      // with it is that its reviewer bundle cannot redeem `?r=`. That makes
+      // it the control host for the capability gate: a denial here can have
+      // no other cause.
+      id: "domain-compat-4",
+      domain: UNSUPPORTED_COMPAT_HOST,
+      status: DomainStatus.ACTIVE,
+      websiteId: WEBSITE_ID,
+    },
   ];
 }
 
@@ -1386,13 +1459,25 @@ export type CompatHarnessOptions = {
   shareLink?: Partial<
     Pick<
       CompatShareLink,
-      "status" | "expiresAt" | "maxViews" | "currentViews" | "alias"
+      | "status"
+      | "expiresAt"
+      | "maxViews"
+      | "currentViews"
+      | "alias"
+      | "transportAlias"
     >
   >;
   /** Additional share links, e.g. a second credential on the same website. */
   extraShareLinks?: CompatShareLinkSpec[];
   websites?: CompatWebsite[];
   domains?: CompatDomain[];
+  /**
+   * Environment overrides for this harness only. Used by the kill-switch
+   * tests to clear `PUBLIC_COMPATIBILITY_URL_HOSTS` without touching shared
+   * state, so the removal is observed on a service built exactly like the
+   * one that accepted the same alias a moment earlier.
+   */
+  env?: Record<string, string>;
   memoryCache?: boolean;
   pepper?: string;
   localVideoStorage?: unknown;
@@ -1426,7 +1511,10 @@ export function createCompatHarness(
     videos: allVideos,
     shareLinks: [primary, ...extras],
   });
-  const config = new CompatConfigService(options.pepper ?? LEGACY_TOKEN_PEPPER);
+  const config = new CompatConfigService(
+    options.pepper ?? LEGACY_TOKEN_PEPPER,
+    options.env ?? {},
+  );
   const memoryCache =
     options.memoryCache === true ? createCompatMemoryCache() : undefined;
   const localStorage =

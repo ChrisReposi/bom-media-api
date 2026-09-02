@@ -2,7 +2,7 @@ import "reflect-metadata";
 import { AsyncLocalStorage } from "node:async_hooks";
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { BadRequestException, ConflictException } from "@nestjs/common";
+import { BadRequestException, ConflictException, Logger } from "@nestjs/common";
 import { CanonicalShareLinkService } from "../src/admin-websites/canonical-share-link.service";
 import type { CreateShareLinkDto } from "../src/admin-websites/dto/create-share-link.dto";
 import { Prisma } from "../src/generated/prisma/client";
@@ -33,6 +33,8 @@ type FakeShareLink = {
   websiteId: string;
   tokenHash: string;
   alias: string | null;
+  /** Optional: rows seeded as "historical" predate the column. */
+  transportAlias?: string | null;
   label: string | null;
   expiresAt: Date | null;
   maxViews: number | null;
@@ -95,6 +97,22 @@ class FakePrisma {
   }[] = [];
   canonicals = new Map<string, FakeCanonical>();
   audits: { action: string; entityId: string; metadata: unknown }[] = [];
+  /** How many further transport-alias writes must fail with P2002. */
+  transportAliasCollisionsRemaining = 0;
+  /**
+   * Callbacks fired at the START of a transport-alias updateMany, before its
+   * check-and-set runs.
+   *
+   * This is how the LOSER path is made deterministic rather than
+   * scheduler-dependent: a hook stands in for the winner committing in the
+   * window between this request's read (which saw null) and its own write.
+   * Without it a test can only set the value up front, which the service
+   * answers from its early return — passing without ever reaching the branch
+   * under test.
+   */
+  beforeTransportAliasUpdate: Array<() => void> = [];
+  /** Every transport alias this fake actually persisted, in order. */
+  persistedTransportAliases: string[] = [];
   private sequence = 0;
 
   nextId(prefix: string): string {
@@ -176,6 +194,53 @@ class FakePrisma {
     findUnique: async (args: { where: { id: string } }): Promise<unknown> => {
       const link = this.shareLinks.get(args.where.id);
       return link ? this.withVideos(link) : null;
+    },
+    /**
+     * The transport-alias BACKFILL: one row by id, and ONLY while it still has
+     * no transport alias and is ACTIVE. Every predicate is applied, so a
+     * service that dropped the `status` guard would surface here as "a
+     * revoked link was given an email-safe alias".
+     */
+    updateMany: async (args: {
+      where: { id: string; transportAlias?: null; status?: string };
+      data: { transportAlias?: string };
+    }): Promise<{ count: number }> => {
+      /* An EXTREMELY unlikely unique collision, on demand. The database
+         raises P2002 when the generated value is already taken; this models
+         exactly that, N times, so the bounded retry is exercised rather than
+         assumed. */
+      for (const hook of this.beforeTransportAliasUpdate.splice(0)) {
+        hook();
+      }
+      if (this.transportAliasCollisionsRemaining > 0) {
+        this.transportAliasCollisionsRemaining -= 1;
+        throw new Prisma.PrismaClientKnownRequestError("unique", {
+          code: "P2002",
+          clientVersion: "7.8.0",
+          meta: { target: "ShareLink_transportAlias_key" },
+        });
+      }
+      const link = this.shareLinks.get(args.where.id);
+      if (!link) {
+        return { count: 0 };
+      }
+      if (
+        "transportAlias" in args.where &&
+        (link.transportAlias ?? null) !== null
+      ) {
+        return { count: 0 };
+      }
+      if (
+        args.where.status !== undefined &&
+        link.status !== args.where.status
+      ) {
+        return { count: 0 };
+      }
+      if (args.data.transportAlias !== undefined) {
+        link.transportAlias = args.data.transportAlias;
+        this.persistedTransportAliases.push(args.data.transportAlias);
+      }
+      return { count: 1 };
     },
     /**
      * Models ONLY the predicates the production query actually sends, each
@@ -479,6 +544,10 @@ function createHarness(options?: {
       }
     },
     getConfiguredPublicSiteProtocol: () => undefined,
+    /* The reviewer-frontend capability gate. `site-a` is the supported host
+       in these fixtures; `other-site.com` (site-b) deliberately is not. */
+    supportsCompatibilityUrl: (domain: string | null) =>
+      domain === "plushcomedystudios.com",
     resolveShareLinkVideoIds: async (
       websiteId: string,
       dto: CreateShareLinkDto,
@@ -502,6 +571,10 @@ function createHarness(options?: {
           websiteId,
           tokenHash: `hash-${prisma.nextId("t")}`,
           alias: prisma.nextId("bundle"),
+          /* NO transportAlias. The real bundle path mints none — the
+             email-safe URL is canonical-single-video only — so a stub that
+             fabricated one would let a test assert behaviour production does
+             not have. `share-link-scope.test.ts` drives the REAL bundle path. */
           label: null,
           expiresAt: null,
           maxViews: null,
@@ -519,6 +592,7 @@ function createHarness(options?: {
         shareLink: { id: link.id, alias: link.alias, videos: videoIds },
         rawToken: "s_raw",
         publicUrl: `https://plushcomedystudios.com/watch#k=${link.alias}`,
+        compatibilityUrl: null,
         outcome: "CREATED",
         isCanonical: false,
       };
@@ -526,6 +600,7 @@ function createHarness(options?: {
     toShareLinkResponse: (
       link: FakeShareLink & { shareLinkVideos: { videoId: string }[] },
       publicUrl: string | null,
+      compatibilityUrl: string | null = null,
     ) => ({
       id: link.id,
       alias: link.alias,
@@ -534,6 +609,7 @@ function createHarness(options?: {
       maxViews: link.maxViews,
       currentViews: link.currentViews,
       publicUrl,
+      compatibilityUrl,
       videos: link.shareLinkVideos.map((video) => ({ videoId: video.videoId })),
     }),
   };
@@ -1229,6 +1305,7 @@ function seedHistoricalLink(
     websiteId: params.websiteId,
     tokenHash: `hash-${params.alias}`,
     alias: params.alias,
+    transportAlias: null,
     label: "Gửi cho khách hàng A",
     expiresAt: params.expiresAt ?? null,
     maxViews: params.maxViews ?? null,
@@ -1928,8 +2005,22 @@ describe("canonical adoption of historical single-video links", () => {
       "admin-1",
     );
 
-    assert.equal(prisma.audits.length, 1);
+    // Exactly one ADOPTION row. The adopted link is ACTIVE and usable, so the
+    // email-safe transport alias is backfilled onto it in the same request
+    // and audited separately (SHARE_LINK_TRANSPORT_ALIAS_BACKFILL); that row
+    // is a different fact and must not be counted as a second adoption.
+    const adoptions = prisma.audits.filter(
+      (row) => row.action === "CANONICAL_SHARE_LINK_AUTO_ADOPT",
+    );
+    assert.equal(adoptions.length, 1);
     assert.equal(prisma.audits[0].action, "CANONICAL_SHARE_LINK_AUTO_ADOPT");
+    assert.deepEqual(
+      prisma.audits.map((row) => row.action),
+      [
+        "CANONICAL_SHARE_LINK_AUTO_ADOPT",
+        "SHARE_LINK_TRANSPORT_ALIAS_BACKFILL",
+      ],
+    );
     const metadata = prisma.audits[0].metadata as Record<string, unknown>;
     assert.equal(metadata.historicalCandidateCount, 2);
     assert.equal(metadata.selectionPolicy, "LATEST_CREATED_AT");
@@ -2098,9 +2189,28 @@ describe("canonical adoption of historical single-video links", () => {
       assert.equal(result.outcome, "REUSED");
     }
     assert.equal(new Set(results.map((row) => row.publicUrl)).size, 1);
-    // Exactly one adoption was audited, however many requests raced.
-    assert.equal(prisma.audits.length, 1);
+    // Exactly one adoption was audited, however many requests raced — and
+    // exactly one transport-alias backfill: the conditional update admits a
+    // single writer, and every other racer reloads that writer's value.
     assert.equal(prisma.audits[0].action, "CANONICAL_SHARE_LINK_AUTO_ADOPT");
+    assert.equal(
+      prisma.audits.filter(
+        (row) => row.action === "CANONICAL_SHARE_LINK_AUTO_ADOPT",
+      ).length,
+      1,
+    );
+    assert.equal(
+      prisma.audits.filter(
+        (row) => row.action === "SHARE_LINK_TRANSPORT_ALIAS_BACKFILL",
+      ).length,
+      1,
+    );
+    assert.equal(prisma.audits.length, 2);
+    assert.equal(
+      new Set(results.map((row) => row.compatibilityUrl)).size,
+      1,
+      "every racer reports the one transport alias",
+    );
   });
 
   it("C15 concurrent requests on a REVOKED newest all deny, and mint nothing", async () => {
@@ -2424,5 +2534,752 @@ describe("canonical create closes its time-of-check/time-of-use windows", () => 
       "identity is pinned; only usability failed",
     );
     assert.equal(prisma.shareLinks.size, 1, "no replacement minted");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CANON-TA — the email-safe transport alias rides on the canonical identity
+//
+// `/watch?r=<transportAlias>` is a SEPARATE 128-bit identifier from `alias`.
+// It is minted with a fresh canonical link, backfilled exactly once onto an
+// existing canonical link the first time that link is re-issued WHILE USABLE,
+// and never minted for a link `assertReusable()` refuses. Design:
+// docs/superpowers/specs/2026-09-02-email-safe-reviewer-url-design.md
+// ---------------------------------------------------------------------------
+
+describe("canonical transport alias (email-safe reviewer URL)", () => {
+  const TRANSPORT_ALIAS_RE = /^[A-Za-z0-9_-]{22}$/;
+  const HOST = "https://plushcomedystudios.com";
+
+  it("CANON-TA-01 a fresh canonical mint carries a 22-character transport alias and a query-form URL", async () => {
+    const { prisma, service } = createHarness();
+
+    const created = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    const link = prisma.shareLinks.get(created.shareLink.id);
+
+    assert.equal(created.outcome, "CREATED");
+    assert.match(link?.transportAlias ?? "", TRANSPORT_ALIAS_RE);
+    assert.equal(
+      created.compatibilityUrl,
+      `${HOST}/watch?r=${link?.transportAlias}`,
+    );
+    assert.equal(created.shareLink.compatibilityUrl, created.compatibilityUrl);
+    // The #k URL is exactly what it was, and the two URLs share no
+    // credential text in either direction.
+    assert.equal(
+      created.publicUrl,
+      `${HOST}/watch#k=${created.shareLink.alias}`,
+    );
+    assert.equal(
+      created.compatibilityUrl?.includes(created.shareLink.alias ?? "!"),
+      false,
+    );
+    assert.equal(
+      created.publicUrl?.includes(link?.transportAlias ?? "!"),
+      false,
+    );
+    assert.notEqual(link?.transportAlias, link?.alias);
+  });
+
+  it("CANON-TA-02 REUSED returns the same compatibility URL and mints nothing", async () => {
+    const { prisma, service } = createHarness();
+    const first = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    const minted = prisma.shareLinks.get(first.shareLink.id)?.transportAlias;
+
+    const second = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-2",
+    );
+
+    assert.equal(second.outcome, "REUSED");
+    assert.equal(second.compatibilityUrl, first.compatibilityUrl);
+    assert.equal(
+      prisma.shareLinks.get(first.shareLink.id)?.transportAlias,
+      minted,
+    );
+    assert.equal(prisma.shareLinks.size, 1);
+    assert.equal(
+      prisma.audits.filter(
+        (row) => row.action === "SHARE_LINK_TRANSPORT_ALIAS_BACKFILL",
+      ).length,
+      0,
+    );
+  });
+
+  it("CANON-TA-03 a canonical link written before the column existed is backfilled exactly once", async () => {
+    const { prisma, service } = createHarness();
+    const first = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    const link = prisma.shareLinks.get(first.shareLink.id);
+    assert.ok(link);
+    // A mapping committed by the previous build: no transport alias.
+    link.transportAlias = null;
+
+    const second = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-2",
+    );
+
+    assert.equal(second.outcome, "REUSED");
+    assert.match(link.transportAlias ?? "", TRANSPORT_ALIAS_RE);
+    assert.equal(
+      second.compatibilityUrl,
+      `${HOST}/watch?r=${link.transportAlias}`,
+    );
+    assert.equal(second.shareLink.compatibilityUrl, second.compatibilityUrl);
+    // Identity untouched: same id, same alias, same #k URL.
+    assert.equal(second.shareLink.id, first.shareLink.id);
+    assert.equal(second.shareLink.alias, first.shareLink.alias);
+    assert.equal(second.publicUrl, first.publicUrl);
+
+    const third = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-3",
+    );
+    assert.equal(third.compatibilityUrl, second.compatibilityUrl);
+    assert.equal(prisma.shareLinks.size, 1);
+
+    // Audited once, with ids only — never the alias, the transport alias or
+    // a token.
+    const backfills = prisma.audits.filter(
+      (row) => row.action === "SHARE_LINK_TRANSPORT_ALIAS_BACKFILL",
+    );
+    assert.equal(backfills.length, 1);
+    assert.equal(backfills[0].entityId, link.id);
+    const serialized = JSON.stringify(backfills[0].metadata);
+    assert.equal(serialized.includes(link.transportAlias ?? "!"), false);
+    assert.equal(serialized.includes(link.alias ?? "!"), false);
+    assert.equal(serialized.includes(link.tokenHash), false);
+  });
+
+  it("CANON-TA-04 a REVOKED canonical link is never given a transport alias", async () => {
+    const { prisma, service } = createHarness();
+    const first = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    const link = prisma.shareLinks.get(first.shareLink.id);
+    assert.ok(link);
+    link.transportAlias = null;
+    link.status = "REVOKED";
+
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-2",
+      ),
+      expectConflictCode("CANONICAL_LINK_REVOKED"),
+    );
+
+    assert.equal(link.transportAlias, null);
+    assert.equal(
+      prisma.audits.some(
+        (row) => row.action === "SHARE_LINK_TRANSPORT_ALIAS_BACKFILL",
+      ),
+      false,
+    );
+  });
+
+  it("CANON-TA-04 a DISABLED, expiring or view-limited canonical link is never given one either", async () => {
+    for (const overrides of [
+      { status: "DISABLED" },
+      { expiresAt: new Date("2099-01-01") },
+      { maxViews: 3 },
+    ] as const) {
+      const { prisma, service } = createHarness();
+      const first = await service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      );
+      const link = prisma.shareLinks.get(first.shareLink.id);
+      assert.ok(link);
+      link.transportAlias = null;
+      Object.assign(link, overrides);
+
+      await assert.rejects(
+        service.createShareLinkForRequest(
+          "site-a",
+          singleVideoRequest("video-1"),
+          "admin-2",
+        ),
+        ConflictException,
+        JSON.stringify(overrides),
+      );
+      assert.equal(link.transportAlias, null, JSON.stringify(overrides));
+    }
+  });
+
+  it("CANON-TA-05 an ACTIVE historical link adopted as canonical is backfilled; a REVOKED one is pinned and left alone", async () => {
+    const active = createHarness();
+    const activeId = seedHistoricalLink(active.prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-active",
+    });
+
+    const adopted = await active.service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    const adoptedLink = active.prisma.shareLinks.get(activeId);
+
+    assert.equal(adopted.outcome, "REUSED");
+    assert.equal(adopted.shareLink.id, activeId);
+    assert.match(adoptedLink?.transportAlias ?? "", TRANSPORT_ALIAS_RE);
+    assert.equal(
+      adopted.compatibilityUrl,
+      `${HOST}/watch?r=${adoptedLink?.transportAlias}`,
+    );
+    assert.equal(adopted.publicUrl, `${HOST}/watch#k=hist-active`);
+
+    const revoked = createHarness();
+    const revokedId = seedHistoricalLink(revoked.prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-revoked",
+      status: "REVOKED",
+    });
+
+    await assert.rejects(
+      revoked.service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      ),
+      expectConflictCode("CANONICAL_LINK_REVOKED"),
+    );
+    assert.equal(
+      revoked.prisma.shareLinks.get(revokedId)?.transportAlias,
+      null,
+    );
+    assert.equal(revoked.prisma.shareLinks.size, 1, "nothing minted");
+  });
+
+  it("CANON-TA-06 a multi-video bundle is routed away and receives NO email-safe URL", async () => {
+    /* SCOPE. The email-safe URL is canonical-single-video only in this
+       release. A two-video request is routed to the bundle path, which mints
+       no transport alias and emits no compatibility URL — proven against the
+       REAL service in `share-link-scope.test.ts`; this asserts the routing
+       decision and the shape the router returns. */
+    const { prisma, service } = createHarness();
+
+    const bundle = await service.createShareLinkForRequest(
+      "site-a",
+      { videoIds: ["video-1", "video-2"] } as CreateShareLinkDto,
+      "admin-1",
+    );
+
+    assert.equal(bundle.isCanonical, false);
+    assert.equal(bundle.compatibilityUrl, null);
+    // The `#k` URL is untouched, and no alternate credential was written.
+    assert.match(
+      bundle.publicUrl ?? "",
+      /^https:\/\/plushcomedystudios\.com\/watch#k=/,
+    );
+    assert.equal(
+      prisma.canonicals.size,
+      0,
+      "no canonical mapping for a bundle",
+    );
+    for (const link of prisma.shareLinks.values()) {
+      assert.equal(link.transportAlias ?? null, null);
+    }
+  });
+
+  it("CANON-TA-07 a canonical mapping anchored to a MULTI-VIDEO link emits no email-safe URL", async () => {
+    /* THE READ PATH, AND THE REASON THE PREDICATE LIVES AT THE EMISSION SITE.
+     *
+     * `getCanonical()` reaches `toResponse()` WITHOUT `assertReusable()`, so a
+     * guard placed in the caller would not run here. A mapping whose anchored
+     * link has grown a second member is a data-integrity fault — but it is
+     * exactly the shape that must never receive a bundle-capable credential,
+     * so the emission site itself refuses it. */
+    const { prisma, service } = createHarness();
+    const created = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    const link = prisma.shareLinks.get(created.shareLink.id);
+    assert.ok(link);
+    assert.match(link.transportAlias ?? "", /^[A-Za-z0-9_-]{22}$/);
+    // Positive control: while it is genuinely single-video, the READ path emits.
+    const before = await service.getCanonical("site-a", "video-1");
+    assert.equal(before.compatibilityUrl, created.compatibilityUrl);
+    assert.ok(before.compatibilityUrl);
+
+    // A second member appears on the anchored link.
+    prisma.shareLinkVideos.push({
+      shareLinkId: link.id,
+      videoId: "video-2",
+      sortOrder: 1,
+    });
+
+    const after = await service.getCanonical("site-a", "video-1");
+    assert.equal(after.compatibilityUrl, null, "a bundle must not be emitted");
+    assert.equal(after.shareLink.compatibilityUrl, null);
+    // The `#k` URLs are unchanged — this release withholds the NEW field only.
+    assert.equal(after.publicUrl, before.publicUrl);
+    assert.equal(after.reviewUrl, before.reviewUrl);
+  });
+
+  it("CANON-TA-08 a canonical mapping whose link grew a budget or expiry emits no email-safe URL", async () => {
+    for (const mutation of [
+      { maxViews: 5 },
+      { expiresAt: new Date("2099-01-01") },
+      { status: "REVOKED" },
+    ] as const) {
+      const { prisma, service } = createHarness();
+      const created = await service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-1",
+      );
+      assert.ok(created.compatibilityUrl, "positive control");
+
+      const link = prisma.shareLinks.get(created.shareLink.id);
+      assert.ok(link);
+      Object.assign(link, mutation);
+
+      const read = await service.getCanonical("site-a", "video-1");
+      assert.equal(
+        read.compatibilityUrl,
+        null,
+        `emitted despite ${JSON.stringify(mutation)}`,
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CANON-TA-CAP — the reviewer-frontend capability gate
+//
+// This backend serves several reviewer frontends and only some redeem
+// `/watch?r=`. A compatibility URL emitted for one that cannot is a silent
+// broken link, so emission is gated on an explicit per-host declaration.
+// ---------------------------------------------------------------------------
+
+describe("canonical transport alias capability gate", () => {
+  it("CANON-TA-CAP-01 emits no compatibility URL for an unsupported host, while #k is unaffected", async () => {
+    const { prisma, service } = createHarness();
+
+    // site-b resolves to other-site.com, which the stub does not declare.
+    const created = await service.createShareLinkForRequest(
+      "site-b",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+
+    assert.equal(created.outcome, "CREATED");
+    assert.equal(created.compatibilityUrl, null);
+    assert.equal(created.shareLink.compatibilityUrl, null);
+    // The fragment URL is untouched and still the operator's link.
+    assert.equal(
+      created.publicUrl,
+      `https://other-site.com/watch#k=${created.shareLink.alias}`,
+    );
+    // The alias IS minted and persisted, so declaring the host later is a
+    // configuration change with no data to backfill.
+    const link = prisma.shareLinks.get(created.shareLink.id);
+    assert.match(link?.transportAlias ?? "", /^[A-Za-z0-9_-]{22}$/);
+  });
+
+  it("CANON-TA-CAP-02 the same pair emits a URL once its host is declared", async () => {
+    const supported = createHarness();
+    const created = await supported.service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+
+    assert.match(
+      created.compatibilityUrl ?? "",
+      /^https:\/\/plushcomedystudios\.com\/watch\?r=[A-Za-z0-9_-]{22}$/,
+    );
+  });
+
+  it("CANON-TA-CAP-03 a reused link on an unsupported host still reports null", async () => {
+    const { service } = createHarness();
+    await service.createShareLinkForRequest(
+      "site-b",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+
+    const reused = await service.createShareLinkForRequest(
+      "site-b",
+      singleVideoRequest("video-1"),
+      "admin-2",
+    );
+
+    assert.equal(reused.outcome, "REUSED");
+    assert.equal(reused.compatibilityUrl, null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CANON-TA-RACE — concurrent backfill convergence
+//
+// Two operators press "Get link" at the same moment on a canonical pair whose
+// transport alias predates the column. Exactly one write may land, and BOTH
+// responses must carry the value that actually landed. A response built from
+// the caller's own generated value would hand a loser a string no reviewer
+// could redeem.
+// ---------------------------------------------------------------------------
+
+describe("canonical transport alias backfill under concurrency", () => {
+  const TRANSPORT_ALIAS_RE = /^[A-Za-z0-9_-]{22}$/;
+
+  /** A canonical pair that exists, is reusable, and has no transport alias. */
+  async function seedBackfillablePair(): Promise<{
+    prisma: FakePrisma;
+    service: CanonicalShareLinkService;
+    shareLinkId: string;
+  }> {
+    const { prisma, service } = createHarness();
+    const first = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    const link = prisma.shareLinks.get(first.shareLink.id);
+    assert.ok(link);
+    link.transportAlias = null;
+    prisma.persistedTransportAliases.length = 0;
+    prisma.audits.length = 0;
+
+    return { prisma, service, shareLinkId: first.shareLink.id };
+  }
+
+  it("CANON-TA-RACE-01 two concurrent reuses converge on ONE persisted alias", async () => {
+    const { prisma, service, shareLinkId } = await seedBackfillablePair();
+
+    const [a, b] = await Promise.all([
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-2",
+      ),
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-3",
+      ),
+    ]);
+
+    const persisted = prisma.shareLinks.get(shareLinkId)?.transportAlias;
+
+    // Exactly one write landed.
+    assert.equal(prisma.persistedTransportAliases.length, 1);
+    assert.match(persisted ?? "", TRANSPORT_ALIAS_RE);
+    assert.equal(prisma.persistedTransportAliases[0], persisted);
+
+    // BOTH responses carry that same persisted value. Neither is null, and
+    // neither carries a value that was generated but never stored.
+    const expected = `https://plushcomedystudios.com/watch?r=${persisted}`;
+    assert.equal(a.compatibilityUrl, expected);
+    assert.equal(b.compatibilityUrl, expected);
+    assert.equal(a.shareLink.compatibilityUrl, expected);
+    assert.equal(b.shareLink.compatibilityUrl, expected);
+
+    // One mapping, one share link, no mint, no fallback.
+    assert.equal(prisma.canonicals.size, 1);
+    assert.equal(prisma.shareLinks.size, 1);
+    assert.equal(a.shareLink.id, shareLinkId);
+    assert.equal(b.shareLink.id, shareLinkId);
+    assert.equal(a.outcome, "REUSED");
+    assert.equal(b.outcome, "REUSED");
+    assert.equal(a.publicUrl, b.publicUrl);
+
+    // Deterministic audit: the writer audits, the loser does not.
+    assert.equal(
+      prisma.audits.filter(
+        (row) => row.action === "SHARE_LINK_TRANSPORT_ALIAS_BACKFILL",
+      ).length,
+      1,
+    );
+  });
+
+  it("CANON-TA-RACE-02 the property holds at higher concurrency", async () => {
+    const { prisma, service, shareLinkId } = await seedBackfillablePair();
+
+    const results = await Promise.all(
+      Array.from({ length: 12 }, (_unused, index) =>
+        service.createShareLinkForRequest(
+          "site-a",
+          singleVideoRequest("video-1"),
+          `admin-${index}`,
+        ),
+      ),
+    );
+
+    const persisted = prisma.shareLinks.get(shareLinkId)?.transportAlias;
+    assert.match(persisted ?? "", TRANSPORT_ALIAS_RE);
+    assert.equal(prisma.persistedTransportAliases.length, 1);
+    assert.equal(
+      new Set(results.map((row) => row.compatibilityUrl)).size,
+      1,
+      "every racer reports the same URL",
+    );
+    assert.equal(
+      results[0]?.compatibilityUrl,
+      `https://plushcomedystudios.com/watch?r=${persisted}`,
+    );
+    assert.equal(
+      prisma.audits.filter(
+        (row) => row.action === "SHARE_LINK_TRANSPORT_ALIAS_BACKFILL",
+      ).length,
+      1,
+    );
+    assert.equal(prisma.shareLinks.size, 1);
+    assert.equal(prisma.canonicals.size, 1);
+  });
+
+  it("CANON-TA-RACE-03 the LOSER re-reads authoritative state rather than its own generated value", async () => {
+    /* DETERMINISTIC, and it must genuinely reach the loser BRANCH.
+     *
+     * Setting the winner's value before the request starts does not do that:
+     * the service answers such a row from its early return and never runs the
+     * conditional update at all — a test that passes without exercising the
+     * code it names. The hook instead fires INSIDE `updateMany`, after this
+     * request has already read the row as null, which is exactly the window a
+     * concurrent winner commits in. `count` is then 0 and the loser branch is
+     * forced.
+     */
+    const { prisma, service, shareLinkId } = await seedBackfillablePair();
+    const winnerAlias = "wInNeRtRaNsPoRt_01234x";
+
+    prisma.beforeTransportAliasUpdate.push(() => {
+      const row = prisma.shareLinks.get(shareLinkId);
+      assert.ok(row);
+      assert.equal(row.transportAlias, null, "the read really did see null");
+      row.transportAlias = winnerAlias;
+      prisma.persistedTransportAliases.push(winnerAlias);
+    });
+
+    const loser = await service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-loser",
+    );
+
+    // The hook fired, so the loser really did take the count === 0 branch.
+    assert.equal(prisma.beforeTransportAliasUpdate.length, 0);
+    // The loser reports the WINNER's persisted alias, byte for byte — never
+    // the value its own attempt generated.
+    assert.equal(
+      loser.compatibilityUrl,
+      `https://plushcomedystudios.com/watch?r=${winnerAlias}`,
+    );
+    // It wrote nothing of its own and audited nothing.
+    assert.equal(prisma.persistedTransportAliases.length, 1);
+    assert.equal(
+      prisma.shareLinks.get(shareLinkId)?.transportAlias,
+      winnerAlias,
+    );
+    assert.equal(
+      prisma.audits.some(
+        (row) => row.action === "SHARE_LINK_TRANSPORT_ALIAS_BACKFILL",
+      ),
+      false,
+    );
+  });
+
+  it("CANON-TA-RACE-04 a bounded run of unique collisions retries, then reports the truth", async () => {
+    // Four collisions, then success: the bounded retry absorbs them.
+    const recovering = await seedBackfillablePair();
+    recovering.prisma.transportAliasCollisionsRemaining = 4;
+
+    const recovered = await recovering.service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-2",
+    );
+
+    const persisted = recovering.prisma.shareLinks.get(
+      recovering.shareLinkId,
+    )?.transportAlias;
+    assert.match(persisted ?? "", TRANSPORT_ALIAS_RE);
+    assert.equal(
+      recovered.compatibilityUrl,
+      `https://plushcomedystudios.com/watch?r=${persisted}`,
+    );
+
+    // Exhausted: the canonical URL is still returned, and the enhancement
+    // field truthfully reports that nothing was persisted. The request must
+    // NOT fail over it.
+    const exhausted = await seedBackfillablePair();
+    exhausted.prisma.transportAliasCollisionsRemaining = 99;
+
+    const response = await exhausted.service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-2",
+    );
+
+    assert.equal(response.outcome, "REUSED");
+    assert.equal(
+      response.publicUrl,
+      `https://plushcomedystudios.com/watch#k=${response.shareLink.alias}`,
+    );
+    assert.equal(response.compatibilityUrl, null);
+    assert.equal(
+      exhausted.prisma.shareLinks.get(exhausted.shareLinkId)?.transportAlias,
+      null,
+    );
+    assert.equal(exhausted.prisma.persistedTransportAliases.length, 0);
+    assert.equal(
+      exhausted.prisma.audits.some(
+        (row) => row.action === "SHARE_LINK_TRANSPORT_ALIAS_BACKFILL",
+      ),
+      false,
+    );
+  });
+
+  it("CANON-TA-RACE-06 NO audit row from ANY canonical path carries the credential", async () => {
+    /* The mint happens inside the same transaction that writes the CREATE
+       audit row, and the backfill writes its own row. Both are asserted here
+       against the persisted value, not against a list of field names — a leak
+       through a field nobody thought of still fails. */
+    const minted = createHarness();
+    const created = await minted.service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    const mintedAlias = minted.prisma.shareLinks.get(
+      created.shareLink.id,
+    )?.transportAlias;
+    assert.match(mintedAlias ?? "", /^[A-Za-z0-9_-]{22}$/);
+    assert.ok(minted.prisma.audits.length > 0);
+    assert.equal(
+      JSON.stringify(minted.prisma.audits).includes(mintedAlias ?? "!"),
+      false,
+      "CANONICAL_SHARE_LINK_CREATE metadata carries the transport alias",
+    );
+
+    // The ADOPT path, which audits AUTO_ADOPT and then backfills.
+    const adopted = createHarness();
+    seedHistoricalLink(adopted.prisma, {
+      websiteId: "site-a",
+      videoIds: ["video-1"],
+      alias: "hist-active",
+    });
+    const reused = await adopted.service.createShareLinkForRequest(
+      "site-a",
+      singleVideoRequest("video-1"),
+      "admin-1",
+    );
+    const backfilled = adopted.prisma.shareLinks.get(
+      reused.shareLink.id,
+    )?.transportAlias;
+    assert.match(backfilled ?? "", /^[A-Za-z0-9_-]{22}$/);
+    const serialized = JSON.stringify(adopted.prisma.audits);
+    assert.deepEqual(
+      adopted.prisma.audits.map((row) => row.action),
+      [
+        "CANONICAL_SHARE_LINK_AUTO_ADOPT",
+        "SHARE_LINK_TRANSPORT_ALIAS_BACKFILL",
+      ],
+    );
+    assert.equal(serialized.includes(backfilled ?? "!"), false);
+    assert.equal(serialized.includes("hist-active"), false);
+  });
+
+  it("CANON-TA-RACE-07 the exhausted-collision WARNING never names the link's credential", async () => {
+    /* `ensureTransportAlias()` logs a warning when it gives up. That is the
+       one log site in the codebase that runs while a transport alias is in
+       scope, so it is captured and searched rather than assumed safe. */
+    const { prisma, service, shareLinkId } = await seedBackfillablePair();
+    prisma.transportAliasCollisionsRemaining = 99;
+
+    const captured: unknown[] = [];
+    const methods = ["log", "error", "warn", "debug", "verbose"] as const;
+    const prototype = Logger.prototype as unknown as Record<string, unknown>;
+    const originals = new Map(methods.map((m) => [m, prototype[m]]));
+    for (const method of methods) {
+      prototype[method] = (...args: unknown[]): void => {
+        captured.push(...args);
+      };
+    }
+
+    try {
+      await service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-2",
+      );
+    } finally {
+      for (const method of methods) {
+        prototype[method] = originals.get(method);
+      }
+    }
+
+    const text = captured
+      .map((entry) =>
+        typeof entry === "string" ? entry : JSON.stringify(entry),
+      )
+      .join("\n");
+
+    assert.ok(text.length > 0, "the exhausted path did warn");
+    assert.match(text, /Transport alias backfill exhausted/);
+    // It names the ShareLink id, which is a database key and not a credential.
+    assert.ok(text.includes(shareLinkId));
+    // And nothing CREDENTIAL-SHAPED anywhere in it. Every one of the 99
+    // rejected candidates was a well-formed transport alias, so a logger that
+    // echoed the value it tried would be caught here whatever field it used.
+    assert.equal(
+      /[A-Za-z0-9_-]{22}/.test(text.replace(shareLinkId, "")),
+      false,
+      `credential-shaped token in log output: ${text}`,
+    );
+    for (const link of prisma.shareLinks.values()) {
+      if (link.alias) {
+        assert.equal(text.includes(link.alias), false, "share alias logged");
+      }
+    }
+  });
+
+  it("CANON-TA-RACE-05 a non-collision database error is never swallowed", async () => {
+    const { prisma, service, shareLinkId } = await seedBackfillablePair();
+    const originalUpdateMany = prisma.shareLink.updateMany;
+    prisma.shareLink.updateMany = async () => {
+      throw new Prisma.PrismaClientKnownRequestError("write conflict", {
+        code: "P2034",
+        clientVersion: "7.8.0",
+      });
+    };
+
+    await assert.rejects(
+      service.createShareLinkForRequest(
+        "site-a",
+        singleVideoRequest("video-1"),
+        "admin-2",
+      ),
+      (error: unknown) =>
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === "P2034",
+    );
+
+    prisma.shareLink.updateMany = originalUpdateMany;
+    assert.equal(prisma.shareLinks.get(shareLinkId)?.transportAlias, null);
   });
 });

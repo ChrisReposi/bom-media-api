@@ -35,15 +35,94 @@ marked `PLANNED`.
 | Admin session | `AdminSession` row keyed by a UUID | Database only | Same as the refresh token; revocable |
 | Public share token | `s_` + `randomBytes(32).base64url` | Returned once at creation; DB stores only `sha256(SHARE_TOKEN_PEPPER + raw)` | Until revoked/expired/limit reached |
 | Public share alias | `randomBytes(5).base64url` (~7 chars) | **Stored in clear** in `ShareLink.alias`, unique | Same as the share link |
+| Public share **transport alias** | `randomBytes(16).base64url` (22 chars, 128 bits) | **Stored in clear** in `ShareLink.transportAlias`, unique, nullable | Same as the share link |
 | Public media grant | `base64url(payload).base64url(HMAC-SHA256)` via `PUBLIC_MEDIA_GRANT_SECRET` | Query string of media URLs | `min(now + PUBLIC_MEDIA_GRANT_TTL_SECONDS, shareLink.expiresAt)`, clamped 5 min … 24 h |
 | Bunny embed token | `SHA256_HEX(BUNNY_STREAM_TOKEN_SECURITY_KEY + videoId + expires)` | Query string of the Bunny iframe URL | `BUNNY_STREAM_EMBED_TOKEN_TTL_SECONDS`, default 5 min, bounded 1 min … 1 h |
 | Bunny TUS signature | `SHA256_HEX(libraryId + BUNNY_STREAM_API_KEY + expiration + videoId)` | Admin browser only, as a TUS request header | `BUNNY_STREAM_TUS_TTL_SECONDS`, default 1 h, bounded 5 min … 24 h |
 | Admin password | bcrypt, 12 rounds | Database only | Until changed |
 
 > **SECURITY INVARIANT: No raw refresh token and no raw share token is ever
-> persisted.** Only peppered SHA-256 hashes are stored. The alias is the one
-> deliberate exception — it is a short, revocable, per-website lookup key that is
-> useless without a matching `ACTIVE` domain, website and share link.
+> persisted.** Only peppered SHA-256 hashes are stored. The two aliases are the
+> deliberate exceptions — each is a short, revocable, per-website lookup key that
+> is useless without a matching `ACTIVE` domain, website and share link.
+
+### 2.0 The two share-link bearer credentials
+
+> **A ShareLink has TWO bearer credentials, and both are secrets.** Say this
+> precisely; the imprecise version is dangerous.
+
+| | `alias` | `transportAlias` |
+|---|---|---|
+| Role | **the canonical bearer credential** | **an alternate, email-safe bearer credential** |
+| Reviewer URL | `/watch#k=<alias>` — a URI FRAGMENT, never transmitted | `/watch?r=<transportAlias>` — a QUERY STRING, transmitted |
+| Redeemed by | `POST /public/watch/exchange`, `GET /public/watch`, and every media route | `POST /public/watch/exchange-compatible` only |
+| Exists on | every ShareLink | canonical single-video links only, and only where minted or backfilled |
+| Entropy | 96 bits (40 for pre-2026-08-25 links) | 128 bits |
+
+**Possession of either grants access to the same ShareLink**, on that link's
+bound host, until the link is revoked, expires, exhausts `maxViews`, or its
+website/domain/video eligibility lapses. Treat `transportAlias` with exactly
+the care `alias` gets.
+
+What the transport alias is **not** is a second authorization model.
+`resolvePublicWatchCompatible()` maps it to a row and then re-enters the
+**unmodified** `resolvePublicWatch()` by that row's own `alias`, so §4's chain
+is evaluated in one place for both credentials. It confers no permission of
+its own, carries no status, budget or expiry, and cannot outlive its ShareLink.
+
+> **SECURITY INVARIANT: both credentials are redacted from logs, and neither
+> may ever reach `AccessLog`.** `AccessLog` stores a `shareLinkId`, never a
+> credential. The Pino request serializer emits only `id`, `method` and a route
+> TEMPLATE, so **no request body and no query string is ever logged**; the
+> redaction list additionally names `req.body.token`, `req.body.alias`,
+> `req.query.token`, `req.query.grant` and `req.query.r` as a second layer.
+>
+> The one inbound header that can still carry a credential is `Referer`, since
+> a reviewer arriving from `/watch?r=…` or the V1 `/?token=…` names it.
+> `sanitizeAccessLogReferer()` keeps the origin and path and drops everything
+> from the first `?` or `#`, so `AccessLog.referer` records which page the
+> viewer came from and never a credential. `Referrer-Policy: no-referrer` on
+> the reviewer site is a client policy and is not relied on here.
+>
+> Pinned by `test/transport-alias-redaction.test.ts` (R1–R10), which searches
+> serialized output for the literal value rather than trusting field names.
+
+> **THE ALTERNATE SURFACE HAS ITS OWN KILL SWITCH.**
+> `PUBLIC_COMPATIBILITY_URL_HOSTS` gates redemption as well as emission:
+> `PublicService.resolvePublicWatchCompatible()` refuses a host that is not on
+> the list **before it reads the presented credential at all**, using the same
+> `isCompatibilityCapableHost()` predicate the Admin emission path uses, so the
+> two answers cannot drift. Clearing the variable and restarting therefore
+> closes every `/watch?r=` link for that host at once while leaving every `#k`
+> link working.
+>
+> This is a **suspension**, not a revocation, and the difference matters during
+> an incident. Restoring the host makes every previously issued transport alias
+> redeem again, because nothing rotates or clears the column. Destroying one
+> credential still means revoking its `ShareLink`, which destroys the `#k`
+> credential with it.
+
+**Compromise semantics, stated plainly:**
+
+- Compromise of a `transportAlias` grants access to **that one ShareLink**,
+  on its bound host, until that ShareLink becomes invalid or is revoked.
+  Revoking the ShareLink is the permanent remedy, and it stops both
+  credentials at once. Removing the host from
+  `PUBLIC_COMPATIBILITY_URL_HOSTS` is the reversible class-wide remedy: it
+  stops every transport alias on that host without touching `#k`.
+- Compromise of a `transportAlias` **does not reveal the `alias`**. The two
+  values share no bytes and neither is derived from the other; the response to
+  a compatibility exchange carries media URLs built from `alias`, so a holder
+  of the transport alias who completes an exchange does learn the `alias` —
+  but a holder of the *string alone*, from a log or a URL, does not.
+- **The first `?r=` request is visible to the static host, any proxy and any
+  CDN**, in the request line, before a byte of JavaScript runs. The reviewer
+  site scrubs the query from the address bar with `history.replaceState`
+  before any subsequent network activity, which removes it from the history
+  entry and from later `Referer` headers — it does **not** remove it from that
+  first server-side request log. That exposure is inherent to a
+  fragment-independent URL, and it is the reason the query carries a separate
+  credential rather than `alias`.
 
 ### 2.1 Access token behaviour
 
@@ -146,8 +225,20 @@ apply to externally hosted media; see §4.1.
 6. The video must have an `ACTIVE` `WebsiteVideo` assignment **to that website**.
 7. The video must be `VideoStatus.READY` with a usable asset.
 
-Metadata resolution (`/public/watch`, `/public/watch/exchange`) adds a
-`currentViews < maxViews` check and then atomically increments `currentViews`.
+Metadata resolution (`/public/watch`, `/public/watch/exchange`,
+`/public/watch/exchange-compatible`) adds a `currentViews < maxViews` check and
+then atomically increments `currentViews`.
+
+> **The email-safe exchange adds a step 0, not a step.** `exchange-compatible`
+> takes a 22-character `transportAlias` (a separate 128-bit identifier that the
+> `/watch?r=` reviewer URL carries in its query string), maps it to a ShareLink
+> row, and enters the chain above at step 1 with that row's own `alias`. It
+> enforces nothing of its own and skips nothing: the website scope in step 3 is
+> re-imposed by the resolver, a transport alias is refused everywhere else, and
+> a share alias or raw token is refused there by shape. The trade-off — the
+> query carrier is visible to the static host once, the fragment credential
+> never — is recorded in
+> [features/share-links.md §3.1](./features/share-links.md#31-the-email-safe-compatibility-url).
 
 Media routes deliberately **do not** apply the `maxViews` check
 (`getDeniedReasonForMediaPlayback` checks status and expiry only). Instead, when

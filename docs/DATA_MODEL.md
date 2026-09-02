@@ -64,7 +64,7 @@ CanonicalVideoShareLink ─1:1─ ShareLink
 | `slug` unique | `Website` | Website identity |
 | `key` unique | `DomainGroup` | Group identity |
 | `domain` unique **globally** | `WebsiteDomain` | One hostname resolves to exactly one website |
-| `tokenHash` unique, `alias` unique | `ShareLink` | Public credential lookup |
+| `tokenHash` unique, `alias` unique, `transportAlias` unique (nullable) | `ShareLink` | Public credential lookup. All three are bearer credentials: `transportAlias` is the email-safe **alternate** one, resolved only by the compatibility exchange, minted only for canonical single-video links |
 | `(websiteId, videoId)` unique | `WebsiteVideo` | One assignment row per pair |
 | `(shareLinkId, videoId)` unique | `ShareLinkVideo` | One membership row per pair |
 | `(websiteId, videoId)` unique **and** `shareLinkId` unique | `CanonicalVideoShareLink` | Exactly one canonical URL per website+video, and a share link anchors at most one |
@@ -198,9 +198,10 @@ test or build.
 
 ## 9. Migration conventions
 
-- Directory name: `<UTC timestamp>_<snake_case_description>`. 19 migrations
+- Directory name: `<UTC timestamp>_<snake_case_description>`. 20 migrations
   exist, from `20260529163942_init` to
-  `20260719090000_add_video_binary_asset_checksum`.
+  `20260902120000_add_share_link_transport_alias` (an additive nullable
+  `ShareLink.transportAlias VARCHAR(32)` plus its unique index; no backfill).
 - `prisma/migrations/migration_lock.toml` pins `provider = "mysql"`. Never edit.
 - Author migrations locally with `yarn db:migrate:dev` (uses
   `SHADOW_DATABASE_URL`). Apply with `yarn db:migrate:deploy`. Never

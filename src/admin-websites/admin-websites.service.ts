@@ -88,6 +88,7 @@ import { isShortAdminWebsiteSearch } from "./utils/admin-website-search.util";
 import { isShareLinkTokenOrAliasCollision } from "./utils/share-link-errors.util";
 import {
   buildPublicShareUrl,
+  isCompatibilityCapableHost,
   generateShareAlias,
   generateShareToken,
 } from "./utils/share-url.util";
@@ -149,6 +150,7 @@ type ShareLinkValidationClient = Pick<Prisma.TransactionClient, "videoAsset">;
 
 type AuditAction =
   | "DOMAIN_CREATE"
+  | "SHARE_LINK_TRANSPORT_ALIAS_BACKFILL"
   | "DOMAIN_UPDATE"
   | "DOMAIN_DISABLE"
   | "DOMAIN_ACTIVATE"
@@ -1978,6 +1980,11 @@ export class AdminWebsitesService {
                   websiteId,
                   tokenHash,
                   alias,
+                  // NO `transportAlias`. A bundle link never receives an
+                  // email-safe URL (see `buildCanonicalCompatibilityUrl()`),
+                  // so minting one would be an unused alternate bearer
+                  // credential at rest. The column stays NULL for the life of
+                  // the row.
                   label,
                   expiresAt,
                   maxViews,
@@ -2042,9 +2049,14 @@ export class AdminWebsitesService {
       stage = "build-response";
       return {
         message: "Share link created successfully.",
-        shareLink: this.toShareLinkResponse(shareLink, publicUrl),
+        // `compatibilityUrl` is ALWAYS null here, and structurally so: this
+        // path mints no transport alias and no generator exists that could
+        // build a bundle URL from one. See `buildCanonicalCompatibilityUrl()`
+        // for why the email-safe form is canonical-only in this release.
+        shareLink: this.toShareLinkResponse(shareLink, publicUrl, null),
         rawToken,
         publicUrl,
+        compatibilityUrl: null,
         outcome: "CREATED",
         isCanonical: false,
       };
@@ -3053,6 +3065,23 @@ export class AdminWebsitesService {
     return primaryDomain?.domain ?? null;
   }
 
+  /**
+   * Whether the reviewer frontend deployed at this host can redeem
+   * `/watch?r=<transportAlias>`.
+   *
+   * Sits beside `getConfiguredPublicSiteProtocol()` because it answers the
+   * same kind of question about the same host, and both services reach it
+   * through this one method — `CanonicalShareLinkService` delegates here
+   * exactly as it already does for the protocol, so no second copy of the
+   * rule can drift.
+   */
+  supportsCompatibilityUrl(domain: string | null): boolean {
+    return isCompatibilityCapableHost(
+      domain,
+      this.configService.get<string>("PUBLIC_COMPATIBILITY_URL_HOSTS"),
+    );
+  }
+
   getConfiguredPublicSiteProtocol(domain: string | null): string | undefined {
     if (domain !== null && this.isLocalhostDomain(domain)) {
       return (
@@ -3296,6 +3325,9 @@ export class AdminWebsitesService {
   toShareLinkResponse(
     shareLink: ShareLinkWithVideos,
     publicUrl: string | null,
+    // Null wherever `publicUrl` is null (list, revoke): the URLs are surfaced
+    // together or not at all.
+    compatibilityUrl: string | null = null,
   ): AdminShareLinkResponse {
     return {
       id: shareLink.id,
@@ -3310,6 +3342,7 @@ export class AdminWebsitesService {
       updatedAt: shareLink.updatedAt,
       lastViewedAt: shareLink.lastViewedAt,
       publicUrl,
+      compatibilityUrl,
       videos: shareLink.shareLinkVideos.map((shareLinkVideo) => ({
         id: shareLinkVideo.id,
         videoId: shareLinkVideo.videoId,

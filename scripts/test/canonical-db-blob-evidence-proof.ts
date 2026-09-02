@@ -267,7 +267,15 @@ function assertEqualRecord(
   }
 }
 
-async function verifyMigrations(prisma: PrismaClient): Promise<void> {
+/**
+ * The database must carry EXACTLY the migrations this checkout ships.
+ *
+ * Deliberately NOT a literal count. The property is a set comparison against
+ * `prisma/migrations`, so adding a migration needs no edit here; a stale
+ * literal would fail the proof for a reason that has nothing to do with what
+ * it proves. Returns the count so the caller can report the real number.
+ */
+async function verifyMigrations(prisma: PrismaClient): Promise<number> {
   const migrationsOnDisk = readdirSync(
     join(__dirname, "../../prisma/migrations"),
     { withFileTypes: true },
@@ -275,20 +283,25 @@ async function verifyMigrations(prisma: PrismaClient): Promise<void> {
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort();
-  invariant(migrationsOnDisk.length === 19, "expected exactly 19 migrations");
+  invariant(
+    migrationsOnDisk.length > 0,
+    "no migrations found on disk — wrong working directory?",
+  );
 
   const applied = await prisma.$queryRaw<
     { migration_name: string }[]
   >`SELECT migration_name FROM _prisma_migrations WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL`;
   const appliedNames = new Set(applied.map((row) => row.migration_name));
   invariant(
-    appliedNames.size === 19,
-    "test database has an unexpected migration count",
+    appliedNames.size === migrationsOnDisk.length,
+    `test database has ${appliedNames.size} applied migrations, expected ${migrationsOnDisk.length}`,
   );
   invariant(
     migrationsOnDisk.every((name) => appliedNames.has(name)),
     "test database is missing a repository migration",
   );
+
+  return migrationsOnDisk.length;
 }
 
 function createProofBuffers(): { bufferA: Buffer; bufferB: Buffer } {
@@ -1137,9 +1150,9 @@ async function main(): Promise<void> {
 
   try {
     prisma = createStandalonePrisma(guarded.database);
-    await verifyMigrations(prisma);
+    const migrationCount = await verifyMigrations(prisma);
     initialCounts = await countDatabase(prisma);
-    console.log(`Migrations verified: 19; run=${runId}`);
+    console.log(`Migrations verified: ${migrationCount}; run=${runId}`);
     console.log(`Initial isolated counts: ${JSON.stringify(initialCounts)}`);
 
     await setupBaseFixtures({

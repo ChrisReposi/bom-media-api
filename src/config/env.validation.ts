@@ -27,6 +27,7 @@ import {
 import { isBunnyPullZoneHostname } from "../bunny/bunny-thumbnail.util";
 import { isAbsolute } from "node:path";
 import proxyaddr from "proxy-addr";
+import { normalizeWebsiteDomain } from "../common/utils/domain.util";
 
 const BOOLEAN_VALUES = new Set(["true", "false", "1", "0"]);
 const DEFAULT_VIDEO_DB_UPLOAD_MB = 50;
@@ -418,6 +419,31 @@ export function validateEnv(
   );
   if (publicShareLocalProtocol !== undefined) {
     validated.PUBLIC_SHARE_LOCAL_PROTOCOL = publicShareLocalProtocol;
+  }
+
+  // REVIEWER-CLIENT CAPABILITY (see share-url.util.ts). Hosts whose deployed
+  // reviewer frontend can redeem `/watch?r=<transportAlias>`. Unset means no
+  // host gets an email-safe URL, which is the correct fail-closed default:
+  // every frontend redeems `#k=`, and only some redeem `?r=`.
+  //
+  // A malformed entry FAILS AT BOOT rather than being dropped, because a
+  // silently ignored entry would present as "the feature is off for that
+  // customer" and send an operator looking in the wrong place.
+  if (typeof config.PUBLIC_COMPATIBILITY_URL_HOSTS === "string") {
+    const raw = config.PUBLIC_COMPATIBILITY_URL_HOSTS.trim();
+    if (raw.length > 0) {
+      for (const entry of raw.split(",")) {
+        if (entry.trim().length === 0) {
+          continue;
+        }
+        if (normalizeWebsiteDomain(entry) === null) {
+          throw new Error(
+            `PUBLIC_COMPATIBILITY_URL_HOSTS contains an invalid host: "${entry.trim()}"`,
+          );
+        }
+      }
+    }
+    validated.PUBLIC_COMPATIBILITY_URL_HOSTS = raw;
   }
   if (typeof config.CORS_ALLOWED_ORIGINS === "string") {
     process.env.CORS_ALLOWED_ORIGINS = config.CORS_ALLOWED_ORIGINS;

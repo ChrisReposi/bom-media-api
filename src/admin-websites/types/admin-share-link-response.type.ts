@@ -52,6 +52,13 @@ export class AdminShareLinkResponse {
   @ApiPropertyOptional({ nullable: true })
   publicUrl!: string | null;
 
+  @ApiPropertyOptional({
+    nullable: true,
+    description:
+      "The EMAIL-SAFE reviewer URL, `https://<domain>/watch?r=<transportAlias>`. Carries a separate 128-bit transport identifier in the query string — never the `#k` credential — and resolves to this same ShareLink under every check `publicUrl` is subject to. Null on list and revoke responses, and for a link that has no transport alias yet.",
+  })
+  compatibilityUrl!: string | null;
+
   @ApiProperty({ type: [AdminShareLinkVideoResponse] })
   videos!: AdminShareLinkVideoResponse[];
 }
@@ -76,6 +83,13 @@ export class CreateShareLinkResponse {
 
   @ApiPropertyOptional({ nullable: true })
   publicUrl!: string | null;
+
+  @ApiPropertyOptional({
+    nullable: true,
+    description:
+      "The email-safe reviewer URL (`/watch?r=<transportAlias>`) for the same link as `publicUrl`. Survives fragment-stripping mail clients; see the security note in docs/features/share-links.md before preferring it.",
+  })
+  compatibilityUrl!: string | null;
 
   @ApiProperty({
     enum: ["CREATED", "REUSED"],

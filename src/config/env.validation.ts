@@ -308,11 +308,57 @@ export function validateEnv(
     throw new Error("PUBLIC_MEDIA_GRANT_SECRET must be at least 32 characters");
   }
   validated.PUBLIC_MEDIA_GRANT_SECRET = mediaGrantSecret;
+  /* THE RESUME SUBSYSTEM SIGNS WITH ITS OWN KEY.
+     Domain separation would be cryptographically sufficient and is still
+     applied on top of this; a separate secret buys the operational
+     properties a shared one cannot. Rotating this ends every resume session
+     without invalidating media grants already sitting in reviewers' DOMs for
+     up to 24 hours, and rotating the media secret no longer signs reviewers
+     out of working sessions.
+
+     Required in production and defaulted only outside it, exactly like the
+     media grant secret. THE ORDERING MATTERS AT DEPLOY TIME: set this in the
+     environment BEFORE the build that reads it goes live, or the process
+     fails fast at boot. That fail-fast is deliberate — a resume subsystem
+     silently falling back to another key would be a configuration error
+     nobody could see. */
+  const resumeSecret = isProduction
+    ? readRequiredString(config, "PUBLIC_WATCH_RESUME_SECRET")
+    : readString(
+        config,
+        "PUBLIC_WATCH_RESUME_SECRET",
+        "local-public-watch-resume-secret-change-me",
+      );
+  if (resumeSecret.length < 32) {
+    throw new Error("PUBLIC_WATCH_RESUME_SECRET must be at least 32 characters");
+  }
+  validated.PUBLIC_WATCH_RESUME_SECRET = resumeSecret;
   validated.PUBLIC_MEDIA_GRANT_TTL_SECONDS = String(
     readBoundedInteger(
       config,
       "PUBLIC_MEDIA_GRANT_TTL_SECONDS",
       6 * 60 * 60,
+      5 * 60,
+      24 * 60 * 60,
+    ),
+  );
+  /* How long a reviewer may resume a scrubbed session in the same tab.
+     Resume grants and rmv1 media use PUBLIC_WATCH_RESUME_SECRET under
+     distinct MAC domains. Legacy media grants keep
+     PUBLIC_MEDIA_GRANT_SECRET and their unchanged wire bytes — see
+     `utils/grant-signature.util.ts`.
+
+     Bounded 5 minutes … 24 hours and THROWS out of range, like every other
+     bounded value here. The ceiling is the point: a resume grant is a bearer
+     credential that redeems into the reviewer payload, so an effectively
+     permanent one would be a durable credential in browser storage. 8 hours
+     covers a working day of refreshes; a reviewer who returns tomorrow opens
+     the email-safe link again, which is free and mints a new one. */
+  validated.PUBLIC_WATCH_RESUME_TTL_SECONDS = String(
+    readBoundedInteger(
+      config,
+      "PUBLIC_WATCH_RESUME_TTL_SECONDS",
+      8 * 60 * 60,
       5 * 60,
       24 * 60 * 60,
     ),

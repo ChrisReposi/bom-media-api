@@ -14,6 +14,7 @@ import {
   WebsiteStatus,
 } from "../src/generated/prisma/client";
 import { PublicMediaGrantService } from "../src/public/public-media-grant.service";
+import { PublicReviewResumeService } from "../src/public/public-review-resume.service";
 import { PublicService } from "../src/public/public.service";
 import { hashShareToken } from "../src/public/utils/share-token.util";
 
@@ -294,6 +295,7 @@ function createService(
     new FakeLocalVideoStorageService() as never,
     new FakeVideoViewGrowthService() as never,
     new PublicMediaGrantService(config as never),
+    new PublicReviewResumeService(config as never),
     options.memoryCache === true ? createMemoryCache() : undefined,
   );
 

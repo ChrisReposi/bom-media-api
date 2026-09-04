@@ -195,7 +195,62 @@ describe("COMPAT-02 ?r=<transportAlias> opens the same ShareLink", () => {
     const viaR = await viaCompat(compat.service, LEGACY_TRANSPORT_ALIAS);
 
     assert.equal(viaR.valid, true);
-    assert.deepEqual(viaR, viaK);
+
+    // TWO PERMITTED DIFFERENCES, BOTH PINNED IN BOTH DIRECTIONS.
+    //
+    // 1. `resumeGrant` is minted only for the flow that scrubs its own carrier
+    //    from the address bar, because that is the only flow a refresh would
+    //    otherwise strand. The `#k` fragment survives a reload unaided, so it
+    //    needs none — and issuing one there would be a second credential
+    //    handed out for no reason.
+    //
+    // 2. THE BACKEND MEDIA URLS DIFFER, AND THAT IS THE SECURITY FIX.
+    //    A media URL echoes the presented token into its `:token` path
+    //    segment. The `#k` caller presented the alias, so echoing it back
+    //    discloses nothing. The `?r=` caller presented only a TRANSPORT
+    //    alias — so echoing the canonical alias let one redemption convert
+    //    the weaker credential into the permanent one, and keep working after
+    //    the host was removed from `PUBLIC_COMPATIBILITY_URL_HOSTS`. The
+    //    compatibility reply now carries per-video `rmv1` tokens.
+    //
+    // Everything a reviewer SEES is still identical; that is asserted below
+    // by stripping exactly these fields and comparing the rest.
+    assert.equal(typeof viaR.resumeGrant, "string");
+    assert.ok((viaR.resumeGrant ?? "").length > 0);
+    // ABSENT on the `#k` body, not present-and-null. `in` is what tells those
+    // two apart, and the pre-feature contract is "absent".
+    assert.equal("resumeGrant" in viaK, false);
+
+    const strip = (response: PublicWatchResponse) => ({
+      ...response,
+      // DELETED, not nulled. `resumeGrant` is an OPTIONAL property now, and
+      // the difference between "absent" and "present and null" is the whole
+      // of HIGH-3 — setting it here would make this comparison blind to
+      // exactly the regression the golden contract exists to catch.
+      resumeGrant: undefined,
+      videos: response.videos.map((video) => ({
+        ...video,
+        publicPlaybackUrl: null,
+        binaryPlaybackUrl: null,
+        thumbnailUrl: null,
+        publicThumbnailUrl: null,
+      })),
+    });
+    assert.deepEqual(strip(viaR), strip(viaK));
+
+    // The stripped URLs are genuinely different and genuinely present, so the
+    // comparison above cannot be passing on two empty sets.
+    const kUrls = viaK.videos.map((video) => video.publicPlaybackUrl);
+    const rUrls = viaR.videos.map((video) => video.publicPlaybackUrl);
+    assert.ok(kUrls.some((url) => typeof url === "string"));
+    assert.notDeepEqual(rUrls, kUrls);
+
+    // And the grant is not a smuggled credential: neither alias appears in it.
+    assert.equal((viaR.resumeGrant ?? "").includes(LEGACY_ALIAS), false);
+    assert.equal(
+      (viaR.resumeGrant ?? "").includes(LEGACY_TRANSPORT_ALIAS),
+      false,
+    );
     assert.deepEqual(
       compat.prisma.accessLogs.map((log) => [
         log.status,
@@ -206,7 +261,7 @@ describe("COMPAT-02 ?r=<transportAlias> opens the same ShareLink", () => {
     );
   });
 
-  it("issues media URLs that carry the ShareLink's OWN alias, so every media route is unchanged", async () => {
+  it("COMPAT-ALIAS-10 issues media URLs that carry NO credential at all", async () => {
     const { service } = harness();
 
     const response = await viaCompat(service, LEGACY_TRANSPORT_ALIAS);
@@ -214,26 +269,79 @@ describe("COMPAT-02 ?r=<transportAlias> opens the same ShareLink", () => {
       (video) => video.id === "video-local-file",
     );
     const playback = parseMediaUrl(local?.publicPlaybackUrl);
+    const segments = playback.pathname.split("/");
+    const token = segments[segments.indexOf("watch") + 1] as string;
 
+    /* COMPAT-ALIAS-03. THIS ASSERTION WAS INVERTED ON 2026-09-03, and the
+       inversion is the fix rather than a relaxation.
+
+       It used to require the pathname to be
+       `/api/v1/public/watch/<LEGACY_ALIAS>/videos/…` — i.e. it PINNED the
+       canonical alias into a reply whose caller had presented only a
+       transport alias. That is a credential escalation: redeem a stolen `?r=`
+       once, read the alias out of `publicPlaybackUrl`, and use
+       `/watch#k=<alias>` indefinitely — surviving removal of the host from
+       `PUBLIC_COMPATIBILITY_URL_HOSTS`, which is precisely the operational
+       property that switch exists to provide.
+
+       The reply now carries a per-video, host-bound, short-lived media token
+       instead, and the assertion states the property the old one contradicted. */
     assert.equal(
       playback.pathname,
-      `/api/v1/public/watch/${LEGACY_ALIAS}/videos/video-local-file/local-file`,
+      `/api/v1/public/watch/${token}/videos/video-local-file/local-file`,
     );
+    assert.ok(token.startsWith("rmv1"), token.slice(0, 24));
+    assert.notEqual(token, LEGACY_ALIAS);
     assert.equal(playback.params.host, LEGACY_HOST);
-    // The transport alias reaches NO part of the response: not a media URL,
-    // not a poster URL, not any other field.
+
+    // COMPAT-ALIAS-01. NEITHER credential reaches ANY part of the reply —
+    // searched as a literal over the whole serialized body, so a field added
+    // later that happens to carry one fails here without anyone remembering
+    // to look.
+    assert.equal(JSON.stringify(response).includes(LEGACY_ALIAS), false);
     assert.equal(
       JSON.stringify(response).includes(LEGACY_TRANSPORT_ALIAS),
       false,
     );
 
-    // And that URL is servable by the existing local-file route as-is.
+    // And that URL is servable by the existing local-file route as-is —
+    // closing the disclosure by emitting a URL that does not work would pass
+    // every assertion above and break every reviewer.
     const file = await service.getPublicLocalVideoFile({
       host: playback.params.host,
-      token: LEGACY_ALIAS,
+      token,
       videoId: "video-local-file",
     });
     assert.equal(file.statusCode, 200);
+
+    // COMPAT-ALIAS-09. The token opens nothing as a share credential.
+    assert.deepEqual(
+      await service.resolvePublicWatch({
+        host: LEGACY_HOST,
+        token,
+        requestMeta: REQUEST_META,
+      }),
+      PUBLIC_DENIAL_RESPONSE,
+    );
+  });
+
+  it("COMPAT-ALIAS-12 the #k path still echoes its own credential, byte for byte", async () => {
+    // The other half of the contract, and the reason the change is scoped to
+    // one origin: a `#k` caller presented the alias, so echoing it back
+    // discloses nothing they did not already hold — and every deployed client
+    // and the release-blocking compatibility suite depend on that URL shape.
+    const { service } = harness();
+
+    const response = await viaFragment(service, LEGACY_ALIAS);
+    const local = response.videos.find(
+      (video) => video.id === "video-local-file",
+    );
+
+    assert.equal(
+      parseMediaUrl(local?.publicPlaybackUrl).pathname,
+      `/api/v1/public/watch/${LEGACY_ALIAS}/videos/video-local-file/local-file`,
+    );
+    assert.equal("resumeGrant" in response, false);
   });
 
   it("does not consult the credential of a DIFFERENT ShareLink", async () => {

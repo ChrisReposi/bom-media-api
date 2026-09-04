@@ -75,6 +75,10 @@ export function serializeRequestForLogs(
             // rather than being discovered later in a log file.
             "req.body.token",
             "req.body.alias",
+            // The resume grant. Not a share credential — it names a row and a
+            // host and authorizes nothing on its own — but redeeming one
+            // restores the session, so it is redacted with the rest.
+            "req.body.grant",
             "req.query.r",
           ],
           censor: "[Redacted]",

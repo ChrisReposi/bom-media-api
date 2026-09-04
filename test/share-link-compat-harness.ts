@@ -38,6 +38,7 @@ import {
 import { MemoryCacheService } from "../src/cache/memory-cache.service";
 import type { MemoryCacheRuntimeConfig } from "../src/cache/memory-cache.types";
 import { PublicMediaGrantService } from "../src/public/public-media-grant.service";
+import { PublicReviewResumeService } from "../src/public/public-review-resume.service";
 import { PublicService } from "../src/public/public.service";
 
 /* ------------------------------------------------------------------ *
@@ -929,7 +930,12 @@ export class CompatPrismaService {
 
   shareLink = {
     findFirst: async (args: {
-      where: { alias?: string; tokenHash?: string; websiteId?: string };
+      where: {
+        id?: string;
+        alias?: string;
+        tokenHash?: string;
+        websiteId?: string;
+      };
       include?: { shareLinkVideos?: ShareLinkVideosQuery };
     }) => {
       this.counters.shareLinkFindFirst += 1;
@@ -942,6 +948,14 @@ export class CompatPrismaService {
           link.websiteId !== args.where.websiteId
         ) {
           return false;
+        }
+        /* Added for the RESUME MEDIA TOKEN, which names a ShareLink by id
+           rather than presenting a credential for it. Applied ONLY when the
+           query asks for it, like every other predicate here — so dropping
+           `websiteId` from that lookup would surface as a cross-tenant
+           authorization failure rather than as "nothing resolves". */
+        if (args.where.id !== undefined) {
+          return link.id === args.where.id;
         }
         if (args.where.alias !== undefined) {
           return link.alias !== null && link.alias === args.where.alias;
@@ -1235,6 +1249,11 @@ export class CompatConfigService {
       PUBLIC_MEDIA_GRANT_SECRET:
         "compat-suite-public-media-grant-secret-at-least-32-bytes",
       PUBLIC_MEDIA_GRANT_TTL_SECONDS: "21600",
+      // A DIFFERENT VALUE from the media secret, deliberately. Setting them
+      // equal here would let a cross-purpose confusion pass unnoticed, since
+      // MAC domain separation would still be carrying the whole property.
+      PUBLIC_WATCH_RESUME_SECRET:
+        "compat-suite-public-watch-resume-secret-at-least-32-bytes",
       // Both tenant hosts are compatibility-capable. UNSUPPORTED_COMPAT_HOST
       // is deliberately absent, so a test can single out the capability gate.
       PUBLIC_COMPATIBILITY_URL_HOSTS: `${LEGACY_HOST},${SECOND_LEGACY_HOST},${FOREIGN_HOST}`,
@@ -1526,6 +1545,7 @@ export function createCompatHarness(
     localStorage as never,
     new StubVideoViewGrowthService() as never,
     grants,
+    new PublicReviewResumeService(config as never),
     memoryCache,
     options.bunnyStream as never,
   );

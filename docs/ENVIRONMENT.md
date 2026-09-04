@@ -46,6 +46,7 @@ Additionally required when `NODE_ENV=production` or `APP_ENV=production`:
 | Variable | Purpose |
 |---|---|
 | `PUBLIC_MEDIA_GRANT_SECRET` | HMAC key for public media grants; **≥ 32 characters** (a weak development default is substituted outside production). **Secret** |
+| `PUBLIC_WATCH_RESUME_SECRET` | Signs the review-resume grant and the alias-free `rmv1` media tokens (compatibility and resume origins); **≥ 32 characters**, validated the same way as `PUBLIC_MEDIA_GRANT_SECRET`. **Secret.** Must be provisioned in the environment **before** deploying a backend build that reads it — production boot **fails fast** if it is missing or under length. See §9 |
 | `ADMIN_CHANGE_PASSWORD_SECRET` | Operator secret for the deprecated change-password route. **Secret** |
 | `ADMIN_WEB_ORIGIN` | Must be a **non-local HTTPS** origin in production |
 
@@ -146,11 +147,33 @@ Process-local, lost on restart, **not shared** between Node processes.
 | `SHARE_TOKEN_PEPPER` | — | **Required. Secret.** Rotating invalidates every raw share token (aliases keep working) |
 | `PUBLIC_MEDIA_GRANT_SECRET` | dev default (**required in prod**) | ≥ 32 chars. **Secret** |
 | `PUBLIC_MEDIA_GRANT_TTL_SECONDS` | `21600` (6 h) | Clamped 300–86400 |
+| `PUBLIC_WATCH_RESUME_SECRET` | dev default (**required in production**) | **Signs the whole review-resume subsystem** — the session grant and the alias-free media tokens a resumed session's URLs carry. ≥ 32 characters. **Secret.** Separate from `PUBLIC_MEDIA_GRANT_SECRET` on purpose: rotating this ends every resume session without invalidating media grants sitting in reviewers' DOMs for up to 24 h, and vice versa. MAC domain separation is retained on top, so setting both to the same value is still safe. **Set it in the environment BEFORE deploying the build that reads it** — the process fails fast at boot without it |
+| `PUBLIC_WATCH_RESUME_TTL_SECONDS` | `28800` (8 h) | **Review-resume grant lifetime.** Bounded 300–86400; an out-of-range value **fails at boot** rather than clamping. Not a secret itself — the value is a duration. Read directly by `PublicReviewResumeService` through `ConfigService`, matching `PUBLIC_MEDIA_GRANT_TTL_SECONDS` rather than going through `env.config.ts` |
 | `ACCESS_LOG_IP_PEPPER` | — | **Required. Secret.** |
 | `PUBLIC_SITE_PROTOCOL` | `https` | Protocol used when building share URLs |
 | `PUBLIC_SHARE_LOCAL_PROTOCOL` | `http` | Used for localhost-style domains |
 | `PUBLIC_COMPATIBILITY_URL_HOSTS` | empty | **Reviewer-frontend capability, and the email-safe kill switch.** Comma-separated hostnames whose deployed reviewer client can redeem the email-safe URL `/watch?r=<transportAlias>`. Gates **both** emission (the Admin is handed a URL) and **redemption** (`POST /public/watch/exchange-compatible` accepts one), through one shared predicate. Empty means no website receives one **and none can redeem one** — the correct fail-closed default, because every reviewer frontend redeems `#k=` and only some redeem `?r=`. Matching is EXACT after normalization: no substring, no suffix, no implicit `www`. A malformed entry **fails at boot**. Not a secret |
 | `ALLOW_LOCALHOST_DOMAIN_CLAIM` | env-dependent | Permits claiming localhost domains |
+
+> **The resume TTL bounds a SESSION, not an authorization.** A resume grant
+> confers nothing on its own: every authorization fact is re-read from the
+> database when one is redeemed, so a revoke, an expiry, an un-assignment or
+> clearing `PUBLIC_COMPATIBILITY_URL_HOSTS` all deny a request carrying a
+> perfectly valid grant. What the TTL bounds is how long a scrubbed tab can
+> keep restoring itself without going back to the email — and the browser
+> discards it when the tab closes regardless, because it lives in
+> `sessionStorage`. Do not raise it to a value that makes a resume credential
+> effectively permanent; 8 hours is a working day, which is the unit the
+> feature exists for.
+>
+> **AND THE TTL IS NOW A REAL BOUND.** It was not, briefly: a resumed reply
+> used to carry the canonical `ShareLink.alias` in its media URLs, so one
+> redemption escalated a grant into a `#k` credential that outlived the TTL,
+> the storage entry and the kill switch. A resumed reply now carries per-video
+> resume media tokens instead. See
+> [SECURITY_MODEL.md §2.0.2](./SECURITY_MODEL.md#202-the-resume-media-token--how-the-alias-stays-out-of-a-resumed-reply)
+> and
+> [features/share-links.md §3.2](./features/share-links.md#32-resuming-a-scrubbed-review-session).
 
 > **Clearing this variable and restarting is the emergency kill switch for the
 > alternate bearer surface.** Every `/watch?r=` link for a removed host stops
@@ -160,6 +183,13 @@ Process-local, lost on restart, **not shared** between Node processes.
 > still the only way to destroy one credential permanently, and that kills the
 > `#k` credential too. See
 > [SECURITY_MODEL.md §2.0](./SECURITY_MODEL.md#20-the-two-share-link-bearer-credentials).
+>
+> **It stops RESUMED sessions too.** `resolvePublicWatchResume()` applies the
+> same `isCompatibilityCapableHost()` predicate BEFORE it examines the
+> presented grant, so clearing the list does not leave already-resumed tabs
+> working for the life of their grants. A kill switch that closed new
+> redemptions but not continued ones would give an operator a false sense of
+> closure during an incident.
 
 ## 10. Public display-view growth
 

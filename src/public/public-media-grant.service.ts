@@ -1,6 +1,12 @@
 import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import { createHmac, timingSafeEqual } from "node:crypto";
+
+import {
+  decodeGrantPayload,
+  encodeGrantPayload,
+  signGrantPayload,
+  verifyGrantSignature,
+} from "./utils/grant-signature.util";
 
 type MediaGrantPayload = {
   v: 1;
@@ -14,8 +20,19 @@ type MediaGrantPayload = {
 const DEFAULT_TTL_SECONDS = 6 * 60 * 60;
 const MIN_TTL_SECONDS = 5 * 60;
 const MAX_TTL_SECONDS = 24 * 60 * 60;
-const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
-const SHA256_BASE64URL_LENGTH = 43;
+
+/**
+ * THE MEDIA GRANT'S MAC DOMAIN IS THE EMPTY STRING, AND MUST STAY THAT WAY.
+ *
+ * `signGrantPayload(secret, "", payload)` is `HMAC(secret, payload)` — exactly
+ * the construction media grants have used since they shipped. Live grants sit
+ * in reviewers' DOMs for up to `PUBLIC_MEDIA_GRANT_TTL_SECONDS` (default 6 h,
+ * ceiling 24 h), and `verify()` has no key-id and no fallback branch, so
+ * changing this would fail every outstanding grant mid-playback as a generic
+ * 404. The resume grant gets domain separation instead, by carrying a
+ * NON-empty domain of its own.
+ */
+const MEDIA_GRANT_DOMAIN = "";
 
 @Injectable()
 export class PublicMediaGrantService {
@@ -42,9 +59,7 @@ export class PublicMediaGrantService {
       exp: Math.floor(expiresAt / 1000),
       purpose: "public_media",
     };
-    const encodedPayload = Buffer.from(JSON.stringify(payload)).toString(
-      "base64url",
-    );
+    const encodedPayload = encodeGrantPayload(payload);
 
     return `${encodedPayload}.${this.sign(encodedPayload)}`;
   }
@@ -58,69 +73,43 @@ export class PublicMediaGrantService {
       now?: Date;
     },
   ): boolean {
-    if (
-      typeof grant !== "string" ||
-      grant.length === 0 ||
-      grant.length > 2048
-    ) {
+    const encodedPayload = verifyGrantSignature({
+      grant,
+      secret: this.secret(),
+      domain: MEDIA_GRANT_DOMAIN,
+    });
+    if (encodedPayload === null) {
       return false;
     }
 
-    const [encodedPayload, signature, extra] = grant.split(".");
-    if (
-      !encodedPayload ||
-      !signature ||
-      extra !== undefined ||
-      !BASE64URL_PATTERN.test(encodedPayload) ||
-      !BASE64URL_PATTERN.test(signature) ||
-      signature.length !== SHA256_BASE64URL_LENGTH
-    ) {
+    const payload =
+      decodeGrantPayload<Partial<MediaGrantPayload>>(encodedPayload);
+    if (payload === null) {
       return false;
     }
 
-    const received = Buffer.from(signature);
-    const expectedSignature = Buffer.from(this.sign(encodedPayload));
-    if (
-      received.length !== expectedSignature.length ||
-      !timingSafeEqual(received, expectedSignature)
-    ) {
-      return false;
-    }
+    const nowSeconds = Math.floor(
+      (expected.now ?? new Date()).getTime() / 1000,
+    );
 
-    try {
-      const decodedPayload = Buffer.from(encodedPayload, "base64url");
-      if (decodedPayload.toString("base64url") !== encodedPayload) {
-        return false;
-      }
-      const payload = JSON.parse(
-        decodedPayload.toString("utf8"),
-      ) as Partial<MediaGrantPayload>;
-      const nowSeconds = Math.floor(
-        (expected.now ?? new Date()).getTime() / 1000,
-      );
-
-      return (
-        payload.v === 1 &&
-        payload.purpose === "public_media" &&
-        payload.sid === expected.shareLinkId &&
-        payload.vid === expected.videoId &&
-        payload.host === expected.host &&
-        typeof payload.exp === "number" &&
-        Number.isSafeInteger(payload.exp) &&
-        payload.exp >= nowSeconds
-      );
-    } catch {
-      return false;
-    }
+    return (
+      payload.v === 1 &&
+      payload.purpose === "public_media" &&
+      payload.sid === expected.shareLinkId &&
+      payload.vid === expected.videoId &&
+      payload.host === expected.host &&
+      typeof payload.exp === "number" &&
+      Number.isSafeInteger(payload.exp) &&
+      payload.exp >= nowSeconds
+    );
   }
 
   private sign(encodedPayload: string): string {
-    const secret = this.configService.getOrThrow<string>(
-      "PUBLIC_MEDIA_GRANT_SECRET",
-    );
-    return createHmac("sha256", secret)
-      .update(encodedPayload)
-      .digest("base64url");
+    return signGrantPayload(this.secret(), MEDIA_GRANT_DOMAIN, encodedPayload);
+  }
+
+  private secret(): string {
+    return this.configService.getOrThrow<string>("PUBLIC_MEDIA_GRANT_SECRET");
   }
 
   private getTtlSeconds(): number {

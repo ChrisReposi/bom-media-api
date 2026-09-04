@@ -415,6 +415,126 @@ Pinned by `test/public-watch-compatibility-exchange.test.ts` (backend) and the
 `tools/watch-browser-test.mjs` (client). Design and trade-off record:
 `docs/superpowers/specs/2026-09-02-email-safe-reviewer-url-design.md`.
 
+#### 3.2 Resuming a scrubbed review session
+
+The compatibility URL's privacy comes from removing its own carrier before the
+first request. That left one real defect: a refresh, a Back past the entry, or
+returning from another tab landed on a bare `/watch/` with nothing to redeem,
+and the reviewer had to go back to the email.
+
+`POST /public/watch/resume` closes it without putting a credential anywhere.
+
+```
+/watch?r=<transportAlias>
+   │  parse, then history.replaceState onto the canonical path
+   │  POST /public/watch/exchange-compatible   → payload + resumeGrant
+   │  sessionStorage["arcwild.watch.resume.v1"] = resumeGrant
+   ▼
+/watch/                     the reviewer refreshes, or comes back
+   │  POST /public/watch/resume { host, grant }
+   ▼  the SAME payload, and NO view spent
+```
+
+| | first redemption | resume |
+|---|---|---|
+| carrier | `?r=<transportAlias>` in the URL | a grant in `sessionStorage` |
+| endpoint | `exchange-compatible` | `resume` |
+| consumes a view | **yes**, exactly one | **no** |
+| authorization | the §4 chain | the same §4 chain, re-read |
+| `AccessLog` row | yes | yes |
+
+**What is stored, and what is deliberately not.** The reviewer's tab holds the
+grant and nothing else — not the transport alias it arrived with, not a `#k`
+credential, not a media grant, not a signed Bunny URL, not the payload. The
+selection is not stored either: it already lives in the `#v=` fragment, which
+is where Back and forward read it from. `sessionStorage` rather than a cookie
+(the reviewer site and the API are different registrable domains, so a cookie
+would be cross-site) and rather than `localStorage` (which is shared between
+tabs and outlives the browser closing).
+
+**Bootstrap priority**, and it is not a preference between working links:
+
+1. a `#k` fragment — an explicit instruction about which link to open;
+2. a `?r=` carrier — likewise, and it supersedes any stored grant;
+3. a bare route with a grant in this tab — the only case where the URL says
+   nothing and the reviewer is still entitled to their session;
+4. otherwise idle.
+
+A fresh entry of either kind **erases the stored grant before requesting a new
+one**, so a failed second exchange cannot leave the previous link's grant
+behind. A carrier this site cannot account for — a `#k` and a `?r` together, or
+a malformed query — erases it too and fails closed: the reviewer followed a
+different URL and is owed a truthful answer about it.
+
+**Any authoritative refusal erases it.** A revoke, an expiry, an un-assignment,
+a video leaving `READY` and a cleared `PUBLIC_COMPATIBILITY_URL_HOSTS` are all
+one generic denial to the client, and all five erase the grant rather than
+retrying it on the next refresh. A *transport* failure does not erase — an
+offline moment is not the backend refusing, and losing the session over one
+would be the worse outcome, while the grant buys nothing the backend does not
+re-authorize anyway.
+
+**The canonical path.** Production serves `/watch/`; Apache's `DirectorySlash`
+301s `/watch` to it before any script runs. The client writes the pathname it
+was actually served at, never a hardcoded one, so no navigation triggers a
+second redirect. Both forms are accepted on input.
+
+#### 3.2.1 A resumed reply carries no share credential
+
+> **THE DEFECT THIS CLOSES, STATED PLAINLY.** A resume re-enters the
+> unmodified resolver with the row's own `alias`, and every backend media URL
+> echoes the presented token into its path. So a resumed reply used to contain
+> `/public/watch/<ALIAS>/videos/…` — and redeeming a stolen resume grant ONCE
+> yielded the canonical `#k` credential, which then kept working after the
+> grant expired, after `sessionStorage` was cleared, and after the host left
+> `PUBLIC_COMPATIBILITY_URL_HOSTS`. The TTL bounded nothing.
+
+Both alias-free origins changed; `#k` did not. A `#k` caller presented the
+alias, so echoing it back discloses nothing — and every deployed client and
+the release-blocking compatibility suite depend on that URL shape. A `?r=`
+caller presented only a transport alias, and a resume caller only a session
+grant, so for those two the alias is withheld.
+
+> **THE `?r=` HALF CLOSED A SEPARATE, OPERATIONAL DEFEAT.** Until 2026-09-03
+> a compatibility reply carried the canonical alias in its media URLs, so a
+> stolen transport alias redeemed ONCE yielded a `#k` credential that kept
+> working after the host was removed from `PUBLIC_COMPATIBILITY_URL_HOSTS`.
+> The kill switch stopped future redemption and nothing else.
+
+**The split is `#k` versus the two ALIAS-FREE origins, not `#k`+`?r=` versus
+resume.** An earlier revision of this table grouped the first `?r=` redemption
+with `#k`, which was true only before 2026-09-03 and is exactly the defect the
+note above records as closed. `mediaTokenModeFor()` now returns one alias-free
+mode for `compat` and `resume` alike, so they share this column:
+
+| | `#k` (canonical) | first `?r=` **and** every resume |
+|---|---|---|
+| `:token` segment | the presented credential | `rmv1<payload><sig>` |
+| scope | the whole ShareLink | ONE video |
+| host binding | the request host | bound into the MAC domain |
+| expiry | the link's | `min(media TTL, the originating review session's expiry)` |
+| survives the kill switch | yes — it is `#k` | **no** |
+
+`playbackUrl`, `embedUrl` and a stored external thumbnail never carried a
+credential and are unchanged; a signed Bunny player URL is Bunny's own and
+contains no share value at all.
+
+**No client change was required, and that was a constraint rather than luck.**
+The reviewer client refuses a media URL whose path segments fall outside
+`[A-Za-z0-9_-]{1,256}` — an alphabet pin that exists because a looser test let
+Chrome normalise `%2e%2e` into a path the validator had not approved. The
+token is shaped to fit it: pure base64url, no separator, the host in the MAC
+domain rather than the payload so even a 253-character hostname stays inside
+the limit (worst case measured, 207 of 256).
+
+Pinned by `test/public-watch-resume.test.ts` RESUME-25…34, which search the
+serialized reply for the literal credential rather than a named field list.
+
+Pinned by `test/public-watch-resume.test.ts` (backend) and the `RESUME-*`
+scenarios in `CPR_arcwildstudios/tools/watch-test.mjs` and
+`tools/watch-browser-test.mjs` (client). Security model:
+[SECURITY_MODEL.md §2.0.1](../SECURITY_MODEL.md#201-the-review-resume-grant--a-pointer-not-a-permission).
+
 **V1 — permanent legacy contract. Still accepted, never re-issued:**
 
 | Form | Note |
@@ -509,7 +629,8 @@ The client sees `INVALID_LINK` in every one of these cases.
 | Future watch resolution (the listing) | **Yes, immediately** |
 | `DB_BLOB` media | **Yes** — full authorization runs per request |
 | `LOCAL_FILE` / thumbnail media, **view-limited** link | **Yes** — never cached |
-| `LOCAL_FILE` / thumbnail media, **unlimited** link | **Mostly** — a process-local authorization cache may serve it for up to `MEDIA_METADATA_CACHE_TTL_SECONDS` (default 300 s) in a process that did not observe the invalidation. Admin API mutations invalidate in-process; direct SQL and other processes do not. See [SECURITY_MODEL.md §4.2](../SECURITY_MODEL.md#42-local_file-media-authorization-cache) |
+| `LOCAL_FILE` / thumbnail media, **unlimited** link, **`#k` credential** | **Mostly** — a process-local authorization cache may serve it for up to `MEDIA_METADATA_CACHE_TTL_SECONDS` (default 300 s) in a process that did not observe the invalidation. Admin API mutations invalidate in-process; direct SQL and other processes do not. See [SECURITY_MODEL.md §4.2](../SECURITY_MODEL.md#42-local_file-media-authorization-cache) |
+| `LOCAL_FILE` / thumbnail media, **`compat`/`resume` `rmv1` token, any budget** | **Yes, immediately** — `rmv1` media tokens bypass this cache entirely (both read and write) and re-read every authorization fact from the database on every request, so this row's bounded exposure never applies to a compatibility or resumed session |
 | Outstanding media **grants** | **No** — a grant stays valid until its own expiry, bounded by `PUBLIC_MEDIA_GRANT_TTL_SECONDS` (≤ 24 h) and the link's `expiresAt` |
 | `DIRECT_URL` / Cloudinary `secure_url` / `EMBED` URLs | **No** — these are external URLs already disclosed to the browser. The backend is not in their request path and cannot invalidate them. See [KNOWN_ISSUES.md](../KNOWN_ISSUES.md#ki-015) |
 

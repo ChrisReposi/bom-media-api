@@ -956,6 +956,11 @@ const BASE_ENV = {
   SHARE_TOKEN_PEPPER: "test-share-pepper",
   ACCESS_LOG_IP_PEPPER: "test-ip-pepper",
   PUBLIC_MEDIA_GRANT_SECRET: "test-public-media-grant-secret-0123456789",
+  // Required in production alongside the media grant secret, and kept a
+  // DIFFERENT value on purpose: equal secrets would let a cross-purpose
+  // confusion pass, since MAC domain separation would carry the property
+  // on its own.
+  PUBLIC_WATCH_RESUME_SECRET: "test-public-watch-resume-secret-0123456789",
   ADMIN_CHANGE_PASSWORD_SECRET: "test-change-secret",
   ADMIN_WEB_ORIGIN: "https://admin.example.com",
 } as const;

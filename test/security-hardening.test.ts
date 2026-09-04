@@ -38,6 +38,11 @@ const productionEnv = {
   REFRESH_TOKEN_PEPPER: "test-refresh-pepper",
   SHARE_TOKEN_PEPPER: "test-share-pepper",
   PUBLIC_MEDIA_GRANT_SECRET: "test-public-media-grant-secret-at-least-32-bytes",
+  // Required in production alongside the media grant secret, and kept a
+  // DIFFERENT value on purpose: equal secrets would let a cross-purpose
+  // confusion pass, since MAC domain separation would carry the property
+  // on its own.
+  PUBLIC_WATCH_RESUME_SECRET: "test-public-watch-resume-secret-at-least-32-byt",
   ACCESS_LOG_IP_PEPPER: "test-ip-pepper",
   ADMIN_CHANGE_PASSWORD_SECRET: "test-password-change-secret",
   VIDEO_DB_STORAGE_ENABLED: "false",
@@ -45,6 +50,9 @@ const productionEnv = {
 
 class GrantConfigService {
   get<T = string>(key: string): T | undefined {
+    if (key === "PUBLIC_WATCH_RESUME_SECRET") {
+      return productionEnv.PUBLIC_WATCH_RESUME_SECRET as T;
+    }
     if (key === "PUBLIC_MEDIA_GRANT_SECRET") {
       return productionEnv.PUBLIC_MEDIA_GRANT_SECRET as T;
     }

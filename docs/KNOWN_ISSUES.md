@@ -469,6 +469,14 @@ real friction) · `LOW` (hygiene, correctness of documentation, cleanup).
   admin mutations do invalidate (`deleteByPrefix("media:metadata:")` in
   `admin-websites.service.ts` and `videos.service.ts`); direct SQL changes and
   other processes do not (see KI-010).
+- **SCOPE: the LEGACY `#k` / `watch` ORIGIN ONLY (2026-09-03).** This window does
+  not exist for the alias-free origins. A `compat` or `resume` request skips the
+  watch cache (`mayUseWatchCache = origin === undefined || origin === "watch"`)
+  and every `rmv1` media token skips this cache on both read and write
+  (`aliasFreeToken = publicReviewResumeService.isMediaToken(trimmedToken)`), so
+  those requests re-read status, expiry, membership, assignment and `READY` from
+  the database every time. A revoke or un-assignment therefore bites immediately
+  on `?r=` and resumed sessions, whatever this TTL is set to.
 - **Why this is bounded.** View-limited links are excluded from caching, so a
   cache hit can never skip grant verification. `DB_BLOB` is never cached. The
   entry can never outlive the share link's own `expiresAt`.

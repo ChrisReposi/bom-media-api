@@ -10,6 +10,7 @@ import {
   AssignmentStatus,
 } from "../../src/generated/prisma/client";
 import { PublicMediaGrantService } from "../../src/public/public-media-grant.service";
+import { PublicReviewResumeService } from "../../src/public/public-review-resume.service";
 import { PublicService } from "../../src/public/public.service";
 import { LocalVideoStorageService } from "../../src/videos/storage/local-video-storage.service";
 import { VideoViewGrowthService } from "../../src/videos/video-view-growth.service";
@@ -56,6 +57,7 @@ async function main(): Promise<void> {
     new LocalVideoStorageService(config),
     new VideoViewGrowthService(prisma, config),
     new PublicMediaGrantService(config),
+    new PublicReviewResumeService(config as never),
   );
   let temporaryShareLinkId: string | null = null;
   let assignmentRemoved = false;

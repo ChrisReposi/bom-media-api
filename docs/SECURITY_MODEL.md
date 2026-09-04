@@ -37,6 +37,8 @@ marked `PLANNED`.
 | Public share alias | `randomBytes(5).base64url` (~7 chars) | **Stored in clear** in `ShareLink.alias`, unique | Same as the share link |
 | Public share **transport alias** | `randomBytes(16).base64url` (22 chars, 128 bits) | **Stored in clear** in `ShareLink.transportAlias`, unique, nullable | Same as the share link |
 | Public media grant | `base64url(payload).base64url(HMAC-SHA256)` via `PUBLIC_MEDIA_GRANT_SECRET` | Query string of media URLs | `min(now + PUBLIC_MEDIA_GRANT_TTL_SECONDS, shareLink.expiresAt)`, clamped 5 min … 24 h |
+| Public **review-resume grant** | `base64url(payload).base64url(HMAC-SHA256)` via `PUBLIC_WATCH_RESUME_SECRET` (NOT the media grant secret) under the MAC domain `review-resume-v1` | Reviewer's `sessionStorage`, and the BODY of `POST /public/watch/resume` | `PUBLIC_WATCH_RESUME_TTL_SECONDS`, default 8 h, bounded 5 min … 24 h; discarded when the tab closes |
+| Public **resume media token** (`rmv1`) | `rmv1` + `base64url(payload)` + 43-char HMAC-SHA256, no separator, via `PUBLIC_WATCH_RESUME_SECRET` (NOT the media grant secret) under the MAC domain `resume-media-v1\|<host>` | The `:token` path segment of an ALIAS-FREE session's media URLs — compat and resume alike | `min(now + PUBLIC_MEDIA_GRANT_TTL_SECONDS, the originating review session's expiry)` |
 | Bunny embed token | `SHA256_HEX(BUNNY_STREAM_TOKEN_SECURITY_KEY + videoId + expires)` | Query string of the Bunny iframe URL | `BUNNY_STREAM_EMBED_TOKEN_TTL_SECONDS`, default 5 min, bounded 1 min … 1 h |
 | Bunny TUS signature | `SHA256_HEX(libraryId + BUNNY_STREAM_API_KEY + expiration + videoId)` | Admin browser only, as a TUS request header | `BUNNY_STREAM_TUS_TTL_SECONDS`, default 1 h, bounded 5 min … 24 h |
 | Admin password | bcrypt, 12 rounds | Database only | Until changed |
@@ -65,9 +67,10 @@ website/domain/video eligibility lapses. Treat `transportAlias` with exactly
 the care `alias` gets.
 
 What the transport alias is **not** is a second authorization model.
-`resolvePublicWatchCompatible()` maps it to a row and then re-enters the
-**unmodified** `resolvePublicWatch()` by that row's own `alias`, so §4's chain
-is evaluated in one place for both credentials. It confers no permission of
+`resolvePublicWatchCompatible()` maps it to a row and then re-enters
+`resolvePublicWatch()` by that row's own `alias`, with the alias-free
+compatibility origin, so §4's chain is evaluated in one place for both
+credentials. It confers no permission of
 its own, carries no status, budget or expiry, and cannot outlive its ShareLink.
 
 > **SECURITY INVARIANT: both credentials are redacted from logs, and neither
@@ -87,12 +90,196 @@ its own, carries no status, budget or expiry, and cannot outlive its ShareLink.
 > Pinned by `test/transport-alias-redaction.test.ts` (R1–R10), which searches
 > serialized output for the literal value rather than trusting field names.
 
+### 2.0.1 The review-resume grant — a pointer, not a permission
+
+> **IT IS NOT A THIRD SHARE CREDENTIAL.** The two above reach a ShareLink by
+> being it. This one names one, and nothing more.
+
+The email-safe URL scrubs `?r=` from the address bar before it makes any
+request, so a refresh had nothing left to redeem and stranded the reviewer.
+`POST /public/watch/resume` restores the session from a short-lived signed
+pointer instead of from a stored credential.
+
+Its payload is `{ v, purpose: "review-resume-v1", sid, host, iat, exp, nonce }` —
+a ShareLink id, the host it was minted on, two timestamps and randomness.
+
+| It carries | It does NOT carry |
+|---|---|
+| the ShareLink's database id | `alias` |
+| the normalized host | `transportAlias` |
+| issued-at and expiry | the raw token or `tokenHash` |
+| | any media URL or media grant |
+
+**Every authorization fact is re-read on every redemption.**
+`resolvePublicWatchResume()` verifies the grant, looks up the row it names,
+and then hands that row's own `alias` to `resolvePublicWatch()` with the
+`resume` origin.
+So a perfectly valid grant is refused when the link is revoked, disabled,
+expired or exhausted, when a video stops being `READY`, when membership or the
+`WebsiteVideo` assignment is removed, when the website or domain is disabled,
+or when the host loses its compatibility capability. Nothing is trusted merely
+because it is signed.
+
+> **SECURITY INVARIANT: a resume consumes NO view.** A refresh is the same
+> review session, not a new one. Compatibility and resume never read or write
+> the watch cache; resume follows the fresh authoritative path and skips
+> `incrementShareLinkView()` there.
+
+> **SECURITY INVARIANT: INDEPENDENT KEYS AND MAC DOMAINS.** Legacy media grants
+> use `PUBLIC_MEDIA_GRANT_SECRET` with the historical empty domain and unchanged
+> wire bytes. Resume grants and rmv1 media use `PUBLIC_WATCH_RESUME_SECRET`
+> under `review-resume-v1` and `resume-media-v1|<normalized-host>` respectively.
+> They remain non-interchangeable even if an operator configures both secrets
+> to the same value and a purpose comparison were deleted.
+
+### 2.0.2 The alias-free media token — how the alias stays out of compatibility and resume
+
+> **CORRECTION (2026-09-03). An earlier revision of this document said a
+> stolen resume grant was bounded by its TTL. IT WAS NOT, and the wording was
+> too strong.**
+>
+> The resume path re-enters the unmodified resolver using the row's own
+> `alias`, and every backend-served media URL echoes the presented token into
+> its `:token` path segment. So a resumed reply handed back
+> `/public/watch/<ALIAS>/videos/<id>/local-file` — and one redemption of a
+> stolen grant yielded the canonical `#k` credential. `/watch#k=<alias>` then
+> worked **after** the grant expired, **after** `sessionStorage` was cleared,
+> and **after** the host was removed from `PUBLIC_COMPATIBILITY_URL_HOSTS`,
+> until the ShareLink itself was revoked. That is a credential escalation, and
+> the TTL bounded nothing.
+
+The three URL builders now take an **rmv1 media token** for both alias-free
+origins.
+
+```
+#k                  /public/watch/<alias>/videos/<id>/local-file   unchanged
+COMPAT / RESUME     /public/watch/rmv1<payload><sig>/videos/<id>/local-file
+```
+
+| | claim |
+|---|---|
+| `sid` | the ShareLink id — a database key, useless as a token on every route |
+| `vid` | ONE video. A leaked poster URL is not a key to the rest of the link |
+| `exp` | clamped to `min(media TTL, the originating review-session expiry)` |
+| the host | bound into the **MAC domain**, not carried as a field |
+
+> **SECURITY INVARIANT: compatibility and resumed replies contain no share credential.** Not
+> the alias, not the transport alias, not a raw token, not a token hash — in
+> no URL, no payload field, no error body and no log line. Pinned by
+> RESUME-25…34, which search the serialized response for the literal value
+> rather than inspecting a list of fields somebody remembered to name.
+
+**Why the host is in the MAC domain and not the payload.** The shipped
+reviewer client refuses any media URL whose path segments fall outside
+`[A-Za-z0-9_-]`, bounded at 256 characters — an alphabet pin that is a
+*measured* defence, not decoration: with a looser test, Chrome normalised
+`/public/watch/%2e%2e/videos/…` into a different path than the validator had
+approved. So the token has to be pure base64url and short. Binding the host
+into the MAC costs the payload nothing, keeps a maximal 253-character hostname
+inside the limit (worst case measured: **207 of 256**), and binds more
+strongly than a field comparison — a token minted for one host does not
+verify on another at all. **No deployed reviewer bundle needed a change.**
+
+**Why the discriminator is a prefix AND a length.** `rmv1` is four base64url
+characters, so a real 16-character alias can begin with it (about one in
+sixteen million). Length settles it: `alias` is `VARCHAR(16)`,
+`transportAlias` is `VARCHAR(32)` and a raw token is `s_` plus 43 characters,
+so nothing that can legitimately resolve reaches 64 characters and every media
+token exceeds it. A short `rmv1…` value is therefore treated as the alias it
+might be, and still works.
+
+> **SECURITY INVARIANT: NO CACHE ANSWERS FOR AUTHORITY on an alias-free
+> request.** The watch metadata cache decides status, expiry, membership,
+> assignment and READY from CACHED rows, and the media metadata cache is keyed
+> on a hash of the presented token — so a warm entry could have answered an
+> `rmv1` request before its signature, its expiry, the kill switch or any
+> current database read. Both are now skipped entirely for the `compat` and
+> `resume` origins and for every `rmv1` media request: those paths re-read
+> every authorization fact on every request, at the cost of one query.
+>
+> The LEGACY `#k` caches are deliberately unchanged — SECURITY_MODEL §4.2 and
+> KI-020 describe that bounded trade-off and COMPAT-040/041 pin it. Pinned by
+> `test/public-watch-cache-authority.test.ts`, which warms each cache with a
+> successful request, changes one authority fact, and requires the next
+> request to fail.
+
+> **SECURITY INVARIANT: the kill switch reaches alias-free media.**
+> `PUBLIC_COMPATIBILITY_URL_HOSTS` is checked before a media token is even
+> examined, so clearing it stops already-issued poster and video URLs as well
+> as new resumes. Without that, the switch would have closed the front door
+> and left the media URLs working for the life of their tokens — the same
+> false sense of closure the alias leak created, one level down. `#k` media is
+> untouched by the same switch.
+
+**Compromise semantics, now that the escalation is closed.** A stolen resume
+grant restores that one session, on that one host, under the link's own
+current checks, and yields only media tokens that are per-video, host-bound
+and expire no later than the grant itself. It cannot be turned into a `#k`
+credential, so **its reach really is bounded by the resume TTL** — and by the
+kill switch, which ends it sooner. Revoking the ShareLink remains the
+permanent remedy.
+
+### 2.0.3 Three origins, ONE alias-free mode
+
+> **CORRECTION (2026-09-03, second pass). An earlier revision said the first
+> `?r=` exchange still echoed the alias and called that acceptable. IT WAS
+> NOT**, and the reason is operational rather than theoretical: a stolen
+> transport alias, redeemed once, disclosed `ShareLink.alias` — so anyone who
+> redeemed BEFORE the kill switch was thrown kept working through the
+> recovered `#k` credential afterwards. Removing a host from
+> `PUBLIC_COMPATIBILITY_URL_HOSTS` closed the door and left the window open.
+
+`mediaTokenModeFor()` is the single decision, taken in one place:
+
+| Origin | Presented | Media URLs carry |
+|---|---|---|
+| `watch` (`#k`) | the alias itself | **the alias** — echoing back what the caller already holds discloses nothing |
+| `compat` (`?r=`) | a transport alias | an `rmv1` media token |
+| `resume` | a session grant | an `rmv1` media token |
+
+Both alias-free origins share one mode, one minting call and one set of URL
+builders, so they cannot drift apart. `#k` is untouched byte for byte, which
+is what the release-blocking compatibility suite depends on.
+
+> **SECURITY INVARIANT: the canonical alias leaves this API only in a reply to
+> a caller who presented it.** Possession of a transport alias, a resume
+> grant, or an `rmv1` media token yields no path to `alias`, the raw token or
+> `tokenHash` — not through a media URL, a poster, a Bunny proxy URL, a view
+> URL, a payload field, an error body, a redirect or a log line. Pinned by
+> RESUME-25…34 and COMPAT-ALIAS-01…12, which search the serialized reply for
+> the literal value.
+
+**The clamp.** A compatibility reply both consumes the view and establishes
+the session, so its media tokens are clamped to the expiry of the resume grant
+minted in the same response — read back from the grant rather than recomputed,
+because two independent calculations of the same deadline is exactly how they
+come to disagree. Nothing a reply hands out outlives the session it belongs
+to.
+
+**It is `sessionStorage`, never a cookie and never `localStorage`.** A cookie
+would be cross-site here (the reviewer site and the API are different
+registrable domains) and its behaviour would depend on a browser's privacy
+policy; `localStorage` is shared across tabs and outlives the browser closing.
+`sessionStorage` dies with the tab, which is the lifetime a review session
+should have. The reviewer's tab stores the grant and **nothing else** — no
+transport alias, no `#k` credential, no media grant, no signed URL, no payload.
+
+> The three grant kinds use independent key/domain combinations: a legacy
+> media grant uses `PUBLIC_MEDIA_GRANT_SECRET` and domain `""`; a resume grant
+> uses `PUBLIC_WATCH_RESUME_SECRET` and `review-resume-v1`; rmv1 uses the resume
+> secret and `resume-media-v1|<host>`. None verifies as another even if both
+> configured secrets are identical and a `purpose` check were deleted. Legacy
+> media-grant wire bytes are unchanged.
+
 > **THE ALTERNATE SURFACE HAS ITS OWN KILL SWITCH.**
 > `PUBLIC_COMPATIBILITY_URL_HOSTS` gates redemption as well as emission:
 > `PublicService.resolvePublicWatchCompatible()` refuses a host that is not on
 > the list **before it reads the presented credential at all**, using the same
 > `isCompatibilityCapableHost()` predicate the Admin emission path uses, so the
-> two answers cannot drift. Clearing the variable and restarting therefore
+> two answers cannot drift. `resolvePublicWatchResume()` applies the identical
+> predicate in the identical position, so clearing the variable closes
+> continued sessions as well as new redemptions — a switch that stopped one
+> but not the other would read as closure and not be it. Clearing the variable and restarting therefore
 > closes every `/watch?r=` link for that host at once while leaving every `#k`
 > link working.
 >
@@ -111,10 +298,9 @@ its own, carries no status, budget or expiry, and cannot outlive its ShareLink.
   `PUBLIC_COMPATIBILITY_URL_HOSTS` is the reversible class-wide remedy: it
   stops every transport alias on that host without touching `#k`.
 - Compromise of a `transportAlias` **does not reveal the `alias`**. The two
-  values share no bytes and neither is derived from the other; the response to
-  a compatibility exchange carries media URLs built from `alias`, so a holder
-  of the transport alias who completes an exchange does learn the `alias` —
-  but a holder of the *string alone*, from a log or a URL, does not.
+  values share no bytes and neither is derived from the other; compatibility
+  responses use per-video rmv1 media tokens and disclose no canonical alias,
+  raw token or token hash.
 - **The first `?r=` request is visible to the static host, any proxy and any
   CDN**, in the request line, before a byte of JavaScript runs. The reviewer
   site scrubs the query from the address bar with `history.replaceState`
@@ -520,6 +706,18 @@ consults the process-local memory cache **before** any database query and
 > the same shared authorization chain uncached and then re-reads the current
 > `VideoAsset` row, so the window described below does not apply to it. See
 > §4.1.2.
+
+> **Scope: this cache, and the bounded exposure it describes, applies ONLY to
+> the legacy `#k` / `watch` origin (2026-09-03).** `compat` and `resume` never
+> reach this cache at all — `mayUseWatchCache = origin === undefined || origin
+> === "watch"` excludes both at the watch-metadata layer, and
+> `aliasFreeToken = publicReviewResumeService.isMediaToken(trimmedToken)` excludes
+> every `rmv1` token from this LOCAL_FILE media-metadata cache's read and write
+> paths as well. A compatibility or resume request therefore re-reads every
+> authorization fact — status, expiry, membership, assignment, READY — from the
+> database on every single request, with no cache-hit fast path and no KI-020
+> window at all. Only a genuine `#k` credential can ever hit this cache. Pinned
+> by `test/public-watch-cache-authority.test.ts`.
 
 > **CLASSIFICATION: INTENTIONAL BOUNDED EXPOSURE, re-affirmed 2026-08-28. NOT a
 > defect requiring change in this pass.**

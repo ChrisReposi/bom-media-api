@@ -60,7 +60,17 @@ import {
   WEBSITE_ID,
 } from "./share-link-compat-harness";
 
-/** Order-insensitive: the public response carries exactly these properties. */
+/**
+ * Order-insensitive: the public response carries exactly these properties.
+ *
+ * Asserted as an EXACT set, not a superset, on both the success and the denial
+ * body — so adding a field is a deliberate act that has to be made here. It
+ * was made here once, for `resumeGrant`, and that was the wrong call: the
+ * field belongs only on a compatibility success, and putting it on the `#k`
+ * body changed a contract deployed clients were written against. The list is
+ * back to the pre-feature four, and `public-watch-golden-contract.test.ts`
+ * pins them byte for byte against HEAD so the next such edit fails loudly.
+ */
 const PUBLIC_RESPONSE_PROPERTIES = [
   "reasonCode",
   "valid",

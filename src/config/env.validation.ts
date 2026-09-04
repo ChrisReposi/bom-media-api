@@ -330,7 +330,9 @@ export function validateEnv(
         "local-public-watch-resume-secret-change-me",
       );
   if (resumeSecret.length < 32) {
-    throw new Error("PUBLIC_WATCH_RESUME_SECRET must be at least 32 characters");
+    throw new Error(
+      "PUBLIC_WATCH_RESUME_SECRET must be at least 32 characters",
+    );
   }
   validated.PUBLIC_WATCH_RESUME_SECRET = resumeSecret;
   validated.PUBLIC_MEDIA_GRANT_TTL_SECONDS = String(

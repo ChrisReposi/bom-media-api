@@ -315,7 +315,8 @@ export class PublicService {
      * specific rules (the non-consuming resume claim, the alias-free media
      * mode) have to be re-implemented — there is now exactly one path that
      * serves them. */
-    const mayUseWatchCache = params.origin === undefined || params.origin === "watch";
+    const mayUseWatchCache =
+      params.origin === undefined || params.origin === "watch";
 
     if (mayUseWatchCache && normalizedHost !== null && trimmedToken) {
       const cacheKey = this.buildPublicWatchCacheKey(

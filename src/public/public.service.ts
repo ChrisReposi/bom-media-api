@@ -45,6 +45,7 @@ import {
 } from "../videos/storage/local-video-storage.service";
 import { VideoViewGrowthService } from "../videos/video-view-growth.service";
 import { PublicMediaGrantService } from "./public-media-grant.service";
+import { PublicReviewResumeService } from "./public-review-resume.service";
 import {
   hashIpAddress,
   sanitizeAccessLogReferer,
@@ -52,6 +53,7 @@ import {
   truncateDomain,
   truncateReasonCode,
 } from "./utils/access-log.util";
+import { RESUME_MEDIA_TOKEN_PREFIX } from "./utils/grant-signature.util";
 import { normalizePublicHost } from "./utils/normalize-host.util";
 import { hashShareToken } from "./utils/share-token.util";
 import type {
@@ -90,6 +92,29 @@ type ResolvePublicWatchParams = {
   host: string;
   token?: string;
   requestMeta?: PublicWatchRequestMeta | undefined;
+  /**
+   * How this request arrived, which decides two things and nothing else:
+   * whether a view is consumed, and whether a resume grant is minted.
+   *
+   *   "watch"   the `#k` exchange and the legacy GET. Consumes a view.
+   *             Mints NO grant: the fragment is still in the reviewer's URL
+   *             and survives a refresh on its own, so there is nothing to
+   *             resume and no reason to put a credential in storage.
+   *   "compat"  the email-safe `?r=` exchange. Consumes a view, and mints a
+   *             grant — this is the ONLY flow that scrubs its carrier, so it
+   *             is the only one whose session a refresh would otherwise lose.
+   *   "resume"  redeeming a grant. Consumes NOTHING, and mints no new grant:
+   *             the reviewer already holds one, and re-minting on every
+   *             refresh would silently extend the TTL forever.
+   */
+  origin?: "watch" | "compat" | "resume";
+  /**
+   * The verified expiry of the resume grant that produced this request, so
+   * the media tokens minted below can be clamped to it. Absent on every other
+   * origin. NOT an authorization fact — nothing concludes "still valid" from
+   * it; it is a ceiling.
+   */
+  resumeNotAfter?: number | undefined;
 };
 
 type ResolvePublicWatchCompatibleParams = {
@@ -97,6 +122,53 @@ type ResolvePublicWatchCompatibleParams = {
   alias: string;
   requestMeta?: PublicWatchRequestMeta | undefined;
 };
+
+type ResolvePublicWatchResumeParams = {
+  host: string;
+  grant: string;
+  requestMeta?: PublicWatchRequestMeta | undefined;
+};
+
+/**
+ * How a response's backend media URLs name the ShareLink.
+ *
+ *   "credential"  the presented alias or raw token, echoed into the path for
+ *                 the historical `#k` contract only
+ *   "aliasFree"   a per-video, host-bound, short-lived rmv1 token used by
+ *                 BOTH compatibility and resume
+ *
+ * THIS IS THE FIX FOR A REAL ESCALATION. Because a resume re-enters the
+ * resolver using the row's own alias, every media URL used to echo that alias
+ * back — so one redemption of a stolen resume grant yielded `ShareLink.alias`,
+ * and `/watch#k=<alias>` then worked after the grant expired, after
+ * `sessionStorage` was cleared, and after the host was removed from
+ * `PUBLIC_COMPATIBILITY_URL_HOSTS`. The TTL bounded nothing.
+ */
+type MediaTokenMode =
+  | { kind: "credential" }
+  | { kind: "aliasFree"; shareLinkId: string; notAfter: number | undefined };
+
+/**
+ * ONE MODE, THREE ORIGINS — decided in one place so the two alias-free flows
+ * cannot drift apart.
+ *
+ *   watch   `#k`. The reviewer already holds the alias; echoing it back
+ *           discloses nothing they did not present, and every deployed client
+ *           and every pinned compatibility test depends on that byte for byte.
+ *   compat  `?r=`. The reviewer holds only a TRANSPORT alias. Echoing the
+ *           canonical alias would let one redemption convert the weaker
+ *           credential into the permanent one.
+ *   resume  holds only a session grant. Same argument, one step further on.
+ */
+function mediaTokenModeFor(
+  origin: ResolvePublicWatchParams["origin"],
+  shareLinkId: string,
+  notAfter: number | undefined,
+): MediaTokenMode {
+  return origin === "compat" || origin === "resume"
+    ? { kind: "aliasFree", shareLinkId, notAfter }
+    : { kind: "credential" };
+}
 
 type PublicDatabaseVideoBinaryParams = {
   host: string;
@@ -205,6 +277,7 @@ export class PublicService {
     private readonly localVideoStorageService: LocalVideoStorageService,
     private readonly videoViewGrowthService: VideoViewGrowthService,
     private readonly publicMediaGrantService: PublicMediaGrantService,
+    private readonly publicReviewResumeService: PublicReviewResumeService,
     @Optional() private readonly memoryCache?: MemoryCacheService,
     // Appended and optional on purpose. Public watch resolution for every
     // legacy source type must work with no Bunny collaborator at all.
@@ -222,7 +295,30 @@ export class PublicService {
     const normalizedHost = normalizePublicHost(params.host);
     const trimmedToken = this.normalizePublicToken(params.token);
 
-    if (normalizedHost !== null && trimmedToken) {
+    /* THE CACHE MAY CACHE DATA. IT MUST NOT CACHE AUTHORITY.
+     *
+     * `resolveCachedPublicWatch()` decides status, expiry, membership,
+     * assignment and READY from the CACHED ShareLink and video rows. For the
+     * legacy `#k` flow that is long-standing, documented, deliberately-bounded
+     * behaviour (SECURITY_MODEL §4.2, KI-020) and the release-blocking
+     * compatibility suite pins it — so it is left exactly as it was.
+     *
+     * The two ALIAS-FREE origins are new surface, and they do not get it. A
+     * compatibility exchange and a resume both re-read every authorization
+     * fact from the database on every request, so a revoke, an expiry, an
+     * un-assignment, a membership change, a video leaving READY or a cleared
+     * `PUBLIC_COMPATIBILITY_URL_HOSTS` take effect on the NEXT request rather
+     * than after a cache TTL. That costs one query per request on a throttled
+     * route, and correctness is worth more than the query.
+     *
+     * Note this also removes the warm-cache branch as a place the origin-
+     * specific rules (the non-consuming resume claim, the alias-free media
+     * mode) have to be re-implemented — there is now exactly one path that
+     * serves them. */
+    const mayUseWatchCache =
+      params.origin === undefined || params.origin === "watch";
+
+    if (mayUseWatchCache && normalizedHost !== null && trimmedToken) {
       const cacheKey = this.buildPublicWatchCacheKey(
         normalizedHost,
         trimmedToken,
@@ -260,7 +356,17 @@ export class PublicService {
    * decides whether the reviewer gets in then runs unmodified — host → ACTIVE
    * domain → ACTIVE website → ShareLink WITHIN that website → status, expiry,
    * `maxViews` → membership ∩ ACTIVE assignment → READY/playable → the atomic
-   * view claim → access log → the same media URLs and grants.
+   * view claim → access log.
+   *
+   * ONE EXCEPTION, DELIBERATE: this is an ALIAS-FREE origin (`mediaTokenModeFor()`).
+   * The AUTHORIZED CONTENT is identical to a `#k` exchange for the same link —
+   * same videos, same titles, same semantic payload — but the PROTECTED
+   * BACKEND URLs are not: `#k` echoes the presented credential into every
+   * `:token` path segment, while `compat` and `resume` carry a short-lived,
+   * per-video `rmv1` media token instead. Echoing the canonical alias back to
+   * a caller who presented only a transport alias would let one redemption
+   * upgrade the weaker credential into the permanent one — see
+   * `PublicReviewResumeService`.
    *
    * WHAT THAT BUYS, AND WHAT IT DELIBERATELY DOES NOT.
    *
@@ -278,9 +384,9 @@ export class PublicService {
    *   (it matches no `alias` and hashes to no `tokenHash`), and a `#k`
    *   credential is refused here by shape before any read.
    *
-   * The media URLs in the response carry the ShareLink's alias, as they do for
-   * the `#k` exchange, so every downstream route is untouched — and the
-   * transport alias itself reaches no part of the response.
+   * The response is alias-free. Protected backend media URLs carry per-video
+   * rmv1 tokens; neither those URLs nor any response field exposes the
+   * ShareLink alias, transport alias, raw token or token hash.
    */
   async resolvePublicWatchCompatible(
     params: ResolvePublicWatchCompatibleParams,
@@ -375,6 +481,125 @@ export class PublicService {
       host: params.host,
       token: shareAlias,
       requestMeta: params.requestMeta,
+      // The one flow that scrubs its carrier, and therefore the only one whose
+      // session a refresh would otherwise lose. This is what makes a resume
+      // grant appear on the response.
+      origin: "compat",
+    });
+  }
+
+  /**
+   * THE REVIEW-RESUME EXCHANGE.
+   *
+   * A reviewer opened `/watch?r=<transportAlias>`, the page scrubbed the
+   * carrier before its first request, and the credential now exists only in a
+   * variable that dies with the document. A refresh would lose the session.
+   * This restores it from a short-lived grant held in `sessionStorage` — with
+   * no share credential in the URL, and without spending a second view.
+   *
+   * THE GRANT IS A POINTER, NOT A PERMISSION. It names a ShareLink id and the
+   * host it was minted on. Everything that decides whether this reviewer may
+   * still watch is re-read from the database on THIS request, by handing the
+   * row's own `alias` to the unmodified V2 resolver. So a grant that is
+   * perfectly valid is still refused when the link was revoked, disabled,
+   * expired or exhausted, when the video stopped being READY, when membership
+   * or the website assignment was removed, when the domain or website was
+   * disabled, or when the host lost its compatibility capability.
+   *
+   * ORDERED CHEAPEST-FIRST, AND FAIL-CLOSED AT EVERY STEP:
+   *
+   *   1. host normalization        no host, no work
+   *   2. CAPABILITY KILL SWITCH    before the credential is examined at all
+   *   3. signature + purpose + host + expiry   no database read yet
+   *   4. locate the row by id      the only thing the grant is trusted for
+   *   5. the unmodified V2 chain   every authorization fact, re-read
+   *
+   * Step 2 sits ahead of step 3 deliberately. Clearing
+   * `PUBLIC_COMPATIBILITY_URL_HOSTS` is the emergency lever for the whole
+   * email-safe surface, and a resume session IS that surface continued — so it
+   * has to die with the same switch, on the same request, before any presented
+   * secret is even inspected.
+   */
+  async resolvePublicWatchResume(
+    params: ResolvePublicWatchResumeParams,
+  ): Promise<PublicWatchResponse> {
+    const normalizedHost = normalizePublicHost(params.host);
+
+    if (normalizedHost === null) {
+      await this.writeAccessLog({
+        reasonCode: "MISSING_HOST",
+        status: AccessLogStatus.DENIED,
+        requestMeta: params.requestMeta,
+      });
+
+      return this.invalidResponse("MISSING_HOST");
+    }
+
+    // THE KILL SWITCH REACHES RESUMED SESSIONS TOO. Without this, clearing the
+    // allowlist would stop new `?r=` redemptions while every tab that had
+    // already resumed kept working for the life of its grant — which is
+    // exactly the false sense of closure the redemption gate was added to
+    // prevent on the exchange itself.
+    if (
+      !isCompatibilityCapableHost(
+        normalizedHost,
+        this.configService.get<string>("PUBLIC_COMPATIBILITY_URL_HOSTS"),
+      )
+    ) {
+      await this.writeAccessLog({
+        domain: normalizedHost,
+        reasonCode: "INVALID_LINK",
+        status: AccessLogStatus.DENIED,
+        requestMeta: params.requestMeta,
+      });
+
+      return this.invalidResponse("INVALID_LINK");
+    }
+
+    const claim = this.publicReviewResumeService.verify(params.grant, {
+      host: normalizedHost,
+    });
+    if (claim === null) {
+      await this.writeAccessLog({
+        domain: normalizedHost,
+        reasonCode: "INVALID_LINK",
+        status: AccessLogStatus.DENIED,
+        requestMeta: params.requestMeta,
+      });
+
+      return this.invalidResponse("INVALID_LINK");
+    }
+
+    // The ONE thing the grant is trusted for: which row to look at. `select`
+    // is deliberately narrow — the resolver re-reads everything it needs, and
+    // a wider select here would invite trusting a value read at this point.
+    const row = await this.prisma.shareLink.findUnique({
+      where: { id: claim.shareLinkId },
+      select: { alias: true },
+    });
+    const shareAlias = row?.alias?.trim();
+
+    if (!shareAlias) {
+      await this.writeAccessLog({
+        domain: normalizedHost,
+        reasonCode: "INVALID_LINK",
+        status: AccessLogStatus.DENIED,
+        requestMeta: params.requestMeta,
+      });
+
+      return this.invalidResponse("INVALID_LINK");
+    }
+
+    return this.resolvePublicWatch({
+      host: params.host,
+      token: shareAlias,
+      requestMeta: params.requestMeta,
+      origin: "resume",
+      /* The ceiling for every media token this response mints. A poster URL
+         must not outlive the session grant that produced it, or deleting
+         `sessionStorage` would stop the reviewer resuming while the URLs
+         already in their DOM kept working. */
+      resumeNotAfter: claim.expiresAt,
     });
   }
 
@@ -558,7 +783,27 @@ export class PublicService {
     // this conditional update re-verifies status, expiry and `maxViews` and
     // claims the view in one statement. Nothing that grants playback may run
     // before it succeeds.
-    const viewIncremented = await this.incrementShareLinkView(shareLink, now);
+    /* A RESUME CONSUMES NOTHING.
+     *
+     * A refresh is the SAME review session, not a new one. Counting it would
+     * make `currentViews` a measure of how often a reviewer's browser reloaded
+     * — and on a budgeted link it would let a page refresh spend somebody
+     * else's access.
+     *
+     * Skipping the claim is safe here precisely because it is not the only
+     * check: `getDeniedReason()` above has already re-read this row's status,
+     * expiry and budget from the database on THIS request, so a revoked,
+     * expired or exhausted link is refused before reaching this point. What
+     * the atomic claim adds over that is the race-free decrement, and a path
+     * that decrements nothing does not need it.
+     *
+     * The grant is not what makes this safe. The grant only says WHICH row to
+     * look at; every authorization fact was re-read from that row.
+     */
+    const viewIncremented =
+      params.origin === "resume"
+        ? true
+        : await this.incrementShareLinkView(shareLink, now);
     if (!viewIncremented) {
       const latestShareLink = await this.prisma.shareLink.findUnique({
         where: { id: shareLink.id },
@@ -600,17 +845,98 @@ export class PublicService {
     const signableBunnyVideoIds =
       await this.loadSignableBunnyVideoIds(playableVideos);
 
+    /* THE SESSION GRANT IS MINTED BEFORE THE PAYLOAD IS SERIALIZED, so the
+       media tokens below can be clamped to its expiry. On the compat origin
+       this response BOTH consumes the view and establishes the session, and a
+       media token that outlived that session would be a credential with
+       nothing left to authorize it. */
+    const resumeSession = this.mintResumeGrantIfEligible(
+      params.origin,
+      shareLink,
+      normalizedHost,
+      now,
+    );
+
     return {
       valid: true,
       reasonCode: "OK",
       website: this.toPublicWebsiteResponse(website, normalizedHost),
       videos: this.toPublicVideoResponses(
         playableVideos,
-        { host: normalizedHost, token: trimmedToken },
+        {
+          host: normalizedHost,
+          token: trimmedToken,
+          mediaTokenMode: mediaTokenModeFor(
+            params.origin,
+            shareLink.id,
+            resumeSession?.expiresAt ?? params.resumeNotAfter,
+          ),
+        },
         shareLink,
         signableBunnyVideoIds,
       ),
+      /* SPREAD, NOT `?? null`. The key is absent unless this exchange
+         actually minted a grant, so the `#k` success body and the legacy
+         `GET` body keep exactly the property set they have always had. */
+      ...(resumeSession === null ? {} : { resumeGrant: resumeSession.grant }),
     };
+  }
+
+  /**
+   * A resume grant, but ONLY for the flow that needs one and ONLY after the
+   * view has already been claimed.
+   *
+   * THE ORIGIN GATE IS THE WHOLE RULE, and it is narrow on purpose:
+   *
+   *   compat  the `?r=` exchange scrubs its carrier from the address bar, so a
+   *           refresh has nothing left to redeem. This is the only session a
+   *           grant is needed for.
+   *   watch   the `#k` flow never scrubs — the fragment stays in the URL and a
+   *           refresh re-redeems it unaided. Minting here would put a
+   *           credential in storage to solve a problem that does not exist.
+   *   resume  already holds one. Re-minting on every refresh would slide the
+   *           TTL forward indefinitely and turn an 8-hour credential into a
+   *           permanent one.
+   *
+   * THE BUDGET GATE IS THE SECOND RULE. A grant restores a session WITHOUT
+   * consuming a view, so on a budgeted link it would be a way to keep watching
+   * after the budget was spent. Canonical links — the only ones the email-safe
+   * URL is emitted for — carry neither `maxViews` nor `expiresAt` by contract,
+   * so this refuses rather than reasons about a shape that should not arrive.
+   */
+  private mintResumeGrantIfEligible(
+    origin: ResolvePublicWatchParams["origin"],
+    shareLink: Pick<ShareLink, "id" | "maxViews" | "expiresAt">,
+    normalizedHost: string,
+    now: Date,
+  ): { grant: string; expiresAt: number } | null {
+    if (origin !== "compat") {
+      return null;
+    }
+    if (shareLink.maxViews !== null || shareLink.expiresAt !== null) {
+      return null;
+    }
+
+    const grant = this.publicReviewResumeService.issue({
+      shareLinkId: shareLink.id,
+      host: normalizedHost,
+      now,
+    });
+    const claim = this.publicReviewResumeService.verify(grant, {
+      host: normalizedHost,
+      now,
+    });
+
+    /* THE EXPIRY IS READ BACK FROM THE GRANT, not recomputed alongside it.
+       The media tokens in this same response are clamped to it, and two
+       independent computations of "the same" deadline is exactly how they
+       would come to disagree — leaving a poster URL alive after the session
+       it belongs to had expired. Reading it back means there is one number.
+
+       `verify()` cannot fail on a grant this method just minted; the null
+       branch is a type obligation, and falling back to no clamp would be
+       wrong, so it drops the grant instead. */
+    return claim === null ? null : { grant, expiresAt: claim.expiresAt };
   }
 
   async getPublicLocalVideoFile(
@@ -684,14 +1010,22 @@ export class PublicService {
     // loader first would silently double the query count on a public route.
     // The cached entry carries the video row, so its `sourceType` is enough to
     // dispatch, and the delegation below then hits the very same entry.
-    const cachedVideo =
-      this.memoryCache?.get<PublicWatchVideoWithBinary>(
-        this.buildPublicLocalMediaMetadataCacheKey(
-          normalizedHost,
-          trimmedToken,
-          params.videoId,
-        ),
-      ) ?? null;
+    // ...AND NOT FOR AN RMV1 TOKEN, for the reason given in
+    // `getAuthorizedPublicLocalVideo()`. This peek only chooses a branch, and
+    // the branch it chooses would authorize from the same entry, so skipping
+    // it here is what keeps the two consistent. An rmv1 thumbnail therefore
+    // takes the fully-authoritative path below on every request.
+    const cachedVideo = this.publicReviewResumeService.isMediaToken(
+      trimmedToken,
+    )
+      ? null
+      : (this.memoryCache?.get<PublicWatchVideoWithBinary>(
+          this.buildPublicLocalMediaMetadataCacheKey(
+            normalizedHost,
+            trimmedToken,
+            params.videoId,
+          ),
+        ) ?? null);
     if (cachedVideo?.sourceType === VideoSourceType.LOCAL_FILE) {
       return this.getPublicLocalThumbnail(params);
     }
@@ -905,10 +1239,13 @@ export class PublicService {
       return null;
     }
 
-    const viewIncremented = await this.incrementShareLinkView(
-      params.cachedMetadata.shareLink,
-      now,
-    );
+    const viewIncremented =
+      params.params.origin === "resume"
+        ? true
+        : await this.incrementShareLinkView(
+            params.cachedMetadata.shareLink,
+            now,
+          );
     if (!viewIncremented) {
       this.memoryCache?.delete(params.cacheKey);
       // Re-runs the full chain, which denies without signing.
@@ -923,6 +1260,17 @@ export class PublicService {
       shareLinkId: params.cachedMetadata.shareLink.id,
       requestMeta: params.params.requestMeta,
     });
+
+    /* Defensive construction retained for byte compatibility with the legacy
+       cache implementation. The caller admits only `watch`/undefined here;
+       compatibility and resume never reach this branch, so it never mints an
+       alias-free response or a resume grant from cached metadata. */
+    const resumeSession = this.mintResumeGrantIfEligible(
+      params.params.origin,
+      params.cachedMetadata.shareLink,
+      params.normalizedHost,
+      now,
+    );
 
     // Consumption succeeded. Signing happens here, per request, so a cache hit
     // still yields a freshly signed Bunny URL rather than a replayed one.
@@ -945,10 +1293,16 @@ export class PublicService {
         {
           host: params.normalizedHost,
           token: params.trimmedToken,
+          mediaTokenMode: mediaTokenModeFor(
+            params.params.origin,
+            params.cachedMetadata.shareLink.id,
+            resumeSession?.expiresAt ?? params.params.resumeNotAfter,
+          ),
         },
         undefined,
         signableBunnyVideoIds,
       ),
+      ...(resumeSession === null ? {} : { resumeGrant: resumeSession.grant }),
     };
   }
 
@@ -1115,7 +1469,18 @@ export class PublicService {
    */
   private toPublicVideoResponses(
     videos: PublicWatchVideoWithBinary[],
-    playbackContext: { host: string; token: string },
+    playbackContext: {
+      host: string;
+      token: string;
+      /**
+       * How the `:token` path segment of every backend media URL is filled.
+       *
+       * Defaults to echoing the presented credential for the historical `#k`
+       * contract. Compatibility and resume pass `aliasFree`, so no canonical
+       * alias appears anywhere in either response.
+       */
+      mediaTokenMode?: MediaTokenMode | undefined;
+    },
     shareLink: Pick<ShareLink, "id" | "maxViews" | "expiresAt"> | undefined,
     /**
      * Result of the authoritative database gate, computed by the caller after
@@ -1124,7 +1489,24 @@ export class PublicService {
      */
     signableBunnyVideoIds: Map<string, string>,
   ): PublicWatchVideoResponse[] {
+    const mediaTokenMode: MediaTokenMode = playbackContext.mediaTokenMode ?? {
+      kind: "credential",
+    };
+
     return this.selectPublicPlayableVideos(videos).map((video) => {
+      /* THE ONE VALUE THAT DECIDES WHETHER THIS RESPONSE LEAKS THE ALIAS.
+         Historical `#k` echoes its presented credential, unchanged.
+         Compatibility and resume use a fresh per-video rmv1 token that names
+         the row, is host/video scoped, and expires with the review session. */
+      const mediaToken =
+        mediaTokenMode.kind === "aliasFree"
+          ? this.publicReviewResumeService.issueMediaToken({
+              shareLinkId: mediaTokenMode.shareLinkId,
+              videoId: video.id,
+              host: playbackContext.host,
+              notAfter: mediaTokenMode.notAfter,
+            })
+          : playbackContext.token;
       const grant =
         shareLink === undefined || shareLink.maxViews === null
           ? undefined
@@ -1137,7 +1519,7 @@ export class PublicService {
       const binaryPlaybackUrl =
         video.sourceType === VideoSourceType.DB_BLOB
           ? this.buildPublicBinaryPlaybackUrl({
-              token: playbackContext.token,
+              token: mediaToken,
               videoId: video.id,
               host: playbackContext.host,
               grant,
@@ -1146,7 +1528,7 @@ export class PublicService {
       const localPlaybackUrl =
         video.sourceType === VideoSourceType.LOCAL_FILE
           ? this.buildPublicLocalPlaybackUrl({
-              token: playbackContext.token,
+              token: mediaToken,
               videoId: video.id,
               host: playbackContext.host,
               grant,
@@ -1156,7 +1538,7 @@ export class PublicService {
         video.sourceType === VideoSourceType.LOCAL_FILE &&
         this.isPlayableImageAsset(video.localThumbnailAsset ?? null)
           ? this.buildPublicThumbnailUrl({
-              token: playbackContext.token,
+              token: mediaToken,
               videoId: video.id,
               host: playbackContext.host,
               grant,
@@ -1184,7 +1566,7 @@ export class PublicService {
         // a correctly-null `embedUrl`.
         this.resolveBunnyThumbnailUpstream(video) !== null
           ? this.buildPublicThumbnailUrl({
-              token: playbackContext.token,
+              token: mediaToken,
               videoId: video.id,
               host: playbackContext.host,
               grant,
@@ -1603,21 +1985,44 @@ export class PublicService {
       },
     };
 
+    const credentialKind = this.resolveMediaCredentialKind(
+      trimmedToken,
+      normalizedHost,
+      params.videoId,
+    );
+    if (credentialKind === null) {
+      throw new NotFoundException("Video not found.");
+    }
+
+    /* THE WEBSITE SCOPE IS RE-IMPOSED FROM THE DATABASE on both branches.
+       A resume media token names a ShareLink id, and the id alone would be
+       enough to reach the row — so the lookup is still scoped to the website
+       resolved from the request host. The token's own `host` claim was
+       checked a moment ago; this is the independent check, and it is the one
+       that survives a forged claim. */
     const shareLink =
-      (await this.prisma.shareLink.findFirst({
-        where: {
-          alias: trimmedToken,
-          websiteId: domainRecord.website.id,
-        },
-        include: binaryInclude,
-      })) ??
-      (await this.prisma.shareLink.findFirst({
-        where: {
-          tokenHash,
-          websiteId: domainRecord.website.id,
-        },
-        include: binaryInclude,
-      }));
+      credentialKind.kind === "resume"
+        ? await this.prisma.shareLink.findFirst({
+            where: {
+              id: credentialKind.shareLinkId,
+              websiteId: domainRecord.website.id,
+            },
+            include: binaryInclude,
+          })
+        : ((await this.prisma.shareLink.findFirst({
+            where: {
+              alias: trimmedToken,
+              websiteId: domainRecord.website.id,
+            },
+            include: binaryInclude,
+          })) ??
+          (await this.prisma.shareLink.findFirst({
+            where: {
+              tokenHash,
+              websiteId: domainRecord.website.id,
+            },
+            include: binaryInclude,
+          })));
 
     if (
       shareLink === null ||
@@ -1707,13 +2112,34 @@ export class PublicService {
       throw new NotFoundException("Video not found.");
     }
 
+    /* AN RMV1 TOKEN IS NEVER SERVED FROM THIS CACHE.
+     *
+     * The entry is keyed on a hash of the presented token, so a first request
+     * with a given token would warm it and every later request with the SAME
+     * token would return before `resolveMediaCredentialKind()` ran — before
+     * the signature was verified, before the token's own expiry was checked,
+     * before the compatibility kill switch, and before any current database
+     * read. A token would then outlive its own `exp`, and clearing
+     * `PUBLIC_COMPATIBILITY_URL_HOSTS` would leave already-issued media URLs
+     * working for the rest of the cache TTL — which is exactly the false sense
+     * of closure this whole surface has been hardened against twice already.
+     *
+     * A legacy authorized-media cache entry is NOT authorization for an rmv1
+     * request, so the read is skipped and the write with it: a per-session
+     * token's entry could never be reused by anyone else, and writing one
+     * would only evict entries that can be.
+     *
+     * `#k` and raw-token caching are untouched. */
+    const aliasFreeToken =
+      this.publicReviewResumeService.isMediaToken(trimmedToken);
     const cacheKey = this.buildPublicLocalMediaMetadataCacheKey(
       normalizedHost,
       trimmedToken,
       params.videoId,
     );
-    const cachedVideo =
-      this.memoryCache?.get<PublicWatchVideoWithBinary>(cacheKey) ?? null;
+    const cachedVideo = aliasFreeToken
+      ? null
+      : (this.memoryCache?.get<PublicWatchVideoWithBinary>(cacheKey) ?? null);
     if (cachedVideo !== null) {
       return cachedVideo;
     }
@@ -1729,6 +2155,7 @@ export class PublicService {
     const ttlSeconds =
       this.memoryCache?.getRuntimeConfig().mediaMetadataTtlSeconds ?? null;
     if (
+      !aliasFreeToken &&
       this.memoryCache !== undefined &&
       ttlSeconds !== null &&
       this.canCachePublicWatchShareLink(shareLink, new Date(), ttlSeconds)
@@ -1835,21 +2262,42 @@ export class PublicService {
       },
     };
 
+    /* THE ONE PROVIDER-INDEPENDENT CHAIN, so the resume media token is
+       understood by LOCAL_FILE playback, the LOCAL_FILE thumbnail and the
+       Bunny poster proxy from a single place — exactly as every other
+       authorization rule here is. */
+    const credentialKind = this.resolveMediaCredentialKind(
+      params.trimmedToken,
+      params.normalizedHost,
+      params.videoId,
+    );
+    if (credentialKind === null) {
+      throw new NotFoundException("Video not found.");
+    }
+
     const shareLink =
-      (await this.prisma.shareLink.findFirst({
-        where: {
-          alias: params.trimmedToken,
-          websiteId: domainRecord.website.id,
-        },
-        include: localVideoInclude,
-      })) ??
-      (await this.prisma.shareLink.findFirst({
-        where: {
-          tokenHash,
-          websiteId: domainRecord.website.id,
-        },
-        include: localVideoInclude,
-      }));
+      credentialKind.kind === "resume"
+        ? await this.prisma.shareLink.findFirst({
+            where: {
+              id: credentialKind.shareLinkId,
+              websiteId: domainRecord.website.id,
+            },
+            include: localVideoInclude,
+          })
+        : ((await this.prisma.shareLink.findFirst({
+            where: {
+              alias: params.trimmedToken,
+              websiteId: domainRecord.website.id,
+            },
+            include: localVideoInclude,
+          })) ??
+          (await this.prisma.shareLink.findFirst({
+            where: {
+              tokenHash,
+              websiteId: domainRecord.website.id,
+            },
+            include: localVideoInclude,
+          })));
 
     if (
       shareLink === null ||
@@ -1984,21 +2432,38 @@ export class PublicService {
       },
     };
 
+    const credentialKind = this.resolveMediaCredentialKind(
+      trimmedToken,
+      normalizedHost,
+      params.videoId,
+    );
+    if (credentialKind === null) {
+      return null;
+    }
+
     const shareLink =
-      (await this.prisma.shareLink.findFirst({
-        where: {
-          alias: trimmedToken,
-          websiteId: domainRecord.website.id,
-        },
-        include: publicViewInclude,
-      })) ??
-      (await this.prisma.shareLink.findFirst({
-        where: {
-          tokenHash,
-          websiteId: domainRecord.website.id,
-        },
-        include: publicViewInclude,
-      }));
+      credentialKind.kind === "resume"
+        ? await this.prisma.shareLink.findFirst({
+            where: {
+              id: credentialKind.shareLinkId,
+              websiteId: domainRecord.website.id,
+            },
+            include: publicViewInclude,
+          })
+        : ((await this.prisma.shareLink.findFirst({
+            where: {
+              alias: trimmedToken,
+              websiteId: domainRecord.website.id,
+            },
+            include: publicViewInclude,
+          })) ??
+          (await this.prisma.shareLink.findFirst({
+            where: {
+              tokenHash,
+              websiteId: domainRecord.website.id,
+            },
+            include: publicViewInclude,
+          })));
 
     if (
       shareLink === null ||
@@ -2268,6 +2733,11 @@ export class PublicService {
       reasonCode: "INVALID_LINK",
       website: null,
       videos: [],
+      // NO `resumeGrant` KEY AT ALL. The denial body has been these four
+      // properties since this API shipped; a fifth would change a contract
+      // deployed clients were written against, and it would buy nothing —
+      // `valid: false` already announces the outcome, so the shape reveals
+      // nothing the content does not.
     };
   }
 
@@ -2298,12 +2768,68 @@ export class PublicService {
   }
 
   private normalizePublicToken(value: unknown): string | null {
-    if (typeof value !== "string" || value.length > 256) {
+    if (typeof value !== "string") {
+      return null;
+    }
+
+    /* THE BOUND IS UNCHANGED AT 256, and a resume media token fits inside it
+       by design: the reviewer client refuses a media path segment longer than
+       that, so anything the API could not fit would be a URL no client would
+       fetch. Binding the host into the MAC domain instead of the payload is
+       what buys the room. */
+    if (value.length > 256) {
       return null;
     }
 
     const normalized = value.trim();
     return normalized.length === 0 ? null : normalized;
+  }
+
+  /**
+   * WHICH KIND OF CREDENTIAL IS IN THE `:token` PATH SEGMENT?
+   *
+   * Media URLs returned by COMPATIBILITY or RESUME carry a short-lived,
+   * per-video, host-bound rmv1 token instead of `ShareLink.alias`. This is
+   * where media routes distinguish alias-free sessions from historical `#k`.
+   *
+   * IT IS EXACT, NOT PROBABILISTIC. All legacy share credentials are shorter
+   * than the rmv1 minimum length. An alias may begin with `rmv1` and still
+   * follows the legacy path; a long rmv1-shaped value is verified or refused,
+   * never retried as a share credential.
+   *
+   * THE KILL SWITCH APPLIES HERE. Compatibility and resume are the email-safe
+   * surface, so media derived from either must die with
+   * `PUBLIC_COMPATIBILITY_URL_HOSTS` exactly as the resume itself does.
+   * Without this, clearing the allowlist during an incident would stop new
+   * resumes while every already-issued poster and video URL kept working for
+   * the life of its token.
+   */
+  private resolveMediaCredentialKind(
+    trimmedToken: string,
+    normalizedHost: string,
+    videoId: string,
+  ): { kind: "credential" } | { kind: "resume"; shareLinkId: string } | null {
+    if (!this.publicReviewResumeService.isMediaToken(trimmedToken)) {
+      return { kind: "credential" };
+    }
+
+    if (
+      !isCompatibilityCapableHost(
+        normalizedHost,
+        this.configService.get<string>("PUBLIC_COMPATIBILITY_URL_HOSTS"),
+      )
+    ) {
+      return null;
+    }
+
+    const claim = this.publicReviewResumeService.verifyMediaToken(
+      trimmedToken,
+      { host: normalizedHost, videoId },
+    );
+
+    return claim === null
+      ? null
+      : { kind: "resume", shareLinkId: claim.shareLinkId };
   }
 
   private isValidPublicVideoId(value: unknown): value is string {

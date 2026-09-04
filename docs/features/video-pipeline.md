@@ -205,11 +205,14 @@ A video that is `READY` but unassigned is invisible publicly. A video assigned
 but not in any share link is likewise invisible.
 
 Both checks are applied on media requests, not only on the listing — with one
-documented exception: for **unlimited** `LOCAL_FILE` links the authorization
-result may be served from a process-local cache for up to
+documented exception, and that exception belongs to the **legacy `#k` origin
+alone**: for **unlimited** `LOCAL_FILE` links reached with a `#k` credential the
+authorization result may be served from a process-local cache for up to
 `MEDIA_METADATA_CACHE_TTL_SECONDS`, so an un-assignment can take that long to
 take effect in a process that did not observe the invalidation. `DB_BLOB` and
-view-limited links are never cached. See
+view-limited links are never cached, and neither is any request carrying an
+alias-free `rmv1` media token — a `compat` or `resume` session bypasses this
+cache entirely and revalidates against the database on every request. See
 [SECURITY_MODEL.md §4.2](../SECURITY_MODEL.md#42-local_file-media-authorization-cache).
 
 ## 10. Deleting

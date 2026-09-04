@@ -78,6 +78,11 @@ const PRODUCTION_ENV_BASE = {
   REFRESH_TOKEN_PEPPER: "pepper",
   SHARE_TOKEN_PEPPER: "share-pepper",
   PUBLIC_MEDIA_GRANT_SECRET: "test-public-media-grant-secret-at-least-32-bytes",
+  // Required in production alongside the media grant secret, and kept a
+  // DIFFERENT value on purpose: equal secrets would let a cross-purpose
+  // confusion pass, since MAC domain separation would carry the property
+  // on its own.
+  PUBLIC_WATCH_RESUME_SECRET: "test-public-watch-resume-secret-at-least-32-byt",
   ACCESS_LOG_IP_PEPPER: "ip-pepper",
   ADMIN_CHANGE_PASSWORD_SECRET: "change-secret",
 } as const;

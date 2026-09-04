@@ -2213,14 +2213,41 @@ describe("public resolution independence from canonical mappings", () => {
     "utf8",
   );
 
+  /**
+   * Remove block and line comments, preserving the executable text.
+   *
+   * Deliberately blunt: it does not parse strings, so a `//` inside a string
+   * literal would truncate that line. That errs towards removing text, which
+   * for this assertion is the SAFE direction only because the assertion below
+   * re-proves that recognisable code survived — see the two `assert.match`
+   * lines there. Nothing else in this file uses it.
+   */
+  const stripComments = (source: string): string =>
+    source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+
   it("never reads the canonical subsystem at all", () => {
     // The strongest statement available: a mapping cannot grant a bypass it is
     // never consulted for.
+    //
+    // COMMENTS ARE STRIPPED FIRST, and that is a correction rather than a
+    // relaxation. The property is about what the code CONSULTS; prose that
+    // merely uses the word "canonical" — explaining, for instance, that the
+    // email-safe URL is emitted only for canonical links — consults nothing.
+    // Matching it made this test fail for a comment, which is a false positive
+    // that trains people to delete the guard. The executable text is still
+    // held to the original, absolute rule: not one occurrence.
+    const code = stripComments(publicServiceSource);
+
     assert.equal(
-      /canonical/i.test(publicServiceSource),
+      /canonical/i.test(code),
       false,
       "public resolution referenced the canonical subsystem",
     );
+
+    // And the stripper must not be able to hide a real reference by eating too
+    // much. A line that is genuinely code survives it.
+    assert.match(code, /class PublicService/);
+    assert.match(code, /private async incrementShareLinkView\(/);
   });
 
   it("keeps enforcing status, expiresAt and maxViews on the watch path", () => {

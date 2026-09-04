@@ -1,8 +1,25 @@
 # Email-safe reviewer URL for the Arcwild private-review flow — design
 
-Status: PROPOSED (uncommitted; production untouched)
+Status: **SUPERSEDED IN PART (2026-09-03) — historical design record, not current
+behaviour.** Read it for the problem statement and the trade-off reasoning; do
+not read it as a description of what the code does now.
 Date: 2026-09-02
 Scope: `bom-media-api`, `CPR_arcwildstudios`, `bom-media-admin`
+
+> **WHAT THIS DOCUMENT NO LONGER DESCRIBES CORRECTLY.** This design had the
+> compatibility exchange echo the ShareLink's own alias into its media URLs
+> "exactly as the `#k` exchange's do" (§3.3), and listed media routes, grants and
+> caching as unchanged (§7). That shipped differently. On 2026-09-03 BOTH
+> alias-free origins — the first `?r=` redemption and every resume — were changed
+> to carry a per-video, host-bound, short-lived `rmv1` media token instead, and
+> both were removed from the watch cache and the authorized-media cache. The
+> reason is recorded in
+> [SECURITY_MODEL.md §2.0.2 and §2.0.3](../../SECURITY_MODEL.md#202-the-alias-free-media-token--how-the-alias-stays-out-of-compatibility-and-resume):
+> echoing the alias let one redemption of the weaker credential recover the
+> permanent one, which survived the `PUBLIC_COMPATIBILITY_URL_HOSTS` kill switch.
+> Current behaviour lives in
+> [API_CONTRACTS.md §3.1.3/§3.1.4](../../API_CONTRACTS.md) and
+> [features/share-links.md §3.1/§3.2](../../features/share-links.md).
 
 ## 1. Problem
 

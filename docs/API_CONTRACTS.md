@@ -95,6 +95,8 @@ Swagger is enabled — this document exists to record **who consumes what** and
 | `/admin/websites/:websiteId/videos/:videoId/canonical-share-link` | GET/POST | access token | read / write | — (the Admin reaches the same logic through `POST …/share-links` with one video) |
 | `/public/watch` | GET | none | — | **P** (legacy fallback) |
 | `/public/watch/exchange` | POST | none | — | **P** (preferred) |
+| `/public/watch/exchange-compatible` | POST | none | — | **P** (email-safe) |
+| `/public/watch/resume` | POST | none | — | **P** (session resume) |
 | `/public/watch/:token/videos/:videoId/view` | POST | none | — | **P** |
 | `/public/watch/:token/videos/:videoId/binary` | GET/HEAD | none | — | **P** |
 | `/public/watch/:token/videos/:videoId/local-file` | GET/HEAD | none | — | **P** |
@@ -845,6 +847,31 @@ Breaking any of these breaks every deployed customer website.
   "videos": [] }
 ```
 
+> **`resumeGrant` is OPTIONAL, and it is ABSENT from every body above.**
+>
+> **CORRECTION (2026-09-03).** It was briefly a REQUIRED property, so it
+> appeared as `null` on the `#k` success body, on the legacy `GET` body and on
+> every denial. The justification was anti-enumeration — a field present only
+> on success would let the shape of a reply reveal its outcome. That does not
+> survive contact with the body, which already announces its outcome in
+> `valid`; the field disclosed nothing new, and it changed a serialized
+> contract that deployed public sites were written against.
+>
+> | Path | Property set |
+> |---|---|
+> | `POST /public/watch/exchange`, `GET /public/watch` | `{ valid, reasonCode, website, videos }` |
+> | `POST /public/watch/resume`, success | `{ valid, reasonCode, website, videos }` |
+> | **every denial, whatever the cause** | `{ valid, reasonCode, website, videos }` |
+> | `POST /public/watch/exchange-compatible`, success, unbudgeted link | the same **plus** `resumeGrant` |
+> | `POST /public/watch/exchange-compatible`, success, budgeted link | the same four — no grant, no key |
+>
+> Pinned by `test/public-watch-golden-contract.test.ts` against the
+> PRE-FEATURE bodies byte for byte.
+>
+> A client MUST treat it as optional, MUST NOT construct one, and MUST NOT
+> store it anywhere that outlives the tab. Full model:
+> [SECURITY_MODEL.md §2.0.1](./SECURITY_MODEL.md#201-the-review-resume-grant--a-pointer-not-a-permission).
+
 > **CONTRACT INVARIANT: denials are `200` with `valid: false`.** The public site
 > branches on `valid`, not on HTTP status. Converting these to `4xx` would break
 > every deployed site.
@@ -940,28 +967,49 @@ request occurs during playback.
 // POST body
 { "host": "arcwildstudios.com", "alias": "<22-character transport alias from ?r=>" }
 
-// 200 — success and denial: EXACTLY the §3.1 bodies. No new field, no new
-// reason code, no new status.
+// 200 — denial: exactly the §3.1 denial body.
+// 200 — eligible success: §3.1 success plus a final resumeGrant property.
+// Ineligible success omits that property; no path emits resumeGrant: null.
 ```
 
 The public site redeems `https://<domain>/watch?r=<transportAlias>` here. The
 body carries the **transport alias** — an alternate bearer credential for the
 ShareLink, never the `#k` credential — and the backend does exactly one new
 thing with it: `resolvePublicWatchCompatible()` maps it to a ShareLink row and
-hands that row's own `alias` to the unmodified `resolvePublicWatch()`. So host
-binding, website scope, status, expiry,
-`maxViews`, membership, assignment, READY/playable, the atomic view claim, the
-access log, caching, Bunny signing and media-URL/grant minting are the §3.1
-ones, byte for byte.
+hands that row's own `alias` to `resolvePublicWatch()` with the compatibility
+origin. So host
+binding, website scope, status, expiry, `maxViews`, membership, assignment,
+READY/playable, the atomic view claim, access logging and Bunny signing use the
+same authority chain. Compatibility bypasses the watch cache and emits
+alias-free rmv1 media URLs.
+
+> **CONTRACT INVARIANT: the reply discloses no canonical credential (changed
+> 2026-09-03).** The caller presented a TRANSPORT alias, so echoing
+> `ShareLink.alias` back in the media URLs let one redemption convert the
+> weaker credential into the permanent one — and that recovered `#k` link kept
+> working after the host was removed from `PUBLIC_COMPATIBILITY_URL_HOSTS`,
+> defeating the switch's whole purpose. Backend-served media URLs now carry a
+> per-video `rmv1` token, the same one a resume uses:
+>
+> ```
+> #k        /api/v1/public/watch/<alias>/videos/<id>/local-file      UNCHANGED
+> ?r=       /api/v1/public/watch/rmv1<payload><sig>/videos/<id>/local-file
+> resume    /api/v1/public/watch/rmv1<payload><sig>/videos/<id>/local-file
+> ```
+>
+> `playbackUrl`, `embedUrl` and stored external thumbnails are untouched —
+> they never carried a credential. **No client change is required**: the token
+> is pure base64url under the 256-character segment limit every shipped client
+> already validates, and all of them pass these URLs through verbatim. A
+> client MUST NOT parse the `:token` segment or build a media URL from it.
 
 > **CONTRACT INVARIANT: same payload, same consumption.** A successful call
 > claims one `currentViews` exactly as `watch/exchange` does; a denial claims
 > nothing; the two URL forms share one budget. That parity is the reason
 > `compatibilityUrl` is emitted only for canonical single-video links, which
-> carry no view budget for a mail scanner to spend. The media URLs in the response
-> carry the ShareLink's **own alias** in their path, as the `#k` exchange's
-> do, so every media route is unchanged and the transport alias reaches no
-> part of the response.
+> carry no view budget for a mail scanner to spend. Protected media URLs carry
+> per-video rmv1 tokens, so neither the transport alias nor the canonical alias
+> reaches any compatibility response field or generated URL.
 
 > **CONTRACT INVARIANT: the two credential kinds are disjoint.** A transport
 > alias is refused by `watch/exchange`, the legacy `GET`, and every media route
@@ -981,6 +1029,87 @@ ones, byte for byte.
 > from that list is therefore an **emergency kill switch** for every `?r=` link
 > on it, effective on restart; `#k` links are unaffected. It suspends rather
 > than revokes — restoring the host restores every alias.
+
+### 3.1.4 `POST /public/watch/resume` — restoring a scrubbed session (added 2026-09-03)
+
+```jsonc
+// POST body
+{ "host": "arcwildstudios.com", "grant": "<the resumeGrant from §3.1.4's issuer>" }
+
+// 200 — success and denial: EXACTLY the §3.1 bodies. No `resumeGrant` key —
+// a resume is a continuation, not a new session, so no grant is reissued and
+// using one cannot extend its own life. No new field, reason code or status.
+```
+
+The email-safe reviewer URL removes `?r=` from the address bar with
+`history.replaceState` **before it makes any request**, which is what keeps an
+alternate bearer credential out of history and out of later `Referer` headers.
+The cost was that a refresh had nothing left to redeem and dropped the reviewer
+on the "this page needs a private link" state. This endpoint restores the
+session from the grant that exchange returned.
+
+> **CONTRACT INVARIANT: a resume CONSUMES NO VIEW.** A refresh is the same
+> review session, not a new one. Compatibility and resume bypass the watch
+> metadata cache; `ShareLink.currentViews` is untouched on the fresh
+> authoritative resume path. An `AccessLog` row
+> IS written, so a denial reaching a resumed tab stays diagnosable — which
+> means `AccessLog` row count and `currentViews` legitimately diverge for a
+> resumed session.
+
+> **CONTRACT INVARIANT: no authority fact is trusted from the grant.** It is a
+> bearer session credential that names a ShareLink id and host.
+> `resolvePublicWatchResume()` verifies it, loads the row it names, and hands
+> that row's own `alias` to `resolvePublicWatch()` with the `resume` origin —
+> so status, expiry, `maxViews`, membership, the
+> `WebsiteVideo` assignment, `READY`, domain and website binding are the §3.1
+> checks, evaluated against current state on every call. A revoke, an expiry,
+> an un-assignment or a video leaving `READY` denies a perfectly valid grant.
+
+> **CONTRACT INVARIANT: the compatibility host gate applies here too, first.**
+> A host absent from `PUBLIC_COMPATIBILITY_URL_HOSTS` is refused with the
+> generic §3.1 denial **before the presented grant is examined at all**. A
+> resumed session is the email-safe surface continued, so it dies with the same
+> emergency switch. See §3.1.3.
+
+> **POST only, and the grant travels in the BODY.** No route parameter and no
+> query string, so nothing about it can reach a request log. `req.body.grant`
+> is a pino redaction path, and request bodies are not logged at all.
+
+> **CONTRACT INVARIANT: a resumed reply carries NO share credential — and the
+> media URLs in it therefore differ from the canonical path (changed
+> 2026-09-03).** Every backend-served media URL echoes the presented token
+> into its `:token` path segment, and a resume presents the row's own `alias`,
+> so a resumed reply used to hand back the canonical `#k` credential. One
+> redemption of a stolen grant then produced a URL that outlived the grant,
+> the client's storage and the kill switch. A resumed reply now carries a
+> **resume media token** instead:
+>
+> ```
+> #k                   /api/v1/public/watch/<alias>/videos/<id>/local-file   UNCHANGED
+> compatibility/resume /api/v1/public/watch/rmv1<payload><sig>/videos/<id>/local-file
+> ```
+>
+> The token is per-video, host-bound, and expires no later than the resume
+> grant that minted it. **Clients need no change**: it is pure base64url,
+> under the 256-character segment limit the shipped reviewer client already
+> enforces (worst case measured, 207), and every client passes these URLs
+> through verbatim. `playbackUrl`, `embedUrl` and any stored external
+> thumbnail are untouched — they never carried a credential.
+>
+> A client MUST NOT parse the `:token` segment or reconstruct a media URL from
+> it. Full model:
+> [SECURITY_MODEL.md §2.0.2](./SECURITY_MODEL.md#202-the-alias-free-media-token--how-the-alias-stays-out-of-compatibility-and-resume).
+
+> **The credential kinds are non-interchangeable.** Legacy media grants retain
+> `PUBLIC_MEDIA_GRANT_SECRET`, an empty MAC domain and unchanged wire bytes.
+> Resume grants and rmv1 use `PUBLIC_WATCH_RESUME_SECRET` under distinct
+> `review-resume-v1` and `resume-media-v1|<normalized-host>` domains, so none
+> verifies as another even if both configured secrets are identical and a
+> purpose check were removed.
+
+Errors: `400` for a missing or over-long field (structural validation only); a
+well-typed but wrong value gets the same generic `200 INVALID_LINK` every other
+refusal on this surface gets, rather than a distinguishable `400`.
 
 ### 3.1.2 The Bunny reviewer URL opens on the poster
 
@@ -1073,11 +1202,15 @@ serves **two** kinds of poster, decided from the video's own `sourceType`:
 > the same semantics as the other media routes.
 
 > Authorization for `local-file` and the `LOCAL_FILE` thumbnail branch may be
-> served from a process-local cache rather than re-queried per request. See
+> served from a process-local cache rather than re-queried per request — but
+> **only for a `#k` credential.** See
 > [SECURITY_MODEL.md §4.2](./SECURITY_MODEL.md#42-local_file-media-authorization-cache).
 > The **Bunny** branch deliberately does not use that cache: it re-reads the
 > current `VideoAsset` row before every proxied fetch, for the same reason the
-> playback signing gate does.
+> playback signing gate does. **Neither does a `compat`/`resume` `rmv1` media
+> token, on any source type** — it bypasses this cache entirely and revalidates
+> current authorization against the database on every request, with no bounded
+> exposure window at all.
 
 ### 3.3 `POST /public/watch/:token/videos/:videoId/view`
 

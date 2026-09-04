@@ -1,4 +1,4 @@
-import { ApiProperty } from "@nestjs/swagger";
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
 import type {
   EmbedProvider,
   VideoSourceType,
@@ -47,6 +47,28 @@ export type PublicWatchVideoResponse = {
   publishedAt: string | null;
 };
 
+/**
+ * `resumeGrant` IS OPTIONAL, AND ITS ABSENCE IS PART OF THE CONTRACT.
+ *
+ * It was briefly unconditional, on an anti-enumeration argument: a field
+ * present only on success would let the SHAPE of a reply reveal its outcome.
+ * That argument does not survive contact with the body, which already
+ * announces its outcome in `valid` — so the field disclosed nothing new, and
+ * the cost was real. It changed the `#k` success body, the legacy `GET` body
+ * and every denial body away from the exact property set every deployed client
+ * and the release-blocking compatibility manifest were written against.
+ *
+ * The property set is now, and must stay:
+ *
+ *   #k success / legacy GET   { valid, reasonCode, website, videos }
+ *   EVERY denial              { valid, reasonCode, website, videos }
+ *   compat success            { valid, reasonCode, website, videos, resumeGrant }
+ *   resume success            { valid, reasonCode, website, videos }
+ *
+ * Pinned by `test/public-watch-golden-contract.test.ts` against the
+ * PRE-FEATURE bodies byte for byte, rather than by fixtures updated to accept
+ * whatever the code now emits.
+ */
 export class PublicWatchResponse {
   @ApiProperty({ example: true })
   valid!: boolean;
@@ -59,6 +81,18 @@ export class PublicWatchResponse {
 
   @ApiProperty({ isArray: true })
   videos!: PublicWatchVideoResponse[];
+
+  @ApiPropertyOptional({
+    description:
+      "OPTIONAL, and ABSENT unless the new protocol requires it. A " +
+      "short-lived, host-bound grant that lets the SAME browser tab restore " +
+      "this review session after a refresh, without keeping any share " +
+      "credential in the URL. Emitted ONLY on a successful email-safe " +
+      "exchange, which is the only flow that scrubs its own carrier. The #k " +
+      "success body, the legacy GET body and every denial body omit the " +
+      "property entirely.",
+  })
+  resumeGrant?: string;
 }
 
 export class PublicVideoViewResponse {

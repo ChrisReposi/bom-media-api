@@ -30,6 +30,7 @@ import {
   ThrottleProfile,
 } from "../security/throttle-profile.decorator";
 import { PublicWatchCompatibleExchangeDto } from "./dto/public-watch-compatible-exchange.dto";
+import { PublicWatchResumeDto } from "./dto/public-watch-resume.dto";
 import { PublicWatchExchangeDto } from "./dto/public-watch-exchange.dto";
 import { PublicWatchQueryDto } from "./dto/public-watch-query.dto";
 import { RecordPublicVideoViewDto } from "./dto/record-public-video-view.dto";
@@ -124,8 +125,13 @@ export class PublicController {
    * credential. Both are secrets and both are redacted.
    * `PublicService.resolvePublicWatchCompatible()` swaps it
    * for the ShareLink's own alias and runs the UNMODIFIED V2 resolver, so the
-   * response, the authorization chain, the view consumption and the media
-   * URLs are exactly those of `POST watch/exchange` for the same link.
+   * authorization chain and the view consumption are exactly those of
+   * `POST watch/exchange` for the same link, and the AUTHORIZED CONTENT —
+   * which videos, which titles — is identical. The protected backend URLs are
+   * NOT identical: `#k` remains credential-backed, while this origin (and a
+   * resume) receive a short-lived, per-video `rmv1` media token instead of the
+   * canonical alias, so redeeming a transport alias here can never disclose
+   * `#k`.
    *
    * POST only, and the alias travels in the BODY: no route parameter, no
    * query string, so nothing about it can reach the request log
@@ -156,6 +162,57 @@ export class PublicController {
     return this.publicService.resolvePublicWatchCompatible({
       host: body.host,
       alias: body.alias,
+      requestMeta: {
+        ip: this.extractClientIp(request),
+        referer: readRequestHeader(request, "referer"),
+        userAgent: readRequestHeader(request, "user-agent"),
+      },
+    });
+  }
+
+  /**
+   * RESUME A SCRUBBED REVIEW SESSION, IN THE SAME TAB.
+   *
+   * The email-safe flow removes its carrier from the address bar before it
+   * makes any request, so nothing survives a refresh. This takes the
+   * short-lived grant that exchange returned and restores the same payload.
+   *
+   * IT CONSUMES NO VIEW. A refresh is the same review session, not a new one.
+   *
+   * IT AUTHORIZES NOTHING BY ITSELF. The grant names a ShareLink and a host;
+   * every authorization fact is re-read from the database on this request, so
+   * a revoke, an expiry, a membership change, an un-assignment, a video
+   * leaving READY, or clearing `PUBLIC_COMPATIBILITY_URL_HOSTS` all deny a
+   * request carrying a perfectly valid grant.
+   *
+   * POST only, and the grant travels in the BODY — no route parameter and no
+   * query string, so nothing about it can reach a request log.
+   */
+  @Post("watch/resume")
+  @HttpCode(HttpStatus.OK)
+  @ThrottleProfile(THROTTLE_PROFILES.publicWatch)
+  @ApiOperation({
+    summary: "Resume a review session from a short-lived resume grant.",
+    description:
+      "Restores the reviewer payload for a session established by the email-safe exchange, in the same browser tab, after the carrier was scrubbed from the URL. Re-runs every authoritative check against current database state and does NOT increment the ShareLink view count. Does not require admin authentication.",
+  })
+  @ApiOkResponse({
+    type: PublicWatchResponse,
+    description: "Public watch result.",
+  })
+  @ApiBadRequestResponse({
+    description: "Invalid request body.",
+  })
+  resumePublicWatch(
+    @Body() body: PublicWatchResumeDto,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ): Promise<PublicWatchResponse> {
+    setNoStoreHeaders(response);
+
+    return this.publicService.resolvePublicWatchResume({
+      host: body.host,
+      grant: body.grant,
       requestMeta: {
         ip: this.extractClientIp(request),
         referer: readRequestHeader(request, "referer"),

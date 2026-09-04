@@ -20,7 +20,8 @@ Verified against: `src/app.module.ts`, `src/common/filters/global-exception.filt
 - **Redaction** — `req.headers.authorization`, `req.headers.cookie`,
   `req.headers.proxy-authorization`, `req.headers.x-api-key`,
   `res.headers.set-cookie`, `req.query.token`, `req.query.grant`,
-  `req.body.token`, `req.body.alias`, `req.query.r` → `[Redacted]`.
+  `req.body.token`, `req.body.alias`, `req.body.grant`, `req.query.r` →
+  `[Redacted]`.
 
 > **REQUEST BODIES ARE NOT LOGGED.** The public watch exchanges carry a bearer
 > credential in the BODY — `{host, token}` for the `#k` form and
@@ -30,6 +31,13 @@ Verified against: `src/app.module.ts`, `src/common/filters/global-exception.filt
 > query reaches a log line at all; the `req.body.*` redaction paths are the
 > second layer, present so that adding a body serializer later cannot silently
 > start logging a credential.
+
+> **THE RESUME GRANT IS REDACTED WITH THE REST.** `POST /public/watch/resume`
+> carries a `grant` in its body. It holds no alias, transport alias, raw token
+> or media URL, but it is still a bearer session credential. A successful
+> redemption returns only alias-free rmv1 protected media URLs after fresh
+> database authorization. It is a secret, `req.body.grant` is a redaction path, and it never
+> reaches `AccessLog`. Pinned by `test/public-watch-resume.test.ts` RESUME-19.
 
 > **INVARIANT: never weaken the redaction list or the request serializer.**
 > Adding a raw-URL, full-headers or **request-body** serializer would leak
@@ -152,7 +160,33 @@ the request. Indexed by `createdAt`, `adminId`, `module` and
 > survives; the credential does not.
 
 Written on **public watch resolution**, both success and denial — including
-the email-safe `exchange-compatible` path.
+the email-safe `exchange-compatible` path and the `watch/resume` path.
+
+> **VIEW ACCOUNTING IS A REDEEM COUNT, NOT AN AUTHORIZATION BUDGET — and one
+> residual is worth stating rather than leaving to be discovered.**
+>
+> One successful compatibility redemption increments `currentViews` exactly
+> once. The increment is committed before the response is written, so if the
+> response is then LOST — a dropped connection, a proxy timeout, a reviewer
+> who closes the tab mid-flight — a later independent redemption of the same
+> `?r=` link increments again. The reviewer saw one page and the counter says
+> two.
+>
+> That is acceptable and is deliberately NOT redesigned here, because the
+> links this surface is emitted for are canonical and therefore unbudgeted by
+> contract: `currentViews` on them is analytics, and nothing authorizes off
+> it. On a BUDGETED link it would matter — which is exactly why the email-safe
+> URL is not emitted for one, and why no resume grant is minted for one.
+>
+> A RESUME increments ZERO times, however many refreshes it serves, so a
+> reviewer re-reading a link all afternoon adds nothing to the count.
+
+> **A RESUME IS LOGGED, AND IS NOT A VIEW.** It writes its `AccessLog` row
+> exactly as the two exchanges do, so a link revoked under a resumed tab is
+> still diagnosable from this table. What it does not do is increment
+> `ShareLink.currentViews` — a refresh is the same review session, not a new
+> one. `AccessLog` row count and `currentViews` therefore diverge for a
+> resumed session. That is correct, and this is the one place to know it.
 
 > **INVARIANT: no share credential ever enters `AccessLog`.** The row
 > identifies the link by `shareLinkId`, never by `alias` and never by
